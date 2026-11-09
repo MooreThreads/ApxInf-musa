@@ -321,3 +321,78 @@ __global__ void geglu_quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat16* 
     }
   }
 }
+
+// Bias + GELU producer. Preserve the BF16 activation and equalization
+// rounding before computing amax, without materializing the BF16 tensor.
+template <int kLanes, bool kHasBias>
+__global__ void bias_gelu_quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat16* input,
+                                                     const __mt_bfloat16* bias,
+                                                     int8_t* output,
+                                                     __half* scales, int rows,
+                                                     int cols,
+                                                     const float* inv_c) {
+  __shared__ float scratch[32];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  PackedBf16x8 cached[kLanes];
+  float maximum = 0.0f;
+#pragma unroll
+  for (int lane = 0; lane < kLanes; ++lane) {
+    const int column = (lane * blockDim.x + threadIdx.x) * 8;
+    if (column < cols) {
+      PackedBf16x8 source, bias_lane;
+      source.bits = *reinterpret_cast<const uint4*>(input + base + column);
+      if (kHasBias) bias_lane.bits = *reinterpret_cast<const uint4*>(bias + column);
+#pragma unroll
+      for (int index = 0; index < 8; ++index) {
+        float value = __bfloat162float(source.lanes[index]);
+        if (kHasBias) value += __bfloat162float(bias_lane.lanes[index]);
+        cached[lane].lanes[index] = __float2bfloat16(gelu_tanh(value));
+      }
+      if (inv_c == nullptr) {
+#pragma unroll
+        for (int index = 0; index < 8; ++index) {
+          maximum = fmaxf(
+              maximum, fabsf(__bfloat162float(cached[lane].lanes[index])));
+        }
+      } else {
+        // Equalize in place: the rounded product overwrites the cached lane,
+        // so the quantization loop below runs unmodified and the factors are
+        // read exactly once.
+        float factors[8];
+        load_inv_c_lane(inv_c, column, factors);
+#pragma unroll
+        for (int index = 0; index < 8; ++index) {
+          cached[lane].lanes[index] = __float2bfloat16(
+              __bfloat162float(cached[lane].lanes[index]) * factors[index]);
+          maximum = fmaxf(
+              maximum, fabsf(__bfloat162float(cached[lane].lanes[index])));
+        }
+      }
+    }
+  }
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
+  if (blockIdx.x == 0) {
+    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x) {
+      scales[rows + pad] = __float2half_rn(0.0f);
+    }
+  }
+  // Same contract as the scalar form: the scale is read out of `scratch[0]`
+  // once and every thread works from its register copy of it.
+#pragma unroll
+  for (int lane = 0; lane < kLanes; ++lane) {
+    const int column = (lane * blockDim.x + threadIdx.x) * 8;
+    if (column < cols) {
+      PackedI8x8 quantized;
+#pragma unroll
+      for (int index = 0; index < 8; ++index) {
+        quantized.lanes[index] = quantize_rows_value(
+            __bfloat162float(cached[lane].lanes[index]), scale);
+      }
+      *reinterpret_cast<uint64_t*>(output + base + column) = quantized.bits;
+    }
+  }
+}

@@ -339,6 +339,18 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// Bias + GELU with BF16 rounding, then optional equalization and INT8 rows.
+    pub fn apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        inv_c: *const c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// Gated GELU over `[rows, 2 * inner]`: `gelu_tanh(gate) * up`, rounded once.
     pub fn apxinf_musa_geglu_bf16(
         gate_up: *const c_void,

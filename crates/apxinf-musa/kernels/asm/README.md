@@ -240,6 +240,7 @@ which is what pins the patch's blast radius to the epilogue.
 | `qint8_256x64.asm` | 256 | 256 × 64 × 64 | 20608 | `bfee7d90b39ca6777b4e59f809eb7ad8b074433520b224f2600c2344bc3cee4e` |
 | `qint8_32x128.asm` | 128 | 32 × 128 × 64 | 10368 | `deb90df04050744c582a8690be24ea899f08da128988e818a17a0f0e3e7375c4` |
 | `qint8_32x64.asm` | 128 | 32 × 64 × 64 | 6272 | `10949d198711683db638df1d464154499d0c7ef7e904ad4cabcaf8547f474310` |
+| `qint8_256x128_mfast.asm` | 256 | 256 × 128 × 64 | 24704 | `d11cb49119bd8e0664b5be1357e5ae17b7f44b09b2a0f42a2c41cae2521bec7b` |
 
 Re-rendering is: render the tile with `OUTPUT_DTYPE=bfloat16`, then apply the
 two bf16-output patch passes to the rendered source. It is only needed to change

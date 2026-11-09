@@ -924,3 +924,31 @@ extern "C" musaError_t apxinf_musa_geglu_quantize_rows_bf16_int8(
   }
   return musaGetLastError();
 }
+
+extern "C" musaError_t apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
+    const void* input, const void* bias, void* output, void* scales,
+    int rows, int cols, const void* inv_c, musaStream_t stream) {
+  // Measured 4352-column specialization; the Rust facade keeps other widths
+  // and unaligned views on bias/GELU followed by the ordinary row quantizer.
+  if (!input || !output || !scales || rows <= 0 || cols != 4352 ||
+      !aligned_to(input, 16) || !aligned_to(output, 8) ||
+      (bias && !aligned_to(bias, 16)) || (inv_c && !aligned_to(inv_c, 16)))
+    return musaErrorInvalidValue;
+  const auto* source = static_cast<const __mt_bfloat16*>(input);
+  const auto* bias_values = static_cast<const __mt_bfloat16*>(bias);
+  auto* destination = static_cast<int8_t*>(output);
+  auto* row_scales = static_cast<__half*>(scales);
+  const auto* factors = static_cast<const float*>(inv_c);
+  // Five hardware warps keep one eight-value lane per thread. This avoids
+  // the register arrays of the 256/512-thread variants on MP22.
+  if (bias) {
+    bias_gelu_quantize_rows_bf16_int8_lanes_kernel<1, true>
+        <<<rows, 640, 0, stream>>>(source, bias_values, destination, row_scales,
+                                 rows, cols, factors);
+  } else {
+    bias_gelu_quantize_rows_bf16_int8_lanes_kernel<1, false>
+        <<<rows, 640, 0, stream>>>(source, bias_values, destination, row_scales,
+                                 rows, cols, factors);
+  }
+  return musaGetLastError();
+}

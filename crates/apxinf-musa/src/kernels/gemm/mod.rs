@@ -1,9 +1,11 @@
 //! GEMM operator contracts.
 //!
-//! The public names mirror `apxinf-cuda`'s GEMM module exactly, including the
+//! Shared public names mirror `apxinf-cuda`'s GEMM module, including the
 //! `pub use` renames: `gemm::bf16` and `gemm::bf16_geglu_fused` are the
 //! *functions* `gemm_bf16` and `gemm_bf16_geglu_fused`, not submodules. Model
 //! code calls them by those names, so the rename is part of the contract.
+//! MUSA-specific W8A8 activation producers are selected through model backend
+//! seams; their addition does not change the shared GEMM entry points.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -30,8 +32,9 @@ pub use w8a8::{
     adaptive_layer_norm_quantize_w8a8_activation, decode_scope as w8a8_decode_scope,
     decode_tiles_supported as w8a8_decode_supported, gemm_quantized_w8a8,
     gemm_quantized_w8a8_into, gemm_w8a8 as w8a8, quantize_w8a8_activation,
-    quantize_w8a8_geglu_activation, quantize_w8a8_silu_mul_activation, W8A8Activation,
-    W8A8DecodeScope, W8A8Layout, W8A8ScaleMode, W8A8WeightView, SCALE_PAD as W8A8_SCALE_PAD,
+    quantize_w8a8_bias_gelu_activation, quantize_w8a8_geglu_activation,
+    quantize_w8a8_silu_mul_activation, W8A8Activation, W8A8DecodeScope, W8A8Layout, W8A8ScaleMode,
+    W8A8WeightView, SCALE_PAD as W8A8_SCALE_PAD,
 };
 
 thread_local! {

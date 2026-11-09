@@ -779,15 +779,12 @@ fn vision_layer_int8_dynamic_with_policies(
         &fused.normalized,
         &policies.gemm,
     )?;
-    let activation = l3_bias_activation_bf16(
+    let projection = weights.fc2.gemm_bias_gelu(
         ctx,
         &activation,
         weights.fc1.bias.as_ref(),
-        ops::PointwiseActivation::Gelu,
+        &policies.gemm,
     )?;
-    let projection = weights
-        .fc2
-        .gemm_with_policies(ctx, &activation, &policies.gemm)?;
     l3_bias_residual_bf16(
         ctx,
         &projection,

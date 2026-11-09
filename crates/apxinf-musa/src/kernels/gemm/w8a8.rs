@@ -438,6 +438,104 @@ pub fn quantize_w8a8_geglu_activation(
     Err(native_unavailable("gemm::quantize_w8a8_geglu_activation"))
 }
 
+/// Bias + GELU followed by row quantization, preserving BF16 intermediate rounding.
+/// The measured 4352-column producer is fused; other widths and unaligned views
+/// retain the unfused arithmetic.
+#[cfg(apxinf_musa_available)]
+pub fn quantize_w8a8_bias_gelu_activation(
+    ctx: &MusaContext,
+    activation: &Tensor,
+    bias: Option<&Tensor>,
+    inv_c: Option<&Tensor>,
+) -> Result<W8A8Activation> {
+    let operation = "gemm::quantize_w8a8_bias_gelu_activation";
+    let (rows, input_dim) = activation_matrix(ctx, activation, operation)?;
+    let bias_pointer = match bias {
+        Some(bias) => {
+            super::super::contracts::require_vector_bf16(ctx, bias, input_dim, operation, "bias")?;
+            MusaBuffer::from_tensor(bias).map_err(musa_error)?.ptr() as *const c_void
+        }
+        None => std::ptr::null(),
+    };
+    let source = MusaBuffer::from_tensor(activation).map_err(musa_error)?;
+    let factors = match inv_c {
+        Some(factors) => {
+            if factors.dtype() != DType::F32
+                || factors.device() != Device::Musa(ctx.device_id())
+                || factors.shape().dims() != [input_dim]
+            {
+                return Err(Error::Other(format!(
+                    "MUSA {operation} expects the equalization factors to be {} f32 on {}, got {} {:?} on {}",
+                    input_dim,
+                    Device::Musa(ctx.device_id()),
+                    factors.dtype(),
+                    factors.shape().dims(),
+                    factors.device()
+                )));
+            }
+            MusaBuffer::from_tensor(factors).map_err(musa_error)?.ptr() as *const c_void
+        }
+        None => std::ptr::null(),
+    };
+    if input_dim != 4352
+        || source.ptr() as usize % 16 != 0
+        || factors as usize % 16 != 0
+        || bias_pointer as usize % 16 != 0
+    {
+        let activated = crate::kernels::activation::bias_gelu_bf16(ctx, activation, bias)?;
+        return quantize_w8a8_activation(ctx, &activated, inv_c);
+    }
+    let elements = rows
+        .checked_mul(input_dim)
+        .ok_or_else(|| Error::Other(format!("MUSA {operation} size overflow")))?;
+    let quantized = crate::workspace::output_buffer(ctx, elements)?;
+    let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, operation)?)?;
+    let rows_i32 = checked_i32(operation, "rows", rows)?;
+    let cols_i32 = checked_i32(operation, "cols", input_dim)?;
+    // SAFETY: `activation_matrix` established that the activation is a
+    // contiguous 2-D BF16 tensor on this context's device, so `source` borrows
+    // `rows * input_dim` readable BF16 elements; `bias_pointer` is null or
+    // borrows a validated BF16 bias vector. `factors` is null or borrows the
+    // validated `input_dim` f32 vector; `quantized` and `row_scales` are
+    // allocations on the same device sized for the INT8 values and the padded
+    // FP16 scales the kernel writes. The launch is asynchronous on
+    // `ctx.stream()`, and every buffer it touches outlives the call.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
+                source.ptr() as *const c_void,
+                bias_pointer,
+                quantized.ptr(),
+                row_scales.ptr(),
+                rows_i32,
+                cols_i32,
+                factors,
+                ctx.stream().handle(),
+            ),
+            operation,
+        )?;
+    }
+    Ok(W8A8Activation {
+        quantized,
+        row_scales,
+        rows,
+        input_dim,
+    })
+}
+
+/// No toolkit: report the gap, do not fall back.
+#[cfg(not(apxinf_musa_available))]
+pub fn quantize_w8a8_bias_gelu_activation(
+    _ctx: &MusaContext,
+    _activation: &Tensor,
+    _bias: Option<&Tensor>,
+    _inv_c: Option<&Tensor>,
+) -> Result<W8A8Activation> {
+    Err(native_unavailable(
+        "gemm::quantize_w8a8_bias_gelu_activation",
+    ))
+}
+
 /// INT8 GEMM over an already-quantized activation.
 #[cfg(apxinf_musa_available)]
 pub fn gemm_quantized_w8a8(
@@ -856,6 +954,197 @@ mod tests {
         }
     }
 
+    fn assert_quantized_equal(actual: &W8A8Activation, expected: &W8A8Activation) {
+        assert_eq!(
+            (actual.rows, actual.input_dim),
+            (expected.rows, expected.input_dim)
+        );
+        for (a, b, bytes) in [
+            (
+                &actual.quantized,
+                &expected.quantized,
+                actual.rows * actual.input_dim,
+            ),
+            (
+                &actual.row_scales,
+                &expected.row_scales,
+                (actual.rows + super::SCALE_PAD) * 2,
+            ),
+        ] {
+            let mut got = vec![0; bytes];
+            let mut want = vec![0; bytes];
+            a.copy_to_host(&mut got).unwrap();
+            b.copy_to_host(&mut want).unwrap();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn bias_gelu_quantization_matches_unfused_bytes() {
+        let ctx = MusaContext::new(0).unwrap();
+        for (rows, width) in [
+            (1, 8),
+            (3, 150),
+            (3, 4304),
+            (512, 4352),
+            (3, 8192),
+            (3, 8200),
+        ] {
+            for case in 0..4 {
+                let mut data = values(rows * width, 41);
+                let mut bias_values = values(width, 19);
+                if width == 4352 {
+                    for row in data.chunks_mut(width) {
+                        row[4304..].fill(0.0);
+                    }
+                    bias_values[4304..].fill(0.0);
+                }
+                if case == 1 {
+                    data.fill(0.0);
+                    bias_values.fill(0.0);
+                }
+                if case == 2 {
+                    data[0] = 128.0;
+                    data[1] = -128.0;
+                }
+                let input = upload(&ctx, &data, Shape::new(vec![rows, width]));
+                let bias = upload(&ctx, &bias_values, Shape::new(vec![width]));
+                let factors = upload_f32_scales(
+                    &ctx,
+                    &(0..width)
+                        .map(|i| 0.25 + (i % 13) as f32 * 0.2)
+                        .collect::<Vec<_>>(),
+                );
+                let bias = if case == 0 { None } else { Some(&bias) };
+                let inv = if case == 3 { Some(&factors) } else { None };
+                let activated =
+                    crate::kernels::activation::bias_gelu_bf16(&ctx, &input, bias).unwrap();
+                let expected = super::quantize_w8a8_activation(&ctx, &activated, inv).unwrap();
+                let actual =
+                    super::quantize_w8a8_bias_gelu_activation(&ctx, &input, bias, inv).unwrap();
+                ctx.synchronize().unwrap();
+                assert_quantized_equal(&actual, &expected);
+            }
+        }
+        // Unaligned views must preserve the unfused path, including each
+        // independently unaligned operand. Invalid bias metadata is rejected.
+        for (input_offset, bias_offset, factor_offset) in [(4, 0, 0), (0, 2, 0), (0, 0, 4)] {
+            let width = 4352;
+            let data: Vec<u8> = values(3 * width, 42)
+                .iter()
+                .flat_map(|v| to_bf16_bits(*v).to_le_bytes())
+                .collect();
+            let storage = MusaBuffer::alloc_on(&ctx, data.len() + input_offset).unwrap();
+            let view = storage.view(input_offset, data.len()).unwrap();
+            view.copy_from_host(&data).unwrap();
+            let input = view
+                .as_tensor(Shape::new(vec![3, width]), DType::BF16)
+                .unwrap();
+            let bias_storage = MusaBuffer::alloc_on(&ctx, width * 2 + bias_offset).unwrap();
+            let bias_view = bias_storage.view(bias_offset, width * 2).unwrap();
+            bias_view.copy_from_host(&data[..width * 2]).unwrap();
+            let bias = bias_view
+                .as_tensor(Shape::new(vec![width]), DType::BF16)
+                .unwrap();
+            let factors: Vec<u8> = (0..width)
+                .flat_map(|i| (0.25 + (i % 13) as f32 * 0.2).to_le_bytes())
+                .collect();
+            let factor_storage = MusaBuffer::alloc_on(&ctx, factors.len() + factor_offset).unwrap();
+            let factor_view = factor_storage.view(factor_offset, factors.len()).unwrap();
+            factor_view.copy_from_host(&factors).unwrap();
+            let inv = factor_view
+                .as_tensor(Shape::new(vec![width]), DType::F32)
+                .unwrap();
+            let activated =
+                crate::kernels::activation::bias_gelu_bf16(&ctx, &input, Some(&bias)).unwrap();
+            let expected = super::quantize_w8a8_activation(&ctx, &activated, Some(&inv)).unwrap();
+            let actual =
+                super::quantize_w8a8_bias_gelu_activation(&ctx, &input, Some(&bias), Some(&inv))
+                    .unwrap();
+            ctx.synchronize().unwrap();
+            assert_quantized_equal(&actual, &expected);
+            let bad_bias = upload(&ctx, &[0.0], Shape::new(vec![1]));
+            assert!(
+                super::quantize_w8a8_bias_gelu_activation(&ctx, &input, Some(&bad_bias), None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs MP22"]
+    fn bias_gelu_quantization_graph_replays_changed_inputs() {
+        use std::sync::Arc;
+        let ctx = Arc::new(MusaContext::new(0).unwrap());
+        let (rows, width) = (512, 4352);
+        let data = values(rows * width, 19);
+        let input = upload(&ctx, &data, Shape::new(vec![rows, width]));
+        let bias = upload(&ctx, &values(width, 20), Shape::new(vec![width]));
+        let factors = upload_f32_scales(&ctx, &vec![0.75; width]);
+        for inv in [None, Some(&factors)] {
+            let a_workspace =
+                crate::workspace::GraphWorkspace::new(rows * width * 4 + 8192, 0).unwrap();
+            let b_workspace =
+                crate::workspace::GraphWorkspace::new(rows * width + 8192, 0).unwrap();
+            let (a_graph, expected) = crate::graph::capture(ctx.clone(), || {
+                crate::workspace::with_workspace(&a_workspace, || {
+                    let activated =
+                        crate::kernels::activation::bias_gelu_bf16(&ctx, &input, Some(&bias))?;
+                    super::quantize_w8a8_activation(&ctx, &activated, inv)
+                })
+            })
+            .unwrap();
+            let (b_graph, actual) = crate::graph::capture(ctx.clone(), || {
+                crate::workspace::with_workspace(&b_workspace, || {
+                    super::quantize_w8a8_bias_gelu_activation(&ctx, &input, Some(&bias), inv)
+                })
+            })
+            .unwrap();
+            for sign in [1.0, -1.0, 0.0, -1.0].into_iter().cycle().take(16) {
+                let bytes: Vec<u8> = data
+                    .iter()
+                    .flat_map(|v| to_bf16_bits(*v * sign).to_le_bytes())
+                    .collect();
+                MusaBuffer::from_tensor(&input)
+                    .unwrap()
+                    .copy_from_host(&bytes)
+                    .unwrap();
+                let bias_bytes: Vec<u8> = (0..width)
+                    .flat_map(|i| to_bf16_bits(sign * (i % 7) as f32 * 0.1).to_le_bytes())
+                    .collect();
+                MusaBuffer::from_tensor(&bias)
+                    .unwrap()
+                    .copy_from_host(&bias_bytes)
+                    .unwrap();
+                ctx.synchronize().unwrap();
+                a_graph.replay().unwrap();
+                b_graph.replay().unwrap();
+                ctx.synchronize().unwrap();
+                assert_quantized_equal(&actual, &expected);
+            }
+            let n = 1152;
+            let weight = upload_int8(&ctx, &int8_values(n * width, 123));
+            let scales = column_scales(n);
+            let scales_f32 = upload_f32_scales(&ctx, &scales);
+            let scales_f16 = upload_f16_scales(&ctx, &scales);
+            let view = W8A8WeightView::new(
+                &weight,
+                &scales_f32,
+                &scales_f16,
+                width,
+                n,
+                W8A8ScaleMode::DynamicRowPerOutputChannel,
+                W8A8Layout::OutputMajor,
+                inv,
+            );
+            let a = gemm_quantized_w8a8(&ctx, &actual, view).unwrap();
+            let b = gemm_quantized_w8a8(&ctx, &expected, view).unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(read_back(&a), read_back(&b));
+        }
+    }
+
     /// Whether this build's assembly is the generation the device runs. The five
     /// INT8 images are [`crate::ASSEMBLY_ARCH`] assembly, so on another
     /// generation they are not assembled and these cases skip rather than
@@ -1030,11 +1319,68 @@ mod tests {
             (522, 2048, 2048),
             (522, 2048, 16384),
             (522, 2560, 2048),
+            (522, 16384, 2048), // encode down: M-fast main plus the ten-row tail
             (10, 1024, 2560),
             (522, 2048, 2560),
             (522, 1024, 2560),
         ] {
             check_quantized_gemm(&ctx, m, k, n);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs MP22"]
+    fn w8a8_encode_down_graph_replays_changed_inputs() {
+        if !asm_tiles_built() {
+            return;
+        }
+        let ctx = std::sync::Arc::new(MusaContext::new(0).unwrap());
+        let (m, k, n) = (522, 16384, 2048);
+        let av = int8_values(m * k, 123);
+        let bv = int8_values(n * k, 456);
+        let activation = W8A8Activation {
+            quantized: upload_int8(&ctx, &av),
+            row_scales: upload_f16_scales(&ctx, &row_scales(m)),
+            rows: m,
+            input_dim: k,
+        };
+        let b = upload_int8(&ctx, &bv);
+        let scales = column_scales(n);
+        let f32_scales = upload_f32_scales(&ctx, &scales);
+        let f16_scales = upload_f16_scales(&ctx, &scales);
+        let weight = W8A8WeightView::new(
+            &b,
+            &f32_scales,
+            &f16_scales,
+            k,
+            n,
+            W8A8ScaleMode::DynamicRowPerOutputChannel,
+            W8A8Layout::OutputMajor,
+            None,
+        );
+        // Warm both main and tail modules before capture. The integer-reference
+        // test above separately checks this shape's arithmetic and row split.
+        let reference = gemm_quantized_w8a8(&ctx, &activation, weight).unwrap();
+        ctx.synchronize().unwrap();
+        let expected = read_back(&reference);
+        let arena = crate::workspace::GraphWorkspace::new(1 << 23, ctx.device_id()).unwrap();
+        let run = || {
+            crate::workspace::with_workspace(&arena, || {
+                gemm_quantized_w8a8(&ctx, &activation, weight)
+            })
+        };
+        let (graph, out) = crate::graph::capture(std::sync::Arc::clone(&ctx), run).unwrap();
+        for sign in [1i8, -1, 0, -1].into_iter().cycle().take(16) {
+            let changed: Vec<u8> = av.iter().map(|value| (*value * sign) as u8).collect();
+            activation.quantized.copy_from_host(&changed).unwrap();
+            ctx.synchronize().unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let got = read_back(&out);
+            assert!(got
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| *a == *b * f32::from(sign)));
         }
     }
 

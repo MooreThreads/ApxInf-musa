@@ -1,6 +1,7 @@
 //! Deterministic tile choice for the MP22 INT8 (`s8mma`) GEMM assembly.
 //!
-//! `kernels/asm/qint8_*.asm` are six muDNN QY2 `s8mma` tiles, rendered from
+//! `kernels/asm/qint8_*.asm` are six muDNN QY2 `s8mma` tiles plus an M-fast
+//! variant of `256x128`. The original tiles are rendered from
 //! `kernels/qint8_mma_tiles/templates/` with `io_dtype=int8` plus a local
 //! template patch that narrows the epilogue to BF16 (the upstream
 //! `output_dtype=half` configuration packed FP16), configured as a 1x1 GEMM,
@@ -40,13 +41,14 @@ pub(crate) struct Qint8Tile {
 ///
 /// The index into this array is the index the adapter's `kTiles` must agree
 /// with.
-pub(crate) const QINT8_TILES: [Qint8Tile; 6] = [
+pub(crate) const QINT8_TILES: [Qint8Tile; 7] = [
     Qint8Tile { name: "256x128", tile_n: 128, tile_k: 64 },
     Qint8Tile { name: "256x256", tile_n: 256, tile_k: 64 },
     Qint8Tile { name: "128x128", tile_n: 128, tile_k: 64 },
     Qint8Tile { name: "256x64", tile_n: 64, tile_k: 64 },
     Qint8Tile { name: "32x128", tile_n: 128, tile_k: 64 },
     Qint8Tile { name: "32x64", tile_n: 64, tile_k: 64 },
+    Qint8Tile { name: "256x128-mfast", tile_n: 128, tile_k: 64 },
 ];
 
 /// The tile the probe timed fastest for each shape it was run on.
@@ -64,6 +66,10 @@ pub(crate) const QINT8_TILES: [Qint8Tile; 6] = [
 /// The 522-row shapes are run as whole tiles plus a remainder (see the adapter's
 /// row split), so the tile recorded here is the one that won for the *whole
 /// block*; the adapter picks the remainder tile itself.
+/// The down shape `(522, 2048, 16384)` uses the same arithmetic with M-fast
+/// block traversal: complete split GEMM measured 2.2392 -> 2.1374 ms on M1000
+/// (`devlocal/encode-int8-layout/runs/12-gemm-pipeline/down-repeat-02.json`).
+/// Other shapes retain their measured traversal order.
 ///
 /// The `(10, 2560, 1024)` entry is the action expert's bare `m = 10` qkv, the
 /// one decode shape where the short band's leading `32x64` loses: `32x128`
@@ -78,7 +84,7 @@ const MEASURED: &[((u32, u32, u32), &str)] = &[
     ((522, 32768, 2048), "256x128"),
     ((522, 2560, 2048), "256x128"),
     ((522, 2048, 2048), "256x128"),
-    ((522, 2048, 16384), "256x128"),
+    ((522, 2048, 16384), "256x128-mfast"),
     ((512, 3456, 1152), "256x128"),
     ((512, 2048, 1152), "256x128"),
     ((512, 1152, 1152), "128x128"),
@@ -172,7 +178,7 @@ fn pick(m: usize, n: usize, k: usize) -> Option<u8> {
 
 /// The tile to run on this build, or `None` when no tile can serve the shape.
 ///
-/// The architecture gate mirrors `build.rs`: the six images are
+/// The architecture gate mirrors `build.rs`: the images are
 /// [`crate::ASSEMBLY_ARCH`] assembly, so any other generation has nothing to
 /// load.
 pub(crate) fn select(m: usize, n: usize, k: usize) -> Option<u8> {
@@ -187,11 +193,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tiles_are_the_six_the_build_embeds_in_order() {
+    fn tiles_match_the_build_order() {
         let names: Vec<&str> = QINT8_TILES.iter().map(|tile| tile.name).collect();
         assert_eq!(
             names,
-            ["256x128", "256x256", "128x128", "256x64", "32x128", "32x64"]
+            [
+                "256x128", "256x256", "128x128", "256x64", "32x128", "32x64",
+                "256x128-mfast",
+            ]
         );
         assert!(QINT8_TILES.iter().all(|tile| tile.tile_k == 64));
     }
@@ -250,5 +259,20 @@ mod tests {
         assert_eq!(pick(10, 12800, 1024), index_of("32x64"));
         assert_eq!(pick(200, 2048, 2048), index_of("128x128"));
         assert_eq!(pick(1024, 2048, 2048), index_of("256x128"));
+    }
+
+    #[test]
+    fn mfast_is_limited_to_the_measured_encode_down_shape() {
+        assert_eq!(pick(522, 2048, 16384), index_of("256x128-mfast"));
+        for (m, n, k) in [
+            (522, 2560, 2048),
+            (522, 2048, 2048),
+            (522, 32768, 2048),
+            (512, 2048, 16384),
+            (523, 2048, 16384),
+        ] {
+            assert_eq!(pick(m, n, k), index_of("256x128"));
+        }
+        assert_eq!(pick(10, 2048, 16384), index_of("32x64"));
     }
 }

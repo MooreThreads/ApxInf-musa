@@ -61,6 +61,17 @@ mod linear {
         Ok(output)
     }
 
+    /// Materialized bias+GELU for the BF16-fallback combination.
+    fn bias_gelu_bf16(ctx: &Context, input: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+        let mut args =
+            ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+        args.bias = bias;
+        args.activation = ops::PointwiseActivation::Gelu;
+        ops::pointwise(ctx, args)?;
+        Ok(output)
+    }
+
     /// Multiply a BF16 matrix by a per-channel f32 vector, allocating the output.
     fn scale_channels(ctx: &Context, input: &Tensor, channel_scale: &Tensor) -> Result<Tensor> {
         let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
@@ -483,6 +494,30 @@ mod linear {
             let mut output =
                 ctx.allocate_output(Shape::new(vec![rows, self.output_dim]), DType::BF16)?;
             ops::w8a8::gemm_geglu(ctx, gate_up, self.as_kernel_view(), &mut output)?;
+            Ok(output)
+        }
+
+        /// Consume the preceding linear's bias/GELU output on the INT8 route.
+        ///
+        /// The vision MLP's FC1 bias and GELU run fused with the row
+        /// quantization, keeping the BF16 intermediate out of the arena. A
+        /// projection that fell back to BF16 has no quantizer to fuse into,
+        /// so it materializes the activation and takes the ordinary GEMM.
+        pub fn gemm_bias_gelu(
+            &self,
+            ctx: &Context,
+            input: &Tensor,
+            bias: Option<&Tensor>,
+            gemm_policy: &ops::GemmPolicy,
+        ) -> Result<Tensor> {
+            if self.bf16_fallback.is_some() {
+                let activated = bias_gelu_bf16(ctx, input, bias)?;
+                return self.gemm_with_policies(ctx, &activated, gemm_policy);
+            }
+            let rows = input.shape().dims()[0];
+            let mut output =
+                ctx.allocate_output(Shape::new(vec![rows, self.output_dim]), DType::BF16)?;
+            ops::w8a8::gemm_bias_gelu(ctx, input, bias, self.as_kernel_view(), &mut output)?;
             Ok(output)
         }
 
