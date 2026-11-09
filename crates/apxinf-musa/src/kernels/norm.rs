@@ -178,7 +178,7 @@ fn launch_layer(
 
 /// Adaptive (adaLN) BF16 RMS normalization.
 ///
-/// `style` is a single BF16 `[3 * cols]` vector holding gate, shift and scale
+/// `style` is a single BF16 `[3 * cols]` vector holding scale, shift and gate
 /// in that order.
 pub fn adaptive_rms_bf16(
     ctx: &MusaContext,

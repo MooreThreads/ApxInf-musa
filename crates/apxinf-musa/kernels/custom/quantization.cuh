@@ -43,6 +43,7 @@
 #include <musa_fp16.h>
 
 #include "math.cuh"
+#include "normalization.cuh"
 #include "reduction.cuh"
 
 // The FP16 zero pad both scale vectors carry past their length. Must match
@@ -395,4 +396,76 @@ __global__ void bias_gelu_quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat
       *reinterpret_cast<uint64_t*>(output + base + column) = quantized.bits;
     }
   }
+}
+
+// 1024-column Adaptive RMSNorm + dynamic row quantization. Keep the same
+// four adjacent columns per thread and reduction tree as the BF16 vector
+// producers. Gated form also writes the BF16 residual for the next sublayer.
+template <bool GATED>
+__global__ void ada_rms_quantize_bf16_int8_kernel(
+    const __mt_bfloat16* input, const __mt_bfloat16* residual,
+    const __mt_bfloat16* gate_style, const __mt_bfloat16* norm_style,
+    __mt_bfloat16* hidden, int8_t* output, __half* scales,
+    int rows, int cols, float eps, const float* inv_c) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int column = threadIdx.x * 4;
+  const int64_t index = static_cast<int64_t>(row) * cols + column;
+  const uint2 input_raw = *reinterpret_cast<const uint2*>(input + index);
+  const auto* in = reinterpret_cast<const __mt_bfloat16*>(&input_raw);
+  uint2 residual_raw, gate_raw, hidden_raw;
+  if (GATED) {
+    residual_raw = *reinterpret_cast<const uint2*>(residual + index);
+    gate_raw = *reinterpret_cast<const uint2*>(gate_style + 2 * cols + column);
+  }
+  const auto* res = reinterpret_cast<const __mt_bfloat16*>(&residual_raw);
+  const auto* gate = reinterpret_cast<const __mt_bfloat16*>(&gate_raw);
+  auto* hid = reinterpret_cast<__mt_bfloat16*>(&hidden_raw);
+  float values[4];
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int lane = 0; lane < 4; ++lane) {
+    if (GATED) {
+      hid[lane] = __float2bfloat16(__bfloat162float(res[lane]) +
+          __bfloat162float(in[lane]) * __bfloat162float(gate[lane]));
+      values[lane] = __bfloat162float(hid[lane]);
+    } else {
+      values[lane] = __bfloat162float(in[lane]);
+    }
+    square_sum += values[lane] * values[lane];
+  }
+  if (GATED) *reinterpret_cast<uint2*>(hidden + index) = hidden_raw;
+  const float inverse_rms =
+      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+  // Protect every read of the sum before reusing scratch for amax.
+  __syncthreads();
+  const uint2 scale_raw = *reinterpret_cast<const uint2*>(norm_style + column);
+  const uint2 shift_raw = *reinterpret_cast<const uint2*>(norm_style + cols + column);
+  const auto* scale = reinterpret_cast<const __mt_bfloat16*>(&scale_raw);
+  const auto* shift = reinterpret_cast<const __mt_bfloat16*>(&shift_raw);
+  float4 factors;
+  if (inv_c) factors = *reinterpret_cast<const float4*>(inv_c + column);
+  const auto* factor = reinterpret_cast<const float*>(&factors);
+  float maximum = 0.0f;
+#pragma unroll
+  for (int lane = 0; lane < 4; ++lane) {
+    __mt_bfloat16 rounded = __float2bfloat16(values[lane] * inverse_rms *
+        (1.0f + __bfloat162float(scale[lane])) + __bfloat162float(shift[lane]));
+    if (inv_c) rounded = __float2bfloat16(__bfloat162float(rounded) * factor[lane]);
+    values[lane] = __bfloat162float(rounded);
+    maximum = fmaxf(maximum, fabsf(values[lane]));
+  }
+  const float row_scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = __float2half_rn(row_scale);
+  if (row == 0) {
+    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x)
+      scales[rows + pad] = __float2half_rn(0.0f);
+  }
+  uint32_t packed;
+  auto* bytes = reinterpret_cast<int8_t*>(&packed);
+#pragma unroll
+  for (int lane = 0; lane < 4; ++lane)
+    bytes[lane] = quantize_rows_value(values[lane], row_scale);
+  *reinterpret_cast<uint32_t*>(output + index) = packed;
 }

@@ -952,3 +952,28 @@ extern "C" musaError_t apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
   }
   return musaGetLastError();
 }
+
+extern "C" musaError_t apxinf_musa_ada_rms_quantize_bf16_int8(
+    const void* input, const void* residual, const void* gate_style,
+    const void* norm_style, void* hidden, void* output, void* scales,
+    int rows, int cols, float eps, const void* inv_c, musaStream_t stream) {
+  if (!input || !norm_style || !output || !scales || rows <= 0 || cols != 1024 ||
+      !aligned_to(input, 8) || !aligned_to(norm_style, 8) || !aligned_to(output, 4) ||
+      (inv_c && !aligned_to(inv_c, 16)) ||
+      (residual && (!gate_style || !hidden || !aligned_to(residual, 8) ||
+                    !aligned_to(gate_style, 8) || !aligned_to(hidden, 8))))
+    return musaErrorInvalidValue;
+  if (residual) {
+    ada_rms_quantize_bf16_int8_kernel<true><<<rows, 256, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(input), static_cast<const __mt_bfloat16*>(residual),
+        static_cast<const __mt_bfloat16*>(gate_style), static_cast<const __mt_bfloat16*>(norm_style),
+        static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+        static_cast<__half*>(scales), rows, cols, eps, static_cast<const float*>(inv_c));
+  } else {
+    ada_rms_quantize_bf16_int8_kernel<false><<<rows, 256, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(input), nullptr, nullptr,
+        static_cast<const __mt_bfloat16*>(norm_style), nullptr, static_cast<int8_t*>(output),
+        static_cast<__half*>(scales), rows, cols, eps, static_cast<const float*>(inv_c));
+  }
+  return musaGetLastError();
+}

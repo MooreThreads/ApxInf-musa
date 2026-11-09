@@ -25,8 +25,19 @@ pub(crate) use apxinf_musa::sampling;
 /// keeps the vendor path, silently.
 pub(crate) mod gemm {
     pub(crate) use apxinf_musa::kernels::gemm::{
-        decode_scope, prepare_bf16_nn_weight, prepare_bf16_nt_weight,
+        adaptive_gate_residual_rms_quantize_w8a8_activation,
+        adaptive_rms_quantize_w8a8_activation, decode_scope, prepare_bf16_nn_weight,
+        prepare_bf16_nt_weight,
     };
+}
+
+/// A normalized input prepared for its consuming projection.
+///
+/// The quantized variant carries the fused norm+quantize producer's rows and
+/// scales; BF16 heads and excluded projections keep the materialized tensor.
+pub(crate) enum NormalizedW8A8Input {
+    Bf16(Tensor),
+    Quantized(ops::w8a8::W8A8Activation),
 }
 
 /// Where this device's tactic measurements live, and how a session takes them.

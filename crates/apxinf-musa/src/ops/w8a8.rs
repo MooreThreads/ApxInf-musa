@@ -15,7 +15,7 @@
 //! borrows the values, both scale vectors and the dimensions together so a call
 //! site cannot mismatch them.
 
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use crate::kernels::elementwise;
 use crate::kernels::gemm as gemm_kernels;
@@ -109,6 +109,30 @@ pub fn gemm_bias_gelu(
         weight.equalization_inv_c,
     )?;
     gemm_quantized(ctx, &quantized, weight, out)
+}
+
+/// INT8 GEMM over an already-quantized activation, allocating the BF16 output.
+///
+/// Serves model code that holds a [`W8A8Activation`] from a fused producer and
+/// owns the result's lifetime itself; the typed operator surface otherwise
+/// hands every operator a caller-owned output.
+pub fn gemm_quantized_alloc(
+    ctx: &MusaContext,
+    activation: &W8A8Activation,
+    weight: W8A8WeightView<'_>,
+) -> Result<Tensor> {
+    let elements = activation
+        .rows()
+        .checked_mul(weight.output_dim)
+        .ok_or_else(|| Error::Other("MUSA gemm::w8a8 output size overflow".into()))?;
+    let bytes = elements
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("MUSA gemm::w8a8 output size overflow".into()))?;
+    let output = crate::workspace::output_buffer(ctx, bytes)?;
+    let mut tensor =
+        output.into_tensor(Shape::new(vec![activation.rows(), weight.output_dim]), DType::BF16);
+    gemm_quantized(ctx, activation, weight, &mut tensor)?;
+    Ok(tensor)
 }
 
 /// Whether a tile serves a `[rows, k] @ [k, n]` contraction.

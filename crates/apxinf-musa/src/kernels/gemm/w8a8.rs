@@ -31,8 +31,10 @@
 //! than running a different arithmetic. The model may instead pad such a shape
 //! to a tile multiple at pack time (the MUSA INT8 weights pad `4304` to
 //! `4352`); that is a model-side choice made before the operator is called, not
-//! part of this contract. The fused-quantization entry points that
-//! would need operators this port does not have stay [`not_ported`].
+//! part of this contract. GeGLU plus row quantization is a
+//! MUSA-specific fused producer, as are Adaptive RMSNorm and gated residual
+//! RMSNorm plus quantization. SiLU/multiply and adaptive layer norm
+//! quantization entry points remain [`not_ported`].
 //!
 //! Signatures mirror `apxinf-cuda/src/kernels/gemm/w8a8.rs`, including the
 //! private fields on [`W8A8Activation`]: a caller cannot fabricate one, which
@@ -58,6 +60,17 @@ use crate::kernels::contracts::checked_i32;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
 use crate::kernels::not_ported;
+
+#[path = "w8a8_norm.rs"]
+mod norm_quant;
+pub use norm_quant::{
+    adaptive_gate_residual_rms_quantize_w8a8_activation,
+    adaptive_rms_quantize_w8a8_activation,
+};
+
+#[cfg(all(test, apxinf_musa_available))]
+#[path = "w8a8_norm_tests.rs"]
+mod action_norm_tests;
 
 thread_local! {
     static DECODE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -214,6 +227,13 @@ pub struct W8A8Activation {
     row_scales: MusaBuffer,
     rows: usize,
     input_dim: usize,
+}
+
+impl W8A8Activation {
+    /// Rows of the quantized activation, for callers sizing its GEMM output.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
 }
 
 /// The FP16 zero pad both scale vectors carry past their length.

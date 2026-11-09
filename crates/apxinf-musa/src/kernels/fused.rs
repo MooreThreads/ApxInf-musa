@@ -369,8 +369,8 @@ fn launch_layer(
 
 /// Gated residual add plus adaptive RMS normalization.
 ///
-/// `gate_style` and `norm_style` are each BF16 `[3 * cols]`: gate, shift and
-/// scale, as [`super::norm::adaptive_rms_bf16`] takes them.
+/// `gate_style` and `norm_style` are each BF16 `[3 * cols]`: scale, shift and
+/// gate, as [`super::norm::adaptive_rms_bf16`] takes them.
 pub fn adaptive_gate_residual_rms_bf16(
     ctx: &MusaContext,
     projection: &Tensor,
