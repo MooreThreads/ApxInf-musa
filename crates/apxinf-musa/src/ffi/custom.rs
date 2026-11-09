@@ -17,6 +17,19 @@ extern "C" {
     pub fn apxinf_musa_capture_anchor(stream: *mut c_void) -> musaError_t;
     pub fn apxinf_musa_mublas_release_stream(stream: *mut c_void);
     pub fn apxinf_musa_mudnn_release_stream(stream: *mut c_void);
+
+    /// Exact MP22 M=1 BF16 GEMV over row-major `[1, K] @ [K, N]`.
+    pub fn apxinf_musa_bf16_gemv_m1(
+        activation: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        n: i32,
+        k: i32,
+        tile_n: i32,
+        load_count: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// muDNN BF16 GEMM. Returns 0 on success; on failure
     /// [`apxinf_musa_mudnn_last_error`] names the reason.
     pub fn apxinf_musa_mudnn_bf16_gemm(
@@ -33,6 +46,32 @@ extern "C" {
         q: *const c_void,
         k: *const c_void,
         v: *const c_void,
+        y: *mut c_void,
+        batch: i32,
+        heads: i32,
+        tokens: i32,
+        dim: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// General BF16 flash attention with independent Q/K lengths and GQA.
+    pub fn apxinf_musa_mudnn_general_flash_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        y: *mut c_void,
+        batch: i32,
+        query_heads: i32,
+        kv_heads: i32,
+        query_tokens: i32,
+        key_tokens: i32,
+        dim: i32,
+        causal: bool,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Noncausal BF16 flash attention over a physical `[B,T,3,H,D]` QKV
+    /// buffer without materializing separate Q/K/V tensors.
+    pub fn apxinf_musa_mudnn_packed_qkv_flash_bf16(
+        qkv: *const c_void,
         y: *mut c_void,
         batch: i32,
         heads: i32,
@@ -60,6 +99,22 @@ extern "C" {
         rows: i32,
         cols: i32,
         activation: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// `silu(gate) * up` over BF16 elements with a single BF16 output rounding.
+    pub fn apxinf_musa_silu_mul_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_silu_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -121,6 +176,47 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// `(projection + bias) -> BF16`, then add residual and round to BF16.
+    /// `bias` may be null and is row-broadcast when present.
+    pub fn apxinf_musa_bias_then_residual_bf16(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// The two-rounding residual contract followed by adaptive LayerNorm.
+    pub fn apxinf_musa_bias_then_residual_adaptive_layer_norm_bf16(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        modulation: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// The two-rounding residual contract followed by ordinary LayerNorm.
+    pub fn apxinf_musa_bias_then_residual_layer_norm_bf16(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// The same followed by an RMSNorm with a weight and no shift. `hidden` is
     /// written rounded to bf16 and read back before the norm.
     pub fn apxinf_musa_bias_residual_rms_norm_bf16(
@@ -144,6 +240,57 @@ extern "C" {
         first_rows: i32,
         second_rows: i32,
         cols: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_concat_columns_bf16(
+        first: *const c_void,
+        second: *const c_void,
+        third: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        first_cols: i32,
+        second_cols: i32,
+        third_cols: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_gather_rows_bf16(
+        input: *const c_void,
+        indices: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Elementwise BF16 add and multiply over `count` values.
+    pub fn apxinf_musa_add_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_mul_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Replace or add unique source rows in one output pass. `row_to_source`
+    /// has one `u32` per destination row and uses `u32::MAX` when unselected.
+    pub fn apxinf_musa_scatter_rows_bf16(
+        destination: *const c_void,
+        source: *const c_void,
+        row_to_source: *const c_void,
+        output: *mut c_void,
+        destination_rows: i32,
+        source_rows: i32,
+        cols: i32,
+        add: i32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -246,6 +393,38 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// Repeat GQA K/V heads while permuting BF16 token-major storage to BF16
+    /// query-head-major storage.
+    pub fn apxinf_musa_permute_gqa_kv_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        kv_heads: i32,
+        q_heads: i32,
+        dim: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// The same GQA expansion and permutation, widening the destination to
+    /// f32 for the score-probability times V contraction.
+    pub fn apxinf_musa_permute_gqa_kv_to_f32(
+        input: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        kv_heads: i32,
+        q_heads: i32,
+        dim: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// In-place causal softmax over flattened `[heads, tokens, tokens]` f32
+    /// scores. Entries above the diagonal become exact zeros.
+    pub fn apxinf_musa_causal_row_softmax_f32(
+        data: *mut c_void,
+        rows: i32,
+        tokens: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// In-place softmax over each row of a `[rows, cols]` f32 tensor.
     ///
     /// f32 arithmetic with the max subtracted — the contract `torch.softmax`
@@ -275,6 +454,18 @@ extern "C" {
         input: *const c_void,
         weight: *const c_void,
         bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Adaptive LayerNorm over `[rows, cols]`; `modulation` is
+    /// `[scale, shift]` with two BF16 values per column.
+    pub fn apxinf_musa_adaptive_layer_norm_bf16(
+        input: *const c_void,
+        modulation: *const c_void,
         output: *mut c_void,
         rows: i32,
         cols: i32,
@@ -324,6 +515,89 @@ extern "C" {
         theta: f32,
         position_offset: i32,
         kv_output_offset: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Apply half-split 2-D vision RoPE to `[tokens, heads, head_dim]`.
+    /// Positions is a device `[tokens, 2]` uint32 buffer; the first and second
+    /// rotary-pair halves select its height and width columns respectively.
+    pub fn apxinf_musa_vision_2d_rope_bf16(
+        input: *const c_void,
+        positions: *const u32,
+        output: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        theta: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Build an interleaved FP32 `[tokens, head_dim / 2, 2]` 2-D RoPE table.
+    pub fn apxinf_musa_build_vision_rotation_table_f32(
+        positions: *const u32,
+        rotation_table: *mut c_void,
+        tokens: i32,
+        head_dim: i32,
+        theta: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Split packed BF16 QKV, add bias and apply a prepared 2-D RoPE table.
+    pub fn apxinf_musa_qkv_split_bias_vision_rope_precomputed_bf16(
+        qkv: *const c_void,
+        bias: *const c_void,
+        query: *mut c_void,
+        key: *mut c_void,
+        value: *mut c_void,
+        rotation_table: *const c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Apply Qwen multimodal 3-D RoPE to `[tokens, heads, head_dim]`.
+    /// Positions is a device `[tokens, 3]` uint32 buffer with `(t, h, w)`;
+    /// `section_t/h/w` select the interleaved frequency sections.
+    pub fn apxinf_musa_mrope_bf16(
+        input: *const c_void,
+        positions: *const u32,
+        output: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        section_t: i32,
+        section_h: i32,
+        section_w: i32,
+        theta: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Build an interleaved FP32 `[tokens, head_dim / 2, 2]` mRoPE table.
+    pub fn apxinf_musa_build_mrope_rotation_table_f32(
+        positions: *const u32,
+        rotation_table: *mut c_void,
+        tokens: i32,
+        head_dim: i32,
+        section_t: i32,
+        section_h: i32,
+        section_w: i32,
+        theta: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Fused Q/K RMSNorm and multimodal RoPE using a prepared FP32 table.
+    pub fn apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
+        query: *const c_void,
+        query_weight: *const c_void,
+        query_output: *mut c_void,
+        key: *const c_void,
+        key_weight: *const c_void,
+        key_output: *mut c_void,
+        rotation_table: *const c_void,
+        tokens: i32,
+        query_heads: i32,
+        key_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        block_threads: i32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -419,5 +693,7 @@ fn mudnn_detail(status: i32) -> String {
 /// Turn a status into the adapter's message; `operation` runs only on failure,
 /// so a successful launch does not format a string it would throw away.
 pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<(), String> {
-    crate::ffi::check_status(status, || format!("{}: {}", operation(), mudnn_detail(status)))
+    crate::ffi::check_status(status, || {
+        format!("{}: {}", operation(), mudnn_detail(status))
+    })
 }

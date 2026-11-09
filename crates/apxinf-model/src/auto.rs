@@ -403,6 +403,16 @@ impl AutoModel {
             ));
         }
 
+        if matches!(
+            model_name,
+            "gr00t" | "gr00t_n1_7" | "Gr00tN1d7" | "gr00t-musa"
+        ) {
+            #[cfg(feature = "musa")]
+            if matches!(device, Device::Musa(_)) {
+                return crate::musa_gr00t::load(path, device, options);
+            }
+        }
+
         if matches!(model_name, "d3" | "d3-cuda") {
             #[cfg(feature = "cuda")]
             return crate::d3::load::load_with_cuda_new(path, device, options);

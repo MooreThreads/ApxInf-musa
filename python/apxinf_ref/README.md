@@ -14,8 +14,11 @@ One directory per model:
   tests/
 ```
 
-`pi05/` is the only model at present. Add a model by adding a sibling
-directory; keep model directories self-contained rather than importing across
+`pi05/` contains the existing Pi0.5 reference. `GR00T-N1.7-LIBERO/` contains
+the NVIDIA GR00T-N1.7-LIBERO fixed-input BF16 reference for Orin/CUDA and
+optional MUSA replay. Follow each model's README for dependencies and artifact
+contracts; the install recipe below applies to Pi0.5, not GR00T N1.7.
+Add a model by adding a sibling directory; keep model directories self-contained rather than importing across
 them. Do not name a directory `models/`: the repository `.gitignore` ignores
 that name at every depth, so `git add` would silently skip the package.
 

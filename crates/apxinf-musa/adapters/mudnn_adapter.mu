@@ -127,10 +127,54 @@ struct Flash {
   }
   ~Flash() { if(lse_buffer) musaFree(lse_buffer); }
 };
+
+// General BF16 flash-attention descriptor with independent Q/K lengths, GQA
+// head counts, causal selection and an optional packed-QKV physical layout.
+// Keep it separate from `Flash`, whose established D72 path is used by PI0.5.
+struct GeneralFlash {
+  md::Tensor q,k,v,y,lse,mask,dropout;
+  md::ScaledDotProductAttention operation;
+  Scratch scratch;
+  void* lse_buffer = nullptr;
+  GeneralFlash(int batch,int query_heads,int kv_heads,int query_tokens,int key_tokens,
+               int dim,bool causal,bool packed_qkv,musaStream_t stream) : scratch(stream) {
+    for(auto p:{&q,&k,&v,&y,&mask}) check(p->SetType(md::Tensor::Type::BFLOAT16));
+    check(y.SetNdInfo({batch,query_heads,query_tokens,dim},
+      {query_tokens*query_heads*dim,dim,query_heads*dim,1}));
+    if(packed_qkv) {
+      const int token_stride=3*query_heads*dim;
+      for(auto p:{&q,&k,&v}) check(p->SetNdInfo(
+        {batch,query_heads,query_tokens,dim},
+        {query_tokens*token_stride,dim,token_stride,1}));
+    } else {
+      check(q.SetNdInfo({batch,query_heads,query_tokens,dim},
+        {query_tokens*query_heads*dim,dim,query_heads*dim,1}));
+      for(auto p:{&k,&v}) check(p->SetNdInfo({batch,kv_heads,key_tokens,dim},
+        {key_tokens*kv_heads*dim,dim,kv_heads*dim,1}));
+    }
+    check(lse.SetType(md::Tensor::Type::FLOAT));
+    check(lse.SetNdInfo({batch,query_heads,query_tokens}));
+    check(mask.SetNdInfo({0}));
+    check(dropout.SetType(md::Tensor::Type::FLOAT)); check(dropout.SetNdInfo({0}));
+    check(operation.SetBatchSize(batch)); check(operation.SetHeadsNum(query_heads));
+    check(operation.SetEmbedDim(query_heads*dim));
+    check(operation.SetScale(1./std::sqrt(double(dim))));
+    check(operation.SetCausal(causal)); check(operation.SetMaskMode(false));
+    check(operation.SetMaxSeqlenQ(query_tokens));
+    check(operation.SetMaxSeqlenK(key_tokens));
+    check(operation.SetTraining(false)); check(operation.SetDropoutP(0));
+    check(operation.SetIsDeterministic(true));
+    if(musaMalloc(&lse_buffer,size_t(batch)*query_heads*query_tokens*sizeof(float))!=musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    check(lse.SetAddr(lse_buffer));
+  }
+  ~GeneralFlash() { if(lse_buffer) musaFree(lse_buffer); }
+};
 struct Stream {
   md::Handle handle;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
+  std::map<std::tuple<int,int,int,int,int,int,bool,bool>,std::unique_ptr<GeneralFlash>> general_flashes;
   Stream(int device,musaStream_t stream) : handle(device) {
     check(handle.SetStream(stream)); check(handle.SetAllowTF32(false));
   }
@@ -248,6 +292,83 @@ extern "C" int apxinf_musa_mudnn_flash_bf16(const void* q,const void* k,const vo
    return e.status;
  } catch(...) {
    record_failure(kStatusUnknown, "muDNN flash attention");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_general_flash_bf16(
+ const void* q,const void* k,const void* v,void* y,int batch,
+ int query_heads,int kv_heads,int query_tokens,int key_tokens,int dim,
+ bool causal,musaStream_t stream) {
+ if(!q||!k||!v||!y||batch<=0||query_heads<=0||kv_heads<=0||
+    query_tokens<=0||key_tokens<=0||dim<=0||query_heads%kv_heads!=0) {
+   record_failure(kStatusInvalidArgument, "muDNN general flash attention");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream);
+  auto key=std::make_tuple(batch,query_heads,kv_heads,query_tokens,key_tokens,dim,causal,false);
+  auto it=s.general_flashes.find(key);
+  if(it==s.general_flashes.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress, "muDNN general flash attention");
+      return kStatusCaptureInProgress;
+    }
+    it=s.general_flashes.emplace(
+      key,std::make_unique<GeneralFlash>(batch,query_heads,kv_heads,query_tokens,
+                                         key_tokens,dim,causal,false,stream)).first;
+  }
+  auto& p=*it->second;
+  check(p.q.SetAddr(const_cast<void*>(q))); check(p.k.SetAddr(const_cast<void*>(k)));
+  check(p.v.SetAddr(const_cast<void*>(v))); check(p.y.SetAddr(y)); p.scratch.cursor=0;
+  const int status = int(p.operation.RunFlash(s.handle,p.y,p.lse,p.q,p.k,p.v,p.mask,p.dropout,
+    [&](size_t n){return p.scratch.get(n);}));
+  if (status != 0) record_failure(status, "muDNN general flash attention");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status, "muDNN general flash attention");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown, "muDNN general flash attention");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_packed_qkv_flash_bf16(
+ const void* qkv,void* y,int batch,int heads,int tokens,int dim,musaStream_t stream) {
+ if(!qkv||!y||batch<=0||heads<=0||tokens<=0||dim<=0) {
+   record_failure(kStatusInvalidArgument, "muDNN packed-QKV flash attention");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream);
+  auto key=std::make_tuple(batch,heads,heads,tokens,tokens,dim,false,true);
+  auto it=s.general_flashes.find(key);
+  if(it==s.general_flashes.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress, "muDNN packed-QKV flash attention");
+      return kStatusCaptureInProgress;
+    }
+    it=s.general_flashes.emplace(
+      key,std::make_unique<GeneralFlash>(batch,heads,heads,tokens,tokens,
+                                         dim,false,true,stream)).first;
+  }
+  auto& p=*it->second;
+  const auto* base=static_cast<const unsigned char*>(qkv);
+  const size_t projection_bytes=size_t(heads)*size_t(dim)*sizeof(uint16_t);
+  check(p.q.SetAddr(const_cast<unsigned char*>(base)));
+  check(p.k.SetAddr(const_cast<unsigned char*>(base+projection_bytes)));
+  check(p.v.SetAddr(const_cast<unsigned char*>(base+2*projection_bytes)));
+  check(p.y.SetAddr(y)); p.scratch.cursor=0;
+  const int status = int(p.operation.RunFlash(s.handle,p.y,p.lse,p.q,p.k,p.v,p.mask,p.dropout,
+    [&](size_t n){return p.scratch.get(n);}));
+  if (status != 0) record_failure(status, "muDNN packed-QKV flash attention");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status, "muDNN packed-QKV flash attention");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown, "muDNN packed-QKV flash attention");
    return kStatusUnknown;
  }
 }

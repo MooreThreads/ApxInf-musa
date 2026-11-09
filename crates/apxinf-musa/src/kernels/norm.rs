@@ -1,21 +1,21 @@
 //! Normalization operator contracts.
 
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
 
-#[cfg(apxinf_musa_available)]
-use super::contracts::{checked_i32, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matrix_bf16, require_output_matrix,
     require_vector_at_least_bf16, require_vector_bf16,
 };
+#[cfg(apxinf_musa_available)]
+use super::contracts::{checked_i32, tensor_ptr};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
-use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
+use crate::kernels::not_ported;
 
 /// BF16 RMS normalization over the last axis.
 ///
@@ -262,6 +262,29 @@ fn launch_adaptive_rms(
 }
 
 // ── FP8-output normalization (not ported) ────────────────────────────────
+
+pub fn rms_quant_bf16_e4m3(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _weight: &Tensor,
+    _eps: f32,
+    _scale: f32,
+) -> Result<Tensor> {
+    Err(not_ported("norm::rms_quant_bf16_e4m3"))
+}
+
+pub fn layer_quant_bf16_e4m3(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _weight: &Tensor,
+    _bias: &Tensor,
+    _eps: f32,
+    _scale: f32,
+) -> Result<Tensor> {
+    Err(not_ported("norm::layer_quant_bf16_e4m3"))
+}
+
+// ── FP8-output normalization (not ported) ────────────────────────────────
 //
 // The `*_quant_f16_e4m3` family writes E4M3 rather than BF16 and belongs to
 // the `fp8_static` variant, outside this port's scope. Signatures mirror
@@ -301,6 +324,77 @@ pub fn adaptive_rms_quant_f16_e4m3(
     _scale: f32,
 ) -> Result<Tensor> {
     Err(not_ported("norm::adaptive_rms_quant_f16_e4m3"))
+}
+
+#[cfg(apxinf_musa_available)]
+fn launch_adaptive_layer(
+    ctx: &MusaContext,
+    input: &Tensor,
+    modulation: &Tensor,
+    output: &Tensor,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<()> {
+    let rows = checked_i32("adaptive_layer_norm", "rows", rows)?;
+    let cols = checked_i32("adaptive_layer_norm", "cols", cols)?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_adaptive_layer_norm_bf16(
+                tensor_ptr(input)?,
+                tensor_ptr(modulation)?,
+                tensor_ptr(output)?,
+                rows,
+                cols,
+                eps,
+                ctx.stream().handle(),
+            ),
+            "adaptive_layer_norm",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+fn launch_adaptive_layer(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _modulation: &Tensor,
+    _output: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+) -> Result<()> {
+    Err(native_unavailable("norm::adaptive_layer_bf16"))
+}
+
+/// Native device-resident adaptive LayerNorm.
+pub fn adaptive_layer(
+    ctx: &MusaContext,
+    input: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = require_matrix_bf16(ctx, input, "adaptive LayerNorm", "input")?;
+    require_vector_bf16(
+        ctx,
+        modulation,
+        2 * cols,
+        "adaptive LayerNorm",
+        "modulation",
+    )?;
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other(
+            "MUSA adaptive LayerNorm needs positive finite epsilon".into(),
+        ));
+    }
+    let output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    #[cfg(apxinf_musa_available)]
+    {
+        launch_adaptive_layer(ctx, input, modulation, &output, rows, cols, eps)?;
+        return Ok(output);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(native_unavailable("norm::adaptive_layer_bf16"))
 }
 
 #[cfg(all(test, apxinf_musa_available))]
@@ -450,12 +544,16 @@ mod tests {
             let base = row * cols;
             let row_values = &input_values[base..base + cols];
             let mean = row_values.iter().sum::<f32>() / cols as f32;
-            let variance =
-                row_values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
+            let variance = row_values
+                .iter()
+                .map(|v| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / cols as f32;
             let inverse_std = 1.0 / (variance + EPS).sqrt();
             for col in 0..cols {
-                let expected =
-                    round((row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col]);
+                let expected = round(
+                    (row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col],
+                );
                 let error = (got[base + col] - expected).abs();
                 worst = worst.max(error);
                 assert!(

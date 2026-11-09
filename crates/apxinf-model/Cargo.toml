@@ -57,6 +57,10 @@ name = "gr00t_bench"
 required-features = ["cuda"]
 
 [[example]]
+name = "gr00t_bench_musa"
+required-features = ["musa"]
+
+[[example]]
 name = "pi05_integrity_probe"
 required-features = ["cuda"]
 

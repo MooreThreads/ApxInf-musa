@@ -131,6 +131,66 @@ __global__ void row_softmax_f32_kernel(float* data, int rows, int cols) {
   }
 }
 
+// GQA K/V variant of the token-major -> head-major permutation. The source
+// has `kv_heads`, while the destination deliberately has `q_heads`: adjacent
+// groups of `q_heads / kv_heads` query heads read the same K/V head. This
+// folds eager's `repeat_interleave(..., dim=1)` into the layout conversion, so
+// no repeated token-major tensor is materialised first.
+template <typename Out>
+__global__ void permute_gqa_kv_kernel(const __mt_bfloat16* in, Out* out,
+                                      int tokens, int kv_heads, int q_heads,
+                                      int dim) {
+  const int token = blockIdx.x;
+  const int warps = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int repeats = q_heads / kv_heads;
+  for (int q_head = threadIdx.x >> 5; q_head < q_heads; q_head += warps) {
+    const int kv_head = q_head / repeats;
+    const int64_t source =
+        (static_cast<int64_t>(token) * kv_heads + kv_head) * dim;
+    const int64_t destination =
+        (static_cast<int64_t>(q_head) * tokens + token) * dim;
+    for (int d = lane; d < dim; d += 32) {
+      out[destination + d] = static_cast<Out>(in[source + d]);
+    }
+  }
+}
+// In-place softmax for equal-length causal self-attention. Rows are flattened
+// from `[heads, tokens, tokens]`; row `r` may only observe columns
+// `0..=(r % tokens)`. Masked probabilities are written as zero, matching the
+// eager bridge's `masked_fill(-inf)` followed by softmax without allocating a
+// boolean mask or a second score tensor.
+__global__ void causal_row_softmax_f32_kernel(float* data, int rows,
+                                              int tokens) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  float* target = data + static_cast<int64_t>(row) * tokens;
+  const int visible = row % tokens + 1;
+
+  float local_max = -3.402823466e38f;
+  for (int col = lane; col < visible; col += 32) {
+    local_max = fmaxf(local_max, target[col]);
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+  }
+  const float maximum = local_max;
+
+  float local_sum = 0.0f;
+  for (int col = lane; col < visible; col += 32) {
+    local_sum += expf(target[col] - maximum);
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+  }
+  const float inverse = 1.0f / local_sum;
+
+  for (int col = lane; col < tokens; col += 32) {
+    target[col] = col < visible ? expf(target[col] - maximum) * inverse : 0.0f;
+  }
+}
+
 // Split a packed `[tokens, 3 * projection_width]` projection into contiguous
 // q | k | v segments, adding an optional per-column bias, rounded once.
 //

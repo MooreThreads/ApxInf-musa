@@ -102,6 +102,8 @@ fn launch(
 ) -> Result<()> {
     let assembly = if super::in_decode_scope() {
         super::assembly::launch(ctx, activation, weight, output, rows, cols, inner)?
+    } else if super::assembly::launch_exact(ctx, activation, weight, output, rows, cols, inner)? {
+        true
     } else {
         super::assembly::launch_encode(ctx, activation, weight, output, rows, cols, inner)?
     };

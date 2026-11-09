@@ -179,3 +179,41 @@ extern "C" int apxinf_musa_asm_gemm(const void* a, const void* b, void* out,
     if (status!=MUSA_SUCCESS) { set_error("ASM GEMM launch failed: %d",int(status)); return -1; }
     return 0;
 }
+
+// Launch one of the base NN/NT images explicitly. Rust's exact-shape table
+// owns the measured choice; the existing selector remains unchanged for the
+// official encode/decode paths above.
+extern "C" int apxinf_musa_asm_gemm_variant(const void* a, const void* b,
+                                             void* out, int m, int n, int k,
+                                             int variant, void* stream) {
+    if (!a || !b || !out || m<=0 || n<=0 || k<=0 || k%32 ||
+        variant<0 || variant>=12 || int64_t(m)*k*2>INT_MAX ||
+        int64_t(n)*k*2>INT_MAX || int64_t(m)*n*2>INT_MAX) {
+        set_error("ASM GEMM variant: invalid shape, variant, or buffer exceeds int32 ABI");
+        return -1;
+    }
+    if (!select_device(stream_device(stream))) {
+        set_error("ASM GEMM variant: cannot select stream device");
+        return -1;
+    }
+    const int nt=variant<6;
+    auto fn=load(variant,stream);
+    if (!fn) return -1;
+    int out_bytes=m*n*2, a_bytes=m*k*2, b_bytes=n*k*2, zero=0, batch=1;
+    int sa=m*k,sb=n*k,sc=m*n,ldb=nt ? k : n;
+    float alpha=1.f,beta=0.f,gamma=0.f;
+    void* nil=nullptr;
+    void* args[]={&out,&out_bytes,&zero,&a,&a_bytes,&zero,&b,&b_bytes,&zero,
+        &nil,&zero,&zero,&nil,&zero,&zero,&nil,&zero,&zero,&nil,&zero,&zero,
+        &m,&n,&k,&k,&ldb,&n,&alpha,&beta,&gamma,&batch,&sa,&sb,&sc};
+    const auto& cfg=images[variant];
+    const int grid_m=(m+cfg.m-1)/cfg.m, grid_n=(n+cfg.n-1)/cfg.n;
+    auto status=muLaunchKernel(fn,cfg.m_fast ? grid_m : grid_n,
+        cfg.m_fast ? grid_n : grid_m,1,cfg.threads,1,1,0,
+        reinterpret_cast<MUstream>(stream),args,nullptr);
+    if (status!=MUSA_SUCCESS) {
+        set_error("ASM GEMM variant launch failed: %d",int(status));
+        return -1;
+    }
+    return 0;
+}

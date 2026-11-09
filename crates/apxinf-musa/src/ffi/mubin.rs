@@ -81,6 +81,16 @@ extern "C" {
         nt: i32,
         stream: *mut c_void,
     ) -> i32;
+    pub fn apxinf_musa_asm_gemm_variant(
+        a: *const c_void,
+        b: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        variant: i32,
+        stream: *mut c_void,
+    ) -> i32;
     pub fn apxinf_musa_asm_transpose(
         input: *const c_void,
         out: *mut c_void,

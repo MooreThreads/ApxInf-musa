@@ -220,7 +220,7 @@ Its timing boundary starts at those host tensors and ends after model-core
 action D2H; it excludes simulator and raw-observation preprocessing time.
 
 ```bash
-python scripts/bench_gr00t.py \
+python scripts/gr00t/bench_apxinf_cuda.py \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
   --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
   --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
@@ -237,6 +237,50 @@ bundled database merely to bypass provenance validation. The report records
 P50/P95 and the complete normalized model-core output. Generated fixtures,
 reference dumps, logs, tactic databases, and result JSON belong under
 `devlocal/gr00t-n1d7/` and are not committed.
+
+### MUSA BF16
+
+The MUSA implementation is a self-contained backend-native port under
+`crates/apxinf-model/src/musa_gr00t/`; it does not import or modify the CUDA
+`gr00t/` implementation. The maintained MUSA scope is BF16, batch 1, two
+camera grids, explicit processor-owned initial noise, and preprocessed tensors
+from NVIDIA's official processor. FP8 and INT8 are rejected at load time.
+
+Build the native runner for the target MUSA generation, then use the Python
+script only as a launcher and report/parity wrapper:
+
+```bash
+APXINF_MUSA_ARCH=mp_22 \
+cargo build --release -p apxinf-model --features musa \
+  --example gr00t_bench_musa
+
+python scripts/gr00t/bench_apxinf_musa.py \
+  --precision bf16 \
+  --binary target/release/examples/gr00t_bench_musa \
+  --checkpoint path_to/GR00T-N1.7-LIBERO/libero_10 \
+  --backbone path_to/Cosmos-Reason2-2B \
+  --fixture path_to/libero-two-view \
+  --reference path_to/orin_gold/debug.npz \
+  --execution require-graph \
+  --warmup 10 \
+  --iterations 50 \
+  --output path_to/gr00t-musa-bf16.json
+```
+
+The benchmark defaults to strict prepared Graph execution (`require-graph`) and
+requires the runtime to report `musa-graph`; capture failure is an error rather
+than a silent eager fallback. Use `--execution eager` only for an explicit
+NoGraph comparison, or `--execution prefer-graph` when an observable eager
+fallback is acceptable. The timing boundary starts with the preprocessed host
+tensors and ends after action D2H, matching the native CUDA fixed-input
+benchmark.
+
+The optimized text paths admit dynamic sequence lengths in
+`128 < sequence_length <= 256`. Shapes outside an exact optimization predicate
+remain on the model-neutral GEMM, attention, normalization, and RoPE fallbacks;
+145 is a measured profile, not a required constant. MUSA-specific assembly
+images are selected inside the backend dispatcher and never by model-layer
+kernel names.
 
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:

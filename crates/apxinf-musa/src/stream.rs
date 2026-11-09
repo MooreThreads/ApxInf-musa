@@ -1,11 +1,17 @@
 //! A MUSA stream, owned by the context that created it.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use apxinf_core::{Error, Result};
 
 use crate::ffi;
+
+thread_local! {
+    static OVERRIDES: RefCell<HashMap<usize, *mut c_void>> = RefCell::new(HashMap::new());
+}
 
 /// The handle is atomic only because the context lends the stream out as
 /// `&MusaStream` and one state — an invalidated capture — has to be left by
@@ -39,8 +45,55 @@ impl MusaStream {
         })
     }
 
+    /// A non-blocking stream owned by an isolated graph capture.
+    pub(crate) fn new_isolated() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe { ffi::check_runtime(ffi::musa::musaStreamCreateWithFlags(&mut handle, 1)) }
+            .map_err(Error::Other)?;
+        Ok(Self {
+            handle: AtomicPtr::new(handle),
+        })
+    }
+
+    /// Bind operations using this stream object to `stream` on this thread.
+    ///
+    /// The override is intentionally scoped and thread-local. It lets a model
+    /// warm and record on a non-blocking capture stream without replacing the
+    /// context's normal replay stream or changing any eager caller.
+    pub(crate) fn with_override<T>(&self, stream: &Self, operation: impl FnOnce() -> T) -> T {
+        struct Restore(usize, Option<*mut c_void>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OVERRIDES.with(|overrides| {
+                    let mut overrides = overrides.borrow_mut();
+                    if let Some(previous) = self.1 {
+                        overrides.insert(self.0, previous);
+                    } else {
+                        overrides.remove(&self.0);
+                    }
+                });
+            }
+        }
+
+        let key = self.handle.load(Ordering::Acquire) as usize;
+        let previous = OVERRIDES.with(|overrides| {
+            overrides
+                .borrow_mut()
+                .insert(key, stream.handle.load(Ordering::Acquire))
+        });
+        let _restore = Restore(key, previous);
+        operation()
+    }
+
     pub fn handle(&self) -> *mut c_void {
-        self.handle.load(Ordering::Acquire)
+        let handle = self.handle.load(Ordering::Acquire);
+        OVERRIDES.with(|overrides| {
+            overrides
+                .borrow()
+                .get(&(handle as usize))
+                .copied()
+                .unwrap_or(handle)
+        })
     }
 
     pub fn synchronize(&self) -> Result<()> {

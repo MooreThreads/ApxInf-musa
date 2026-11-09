@@ -15,6 +15,190 @@ pub(crate) struct PreparedWeights {
     >,
 }
 
+#[cfg(apxinf_musa_available)]
+#[derive(Clone, Copy)]
+struct ExactKernel {
+    m_min: usize,
+    m_max: usize,
+    n: usize,
+    k: usize,
+    variant: i32,
+    transpose: bool,
+}
+
+#[cfg(apxinf_musa_available)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactGemvKernel {
+    tile_n: i32,
+    load_count: i32,
+}
+
+// Measured MP22 choices for the BF16 shapes used by the current vision,
+// language and action stacks. The M range intentionally covers dynamic token
+// lengths where the same tile remains valid; unmatched shapes keep the
+// official encode/decode or vendor-provider path.
+#[cfg(apxinf_musa_available)]
+const EXACT_KERNELS: &[ExactKernel] = &[
+    ExactKernel {
+        m_min: 1,
+        m_max: 32,
+        n: 1536,
+        k: 2048,
+        variant: 2,
+        transpose: true,
+    },
+    ExactKernel {
+        m_min: 40,
+        m_max: 40,
+        n: 1536,
+        k: 1536,
+        variant: 7,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 40,
+        m_max: 40,
+        n: 1536,
+        k: 3072,
+        variant: 2,
+        transpose: true,
+    },
+    ExactKernel {
+        m_min: 128,
+        m_max: 128,
+        n: 1536,
+        k: 2048,
+        variant: 7,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 128,
+        m_max: 128,
+        n: 2048,
+        k: 4096,
+        variant: 1,
+        transpose: true,
+    },
+    ExactKernel {
+        m_min: 128,
+        m_max: 128,
+        n: 4096,
+        k: 4096,
+        variant: 7,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 1024,
+        k: 2048,
+        variant: 7,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 2048,
+        k: 8192,
+        variant: 10,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 2048,
+        k: 6144,
+        variant: 10,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 2048,
+        k: 2048,
+        variant: 10,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 6144,
+        k: 2048,
+        variant: 9,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 129,
+        m_max: 256,
+        n: 8192,
+        k: 2048,
+        variant: 5,
+        transpose: true,
+    },
+    ExactKernel {
+        m_min: 512,
+        m_max: 512,
+        n: 1024,
+        k: 1024,
+        variant: 7,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 512,
+        m_max: 512,
+        n: 1024,
+        k: 1536,
+        variant: 1,
+        transpose: true,
+    },
+    ExactKernel {
+        m_min: 512,
+        m_max: 512,
+        n: 1024,
+        k: 4096,
+        variant: 10,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 512,
+        m_max: 512,
+        n: 3072,
+        k: 1024,
+        variant: 9,
+        transpose: false,
+    },
+    ExactKernel {
+        m_min: 512,
+        m_max: 512,
+        n: 4096,
+        k: 1024,
+        variant: 10,
+        transpose: false,
+    },
+];
+
+#[cfg(apxinf_musa_available)]
+fn exact_kernel(m: usize, n: usize, k: usize) -> Option<ExactKernel> {
+    EXACT_KERNELS
+        .iter()
+        .copied()
+        .find(|entry| (entry.m_min..=entry.m_max).contains(&m) && entry.n == n && entry.k == k)
+}
+
+/// M=1 shapes whose scalar-FMA GEMV was measured faster than muBLAS GEMM on
+/// MP22. Only steady-state GR00T shapes are routed here; unmatched shapes keep
+/// the regular exact-ASM or provider path.
+#[cfg(apxinf_musa_available)]
+fn exact_gemv_kernel(m: usize, n: usize, k: usize) -> Option<ExactGemvKernel> {
+    match (m, n, k) {
+        (1, 1024, 132) | (1, 1536, 1024) => Some(ExactGemvKernel {
+            tile_n: 64,
+            load_count: 4,
+        }),
+        _ => None,
+    }
+}
+
 /// Prepare a fixed KN BF16 weight as contiguous NK once, outside capture.
 /// The caller must not mutate the source after registration. Other targets
 /// and unsupported K dimensions keep the vendor path and need no preparation.
@@ -109,6 +293,95 @@ fn supports(m: usize, n: usize, k: usize) -> bool {
                 .and_then(|v| v.checked_mul(2))
                 .is_some_and(|bytes| bytes <= i32::MAX as usize)
         })
+}
+
+#[cfg(apxinf_musa_available)]
+fn prepared_nt_weight(ctx: &MusaContext, weight: &Tensor, k: usize, n: usize) -> Result<Tensor> {
+    use super::super::contracts::tensor_ptr;
+    use crate::error::musa_error;
+    let key = (tensor_ptr(weight)? as usize, k, n);
+    {
+        let mut weights = ctx
+            .asm_weights
+            .lock()
+            .map_err(|_| musa_error("ASM weight lock poisoned"))?;
+        if let Some((_, Some(transposed))) = weights.entries.get(&key) {
+            return Ok(transposed.clone());
+        }
+        // A model may have registered the same immutable weight for the
+        // official NN encode path before an exact NT shape is seen. Upgrade
+        // the cache during prepare; later dispatches can reuse the NT tensor.
+        weights.entries.remove(&key);
+    }
+    prepare(ctx, weight, true)?;
+    ctx.asm_weights
+        .lock()
+        .map_err(|_| musa_error("ASM weight lock poisoned"))?
+        .entries
+        .get(&key)
+        .and_then(|(_, transposed)| transposed.clone())
+        .ok_or_else(|| musa_error("ASM exact-shape weight preparation did not retain NT data"))
+}
+
+/// Launch a measured exact-shape MP22 image. Shape selection and any required
+/// immutable KN-to-NK preparation remain internal to the GEMM dispatcher.
+#[cfg(apxinf_musa_available)]
+pub(super) fn launch_exact(
+    ctx: &MusaContext,
+    a: &Tensor,
+    w: &Tensor,
+    out: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<bool> {
+    use super::super::contracts::tensor_ptr;
+    use crate::{error::musa_error, ffi};
+    if crate::MUSA_ARCH == "mp_22" {
+        if let Some(kernel) = exact_gemv_kernel(m, n, k) {
+            let status = unsafe {
+                ffi::custom::apxinf_musa_bf16_gemv_m1(
+                    tensor_ptr(a)?,
+                    tensor_ptr(w)?,
+                    tensor_ptr(out)?,
+                    n as i32,
+                    k as i32,
+                    kernel.tile_n,
+                    kernel.load_count,
+                    ctx.stream().handle(),
+                )
+            };
+            ffi::check_runtime(status).map_err(musa_error)?;
+            return Ok(true);
+        }
+    }
+    let Some(kernel) = exact_kernel(m, n, k) else {
+        return Ok(false);
+    };
+    if !supports(m, n, k) {
+        return Ok(false);
+    }
+    let prepared;
+    let weight = if kernel.transpose {
+        prepared = prepared_nt_weight(ctx, w, k, n)?;
+        &prepared
+    } else {
+        w
+    };
+    let status = unsafe {
+        ffi::mubin::apxinf_musa_asm_gemm_variant(
+            tensor_ptr(a)?,
+            tensor_ptr(weight)?,
+            tensor_ptr(out)?,
+            m as i32,
+            n as i32,
+            k as i32,
+            kernel.variant,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::mubin::check_asm_gemm(status, "asm exact-shape bf16 gemm").map_err(musa_error)?;
+    Ok(true)
 }
 
 #[cfg(apxinf_musa_available)]
@@ -215,6 +488,38 @@ mod support_tests {
             assert!(!supports(shape.0, shape.1, shape.2));
         }
         assert_eq!(supports(10, 1024, 1024), crate::MUSA_ARCH == "mp_22");
+    }
+
+    #[cfg(apxinf_musa_available)]
+    #[test]
+    fn exact_table_covers_dynamic_text_rows_without_claiming_m41() {
+        assert_eq!(
+            exact_gemv_kernel(1, 1024, 132),
+            Some(ExactGemvKernel {
+                tile_n: 64,
+                load_count: 4
+            })
+        );
+        assert_eq!(
+            exact_gemv_kernel(1, 1536, 1024),
+            Some(ExactGemvKernel {
+                tile_n: 64,
+                load_count: 4
+            })
+        );
+        assert!(exact_gemv_kernel(1, 1536, 1536).is_none());
+        assert!(exact_gemv_kernel(2, 1024, 132).is_none());
+        for rows in [129, 141, 145, 255, 256] {
+            let kernel = exact_kernel(rows, 2048, 2048).expect("dynamic text GEMM");
+            assert_eq!(kernel.variant, 10);
+            assert!(!kernel.transpose);
+        }
+        let short = exact_kernel(17, 1536, 2048).expect("short text GEMM");
+        assert_eq!(short.variant, 2);
+        assert!(short.transpose);
+        assert!(exact_kernel(128, 2048, 2048).is_none());
+        assert!(exact_kernel(257, 2048, 2048).is_none());
+        assert!(exact_kernel(41, 1536, 6144).is_none());
     }
 }
 

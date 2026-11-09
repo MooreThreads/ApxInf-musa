@@ -7,12 +7,12 @@ crate's, and the differences are MUSA's own names (`musaMalloc` for
 `cudaMalloc`, `--offload-arch=mp_22` for `-arch=sm_xx`, `musart`/`mublas` for
 `cudart`/`cublas`).
 
-PI0.5 reaches it through `crates/apxinf-model/src/musa_pi05/`, a
-backend-native port that **copies** what it needs instead of sharing the CUDA
-family's code. That placement is the rule in
-[model-layer-architecture](model-layer-architecture.md#where-backend-native-model-code-lives),
-and it is what makes an upstream change to `pi05/` unable to alter MUSA's
-numbers.
+PI0.5 and GR00T reach it through `crates/apxinf-model/src/musa_pi05/` and
+`crates/apxinf-model/src/musa_gr00t/`, backend-native ports that **copy** what
+they need instead of sharing the CUDA families' code. That placement is the
+rule in [model-layer-architecture](model-layer-architecture.md#where-backend-native-model-code-lives),
+and it is what makes an upstream change to a CUDA family unable to alter the
+MUSA port's numbers.
 
 What is measured on M1000 (mp_22), PI0.5 BF16, 2 views, H = 10, 10 flow steps,
 against the `torch-eager-gold.v1` bundle recorded on Orin:
@@ -215,6 +215,33 @@ FP8 is **not ported**, and the port says so rather than silently degrading: an
 FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 `fp8_static`.
 
+## GR00T N1.7 on MUSA
+
+`crates/apxinf-model/src/musa_gr00t/` is the independent MUSA port of the
+GR00T N1.7 model core. Its currently validated slice is BF16 on MP22/M1000 with
+batch 1, two camera grids, official preprocessed tensors, explicit initial
+noise, and dynamic text sequence lengths. The loader rejects FP8 and INT8
+instead of selecting another precision.
+
+The backend keeps exact-shape acceleration behind model-neutral dispatchers.
+Measured GEMM variants, the MP22 scalar M=1 GEMV, muDNN attention, fused
+residual/norm operations, and precomputed text/vision rotary tables are used
+only when their complete shape predicates match; otherwise the existing
+generic device path remains the fallback. The GEMV route is limited to the two
+measured steady-state shapes `(1,1024,132)` and `(1,1536,1024)`. In particular,
+the optimized text interval is
+`128 < sequence_length <= 256`, not an exact 145-token contract.
+
+Use `scripts/gr00t/bench_apxinf_musa.py` to launch the native Rust benchmark and apply
+the BF16 parity gate. The script does not execute the model in Python. See
+[GR00T N1.7](gr00t-n1.7.md#musa-bf16) for the fixed-input contract and command.
+The MUSA GR00T loader accepts a tactics JSON file through `--tactics`.
+Use `--autotune --tactics path_to/tactics.json` to measure missing BF16 GEMM
+choices before Graph capture. Exact assembly routes retain their existing
+dispatch; other supported BF16 shapes tune between muBLAS and muDNN.
+Capture itself suppresses tuning. Device and library fingerprints prevent
+reusing incompatible tactic databases.
+
 ## Serving on MUSA
 
 The websocket policy server runs unchanged on this backend: `WebsocketPolicyServer`
@@ -414,6 +441,24 @@ is memory-bound and its spread moves with host load: runs an hour apart can
 differ by several percent with no code change. Second, the `.venv` wheel has to
 be rebuilt after any change to `crates/apxinf-musa` or the port — a stale wheel
 measures the previous build, and nothing else tells you that.
+
+## GR00T BF16 batched vision attention
+
+The MUSA GR00T BF16 path batches two independent 256-token vision segments
+with 16 heads and head dimension 64 into one muDNN Flash call. The output
+is contiguous `[512, 1024]`, avoiding the two-call path's final concatenation.
+The backend currently enables this route only for `mp_22`; other architectures
+and unmeasured shapes retain the existing segmented path. Vendor errors are
+propagated rather than silently changing algorithms.
+
+Set `APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION=1` to retain the previous
+two-call path for same-binary A/B testing. The backend's legacy BF16 SDPA mode
+also bypasses batching. Keep prepared arena enabled, allocation cache disabled,
+and use W10/R50 with required Graph execution for whole-model comparisons.
+For the fixed `libero-two-view` fixture, use the Orin normalized-action gold
+under `path_to/orin_gold/debug.npz`
+with `scripts/gr00t/compare_outputs.py --reference`; changed inputs need their
+own matching reference. Candidate and baseline should additionally match exactly.
 
 ## Verifying the port's own tests
 

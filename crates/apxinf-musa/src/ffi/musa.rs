@@ -54,6 +54,7 @@ extern "C" {
     pub fn musaGetErrorString(error: musaError_t) -> *const std::ffi::c_char;
     pub fn musaDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> musaError_t;
     pub fn musaDeviceSynchronize() -> musaError_t;
+    pub fn musaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> musaError_t;
     pub fn musaStreamBeginCapture(stream: *mut c_void, mode: i32) -> musaError_t;
     pub fn musaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> musaError_t;
     pub fn musaGraphInstantiate(

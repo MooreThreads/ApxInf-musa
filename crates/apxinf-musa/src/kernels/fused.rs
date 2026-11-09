@@ -1,24 +1,24 @@
 //! Fused residual and normalization operator contracts.
 
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
 
-#[cfg(apxinf_musa_available)]
-use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matching_bf16, require_matrix_bf16,
     require_optional_vector_bf16, require_output_matrix, require_vector_at_least_bf16,
     require_vector_bf16,
 };
+#[cfg(apxinf_musa_available)]
+use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::error::musa_error;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
-use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
+use crate::kernels::not_ported;
 
 /// The two outputs of a fused residual-plus-normalization step.
 ///
@@ -148,7 +148,14 @@ pub fn bias_residual_rms_bf16_into(
     require_vector_bf16(ctx, weight, cols, "bias residual rms", "weight")?;
     require_optional_vector_bf16(ctx, bias, cols, "bias residual rms", "bias")?;
     require_output_matrix(ctx, hidden, rows, cols, "bias residual rms", "hidden")?;
-    require_output_matrix(ctx, normalized, rows, cols, "bias residual rms", "normalized")?;
+    require_output_matrix(
+        ctx,
+        normalized,
+        rows,
+        cols,
+        "bias residual rms",
+        "normalized",
+    )?;
     launch_bias_residual_rms(
         ctx, projection, bias, residual, weight, hidden, normalized, rows, cols, eps,
     )
@@ -418,7 +425,14 @@ pub fn adaptive_gate_residual_rms_bf16_into(
     require_vector_at_least_bf16(ctx, gate_style, 3 * cols, "ada gate residual", "gate_style")?;
     require_vector_at_least_bf16(ctx, norm_style, 2 * cols, "ada gate residual", "norm_style")?;
     require_output_matrix(ctx, hidden, rows, cols, "ada gate residual", "hidden")?;
-    require_output_matrix(ctx, normalized, rows, cols, "ada gate residual", "normalized")?;
+    require_output_matrix(
+        ctx,
+        normalized,
+        rows,
+        cols,
+        "ada gate residual",
+        "normalized",
+    )?;
     launch(
         ctx, projection, residual, gate_style, norm_style, hidden, normalized, rows, cols, eps,
     )
@@ -493,6 +507,38 @@ fn launch(
     Err(native_unavailable("fused::adaptive_gate_residual_rms_bf16"))
 }
 
+pub fn bias_residual_bf16_packed4(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _bias: &Tensor,
+    _residual: &Tensor,
+) -> Result<Tensor> {
+    Err(not_ported("fused::bias_residual_bf16_packed4"))
+}
+
+pub fn bias_then_residual_bf16_packed4(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _bias: Option<&Tensor>,
+    _residual: &Tensor,
+) -> Result<Tensor> {
+    Err(not_ported("fused::bias_then_residual_bf16_packed4"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bias_residual_layer_quant_bf16_e4m3(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _projection_bias: Option<&Tensor>,
+    _residual: &Tensor,
+    _norm_weight: &Tensor,
+    _norm_bias: &Tensor,
+    _eps: f32,
+    _scale: f32,
+) -> Result<ResidualNormTensors> {
+    Err(not_ported("fused::bias_residual_layer_quant_bf16_e4m3"))
+}
+
 // ── FP8 and FP8-output fused operators (not ported) ──────────────────────
 
 /// FP8 GEMM plus an FP16 bias, returning FP16.
@@ -505,7 +551,14 @@ pub fn gemm_bias_fp8(
     activation_scale: f32,
     weight_scale: f32,
 ) -> Result<Tensor> {
-    let _ = (ctx, activation, weight, bias, activation_scale, weight_scale);
+    let _ = (
+        ctx,
+        activation,
+        weight,
+        bias,
+        activation_scale,
+        weight_scale,
+    );
     Err(not_ported("fused::gemm_bias_fp8"))
 }
 
@@ -607,15 +660,207 @@ pub fn adaptive_gate_residual_rms_quant_f16_e4m3(
     scale: f32,
 ) -> Result<ResidualNormTensors> {
     let _ = (
+        ctx, projection, residual, gate_style, norm_style, eps, scale,
+    );
+    Err(not_ported(
+        "fused::adaptive_gate_residual_rms_quant_f16_e4m3",
+    ))
+}
+
+/// Add bias with BF16 rounding before adding the residual, matching the
+/// CUDA contract in one native launch.
+pub fn bias_then_residual_bf16(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let (rows, cols) = require_matrix_bf16(ctx, projection, "bias then residual", "projection")?;
+    let residual_shape = require_matrix_bf16(ctx, residual, "bias then residual", "residual")?;
+    if residual_shape != (rows, cols) {
+        return Err(Error::Other(
+            "MUSA bias-then-residual shape mismatch".into(),
+        ));
+    }
+    if let Some(value) = bias {
+        require_vector_bf16(ctx, value, cols, "bias then residual", "bias")?;
+    }
+    let output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        let bias_pointer = match bias {
+            Some(value) => tensor_ptr(value)?,
+            None => std::ptr::null_mut(),
+        };
+        check_native(
+            ffi::custom::apxinf_musa_bias_then_residual_bf16(
+                tensor_ptr(projection)?,
+                bias_pointer,
+                tensor_ptr(residual)?,
+                tensor_ptr(&output)?,
+                checked_i32("bias then residual", "rows", rows)?,
+                checked_i32("bias then residual", "columns", cols)?,
+                ctx.stream().handle(),
+            ),
+            "bias_then_residual_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("fused::bias_then_residual_bf16"));
+    Ok(output)
+}
+
+/// Add bias with a BF16 rounding boundary, add the residual with another BF16
+/// boundary, then apply LayerNorm. Exact-shape acceleration stays inside this
+/// model-neutral dispatcher; other shapes preserve the same semantics through
+/// the primitive composition.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_then_residual_layer_bf16(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) =
+        require_matrix_bf16(ctx, projection, "bias then residual layer", "projection")?;
+    require_matching_bf16(
         ctx,
+        "bias then residual layer",
+        "residual",
         projection,
         residual,
-        gate_style,
-        norm_style,
-        eps,
-        scale,
-    );
-    Err(not_ported("fused::adaptive_gate_residual_rms_quant_f16_e4m3"))
+    )?;
+    require_vector_bf16(
+        ctx,
+        projection_bias,
+        cols,
+        "bias then residual layer",
+        "projection_bias",
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_weight,
+        cols,
+        "bias then residual layer",
+        "norm_weight",
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_bias,
+        cols,
+        "bias then residual layer",
+        "norm_bias",
+    )?;
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other(
+            "MUSA bias-then-residual LayerNorm needs positive finite epsilon".into(),
+        ));
+    }
+    if rows == 41 && cols == 1536 {
+        let hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+        let normalized = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+        #[cfg(apxinf_musa_available)]
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_bias_then_residual_layer_norm_bf16(
+                    tensor_ptr(projection)?,
+                    tensor_ptr(projection_bias)?,
+                    tensor_ptr(residual)?,
+                    tensor_ptr(norm_weight)?,
+                    tensor_ptr(norm_bias)?,
+                    tensor_ptr(&hidden)?,
+                    tensor_ptr(&normalized)?,
+                    checked_i32("bias then residual layer", "rows", rows)?,
+                    checked_i32("bias then residual layer", "columns", cols)?,
+                    eps,
+                    ctx.stream().handle(),
+                ),
+                "bias_then_residual_layer_bf16",
+            )?;
+        }
+        #[cfg(not(apxinf_musa_available))]
+        return Err(native_unavailable("fused::bias_then_residual_layer_bf16"));
+        return Ok(ResidualNormTensors { hidden, normalized });
+    }
+    let hidden = bias_then_residual_bf16(ctx, projection, Some(projection_bias), residual)?;
+    let normalized = super::norm::layer_bf16(ctx, &hidden, norm_weight, norm_bias, eps)?;
+    Ok(ResidualNormTensors { hidden, normalized })
+}
+
+/// The same two-rounding residual contract followed by adaptive LayerNorm.
+pub fn bias_then_residual_adaptive_layer_bf16(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) = require_matrix_bf16(
+        ctx,
+        projection,
+        "bias then residual adaptive layer",
+        "projection",
+    )?;
+    require_matching_bf16(
+        ctx,
+        "bias then residual adaptive layer",
+        "residual",
+        projection,
+        residual,
+    )?;
+    require_vector_bf16(
+        ctx,
+        projection_bias,
+        cols,
+        "bias then residual adaptive layer",
+        "projection_bias",
+    )?;
+    require_vector_bf16(
+        ctx,
+        modulation,
+        2 * cols,
+        "bias then residual adaptive layer",
+        "modulation",
+    )?;
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other(
+            "MUSA bias-then-residual adaptive LayerNorm needs positive finite epsilon".into(),
+        ));
+    }
+    if rows == 41 && cols == 1536 {
+        let hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+        let normalized = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+        #[cfg(apxinf_musa_available)]
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_bias_then_residual_adaptive_layer_norm_bf16(
+                    tensor_ptr(projection)?,
+                    tensor_ptr(projection_bias)?,
+                    tensor_ptr(residual)?,
+                    tensor_ptr(modulation)?,
+                    tensor_ptr(&hidden)?,
+                    tensor_ptr(&normalized)?,
+                    checked_i32("bias then residual adaptive layer", "rows", rows)?,
+                    checked_i32("bias then residual adaptive layer", "columns", cols)?,
+                    eps,
+                    ctx.stream().handle(),
+                ),
+                "bias_then_residual_adaptive_layer_bf16",
+            )?;
+        }
+        #[cfg(not(apxinf_musa_available))]
+        return Err(native_unavailable(
+            "fused::bias_then_residual_adaptive_layer_bf16",
+        ));
+        return Ok(ResidualNormTensors { hidden, normalized });
+    }
+    let hidden = bias_then_residual_bf16(ctx, projection, Some(projection_bias), residual)?;
+    let normalized = super::norm::adaptive_layer(ctx, &hidden, modulation, eps)?;
+    Ok(ResidualNormTensors { hidden, normalized })
 }
 
 #[cfg(all(test, apxinf_musa_available))]
@@ -746,15 +991,8 @@ mod tests {
         let weight = upload(ctx, &weight_values, Shape::new(vec![cols]));
         let bias = with_bias.then(|| upload(ctx, &bias_values, Shape::new(vec![cols])));
 
-        let out = bias_residual_rms_bf16(
-            ctx,
-            &projection,
-            bias.as_ref(),
-            &residual,
-            &weight,
-            EPS,
-        )
-        .expect("native fused bias residual rms");
+        let out = bias_residual_rms_bf16(ctx, &projection, bias.as_ref(), &residual, &weight, EPS)
+            .expect("native fused bias residual rms");
         ctx.stream().synchronize().expect("synchronise");
         let got_hidden = read_back(&out.hidden);
         let got_normalized = read_back(&out.normalized);
@@ -998,7 +1236,11 @@ mod tests {
             Shape::new(vec![rows, cols]),
         );
         let weight = upload(&ctx, &values(cols, 0x0bad_c0de), Shape::new(vec![cols]));
-        let style = upload(&ctx, &values(3 * cols, 0x1357_9bdf), Shape::new(vec![3 * cols]));
+        let style = upload(
+            &ctx,
+            &values(3 * cols, 0x1357_9bdf),
+            Shape::new(vec![3 * cols]),
+        );
 
         // Same shape, same device, F16 instead of BF16.
         let f16_residual = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F16);
