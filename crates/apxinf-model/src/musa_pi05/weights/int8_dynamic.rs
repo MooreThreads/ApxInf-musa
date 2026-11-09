@@ -595,6 +595,64 @@ mod linear {
             }
         }
 
+        /// Affine norm fused with this projection's row quantization.
+        ///
+        /// A norm bias selects LayerNorm; without it this is RMSNorm. Only
+        /// meaningful on the quantized route; callers with a BF16 fallback
+        /// projection keep the materialized norm.
+        pub fn prepare_norm(
+            &self,
+            ctx: &Context,
+            input: &Tensor,
+            weight: &Tensor,
+            norm_bias: Option<&Tensor>,
+            eps: f32,
+        ) -> Result<crate::musa_pi05::backend::NormalizedW8A8Input> {
+            let (_hidden, normalized) =
+                crate::musa_pi05::backend::gemm::norm_quantize_w8a8_activation(
+                    ctx,
+                    input,
+                    None,
+                    weight,
+                    norm_bias,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?;
+            Ok(crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(
+                normalized,
+            ))
+        }
+
+        /// Residual + affine norm fused with this projection's row quantization.
+        pub fn prepare_residual_norm(
+            &self,
+            ctx: &Context,
+            projection: &Tensor,
+            residual: &Tensor,
+            residual_bias: Option<&Tensor>,
+            weight: &Tensor,
+            norm_bias: Option<&Tensor>,
+            eps: f32,
+        ) -> Result<(Tensor, crate::musa_pi05::backend::NormalizedW8A8Input)> {
+            let (hidden, normalized) =
+                crate::musa_pi05::backend::gemm::norm_quantize_w8a8_activation(
+                    ctx,
+                    projection,
+                    Some((residual, residual_bias)),
+                    weight,
+                    norm_bias,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?;
+            let hidden = hidden.ok_or_else(|| {
+                Error::Other("residual norm producer must return the hidden stream".into())
+            })?;
+            Ok((
+                hidden,
+                crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(normalized),
+            ))
+        }
+
         pub fn as_kernel_view(&self) -> W8A8WeightView<'_> {
             W8A8WeightView::new(
                 &self.weight_output_major,

@@ -47,6 +47,7 @@ namespace {
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/quantization.cuh"
+#include "../kernels/custom/norm_quantization.cuh"
 }  // namespace
 
 extern "C" musaError_t apxinf_musa_capture_anchor(musaStream_t stream) {
@@ -974,6 +975,94 @@ extern "C" musaError_t apxinf_musa_ada_rms_quantize_bf16_int8(
         static_cast<const __mt_bfloat16*>(input), nullptr, nullptr,
         static_cast<const __mt_bfloat16*>(norm_style), nullptr, static_cast<int8_t*>(output),
         static_cast<__half*>(scales), rows, cols, eps, static_cast<const float*>(inv_c));
+  }
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_norm_quantize_bf16_int8(
+    const void* input, const void* residual, const void* projection_bias,
+    const void* weight, const void* norm_bias, void* hidden, void* output,
+    void* scales, int rows, int cols, float eps, const void* inv_c,
+    musaStream_t stream) {
+  const bool layer = norm_bias != nullptr;
+  const int alignment = layer ? 8 : 16;
+  if (!input || !weight || !output || !scales || rows <= 0 ||
+      cols != (layer ? 1152 : 2048) || !aligned_to(input, alignment) ||
+      !aligned_to(weight, alignment) || !aligned_to(output, 8) ||
+      !aligned_to(scales, 2) ||
+      (norm_bias && !aligned_to(norm_bias, alignment)) ||
+      (inv_c && !aligned_to(inv_c, 16)) ||
+      (projection_bias &&
+       (!residual || !aligned_to(projection_bias, alignment))) ||
+      (residual && (!hidden || !aligned_to(residual, alignment) ||
+                    !aligned_to(hidden, alignment))))
+    return musaErrorInvalidValue;
+  if (!residual) {
+    if (layer)
+      layer_quantize_bf16_int8_kernel<4, false, false>
+          <<<(rows + 3) / 4, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+              static_cast<__half*>(scales), rows, cols, eps,
+              static_cast<const float*>(inv_c));
+    else
+      rms_quantize_bf16_int8_kernel<false, false><<<rows, 256, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(residual),
+          static_cast<const __mt_bfloat16*>(projection_bias),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(norm_bias),
+          static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+          static_cast<__half*>(scales), rows, cols, eps,
+          static_cast<const float*>(inv_c));
+  } else if (!projection_bias) {
+    if (layer)
+      layer_quantize_bf16_int8_kernel<8, true, false>
+          <<<(rows + 7) / 8, 256, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+              static_cast<__half*>(scales), rows, cols, eps,
+              static_cast<const float*>(inv_c));
+    else
+      rms_quantize_bf16_int8_kernel<true, false><<<rows, 256, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(residual),
+          static_cast<const __mt_bfloat16*>(projection_bias),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(norm_bias),
+          static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+          static_cast<__half*>(scales), rows, cols, eps,
+          static_cast<const float*>(inv_c));
+  } else {
+    if (layer)
+      layer_quantize_bf16_int8_kernel<8, true, true>
+          <<<(rows + 7) / 8, 256, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+              static_cast<__half*>(scales), rows, cols, eps,
+              static_cast<const float*>(inv_c));
+    else
+      rms_quantize_bf16_int8_kernel<true, true><<<rows, 256, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(residual),
+          static_cast<const __mt_bfloat16*>(projection_bias),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(norm_bias),
+          static_cast<__mt_bfloat16*>(hidden), static_cast<int8_t*>(output),
+          static_cast<__half*>(scales), rows, cols, eps,
+          static_cast<const float*>(inv_c));
   }
   return musaGetLastError();
 }

@@ -29,6 +29,7 @@ pub use bf16::{
 };
 pub use qint8_tiles::serves as w8a8_tile_serves;
 pub use w8a8::{
+    norm_quantize_w8a8_activation,
     adaptive_gate_residual_rms_quantize_w8a8_activation,
     adaptive_rms_quantize_w8a8_activation,
     adaptive_layer_norm_quantize_w8a8_activation, decode_scope as w8a8_decode_scope,

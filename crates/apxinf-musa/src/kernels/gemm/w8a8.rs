@@ -61,6 +61,10 @@ use crate::kernels::contracts::checked_i32;
 use crate::kernels::native_unavailable;
 use crate::kernels::not_ported;
 
+#[path = "w8a8_affine_norm.rs"]
+mod affine_norm_quant;
+pub use affine_norm_quant::norm_quantize_w8a8_activation;
+
 #[path = "w8a8_norm.rs"]
 mod norm_quant;
 pub use norm_quant::{
@@ -71,6 +75,10 @@ pub use norm_quant::{
 #[cfg(all(test, apxinf_musa_available))]
 #[path = "w8a8_norm_tests.rs"]
 mod action_norm_tests;
+
+#[cfg(all(test, apxinf_musa_available))]
+#[path = "w8a8_affine_norm_tests.rs"]
+mod encode_norm_tests;
 
 thread_local! {
     static DECODE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
