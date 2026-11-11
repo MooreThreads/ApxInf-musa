@@ -26,9 +26,9 @@ upgrade to.
 
 | file | SHA256 | rendered from |
 |---|---|---|
-| `fa_d256_mp22.asm` | `2d4b5818bc0e9d6f84a322fd3883056fb89f9c13abc0431bae873dacdd51395a` | `fa_d256_mp22.s`, `packed_decode=False split_kv=False` |
-| `fa_d256_mp22_decode.asm` | `0a5285a6624075b9681d34f77686619d83f7dfb8fb7330f5c4fb3ae47064498c` | same, `packed_decode=True split_kv=False` |
-| `fa_d256_mp22_splitkv.asm` | `8d13605463cd9dd624ae1dfeb32a45e1b84419a99bc178bbc1291cd8cd24b17a` | same, `packed_decode=True split_kv=True` |
+| `fa_d256_mp22.asm` | `bb424e28f7dddfd15958aa1e06d30f7cd3d0e9a1fff4fdda430eaa04306c573d` | `fa_d256_mp22.s`, `packed_decode=False split_kv=False` |
+| `fa_d256_mp22_decode.asm` | `e2fac71069de2b0c842f1daf9f7d5d1ca623ea6313e6fca83fb005aef55ee776` | same, `packed_decode=True split_kv=False` |
+| `fa_d256_mp22_splitkv.asm` | `0cada532b38e8e59539941c229c2e5c2986aeac29062c2dc28d08f879d8ae2ad` | same, `packed_decode=True split_kv=True` |
 
 The upstream renderer is muDNN's `ComputeAsmKern` at `6be23bf2` with
 `asm_render` at `aa1fdfa5`, driven by `scripts/render_fa_d256_mp22.py` in the
