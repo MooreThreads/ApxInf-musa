@@ -64,11 +64,12 @@ pub(crate) const QINT8_TILES: [Qint8Tile; 7] = [
 /// one resident block per MP, which is what sinks it once `k` is deep.
 ///
 /// The 522-row shapes are run as whole tiles plus a remainder (see the adapter's
-/// row split), so the tile recorded here is the one that won for the *whole
-/// block*; the adapter picks the remainder tile itself.
-/// The down shape `(522, 2048, 16384)` uses the same arithmetic with M-fast
-/// block traversal: complete split GEMM measured 2.2392 -> 2.1374 ms on M1000
-/// (`devlocal/encode-int8-layout/runs/12-gemm-pipeline/down-repeat-02.json`).
+/// row split), so the tile recorded here is the one that won for the whole-block
+/// launch; the adapter picks the remainder tile itself. The M-fast row is the
+/// exception to that reading: its 2.2392 -> 2.1374 ms is the complete split GEMM
+/// (512-row main launch plus the ten-row tail), measured on M1000 with the
+/// reference launcher at 50 warmup / 200 launches. The key remains the requested
+/// shape, so other `m` values do not inherit the M-fast pick.
 /// Other shapes retain their measured traversal order.
 ///
 /// The `(10, 2560, 1024)` entry is the action expert's bare `m = 10` qkv, the

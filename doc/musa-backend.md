@@ -180,6 +180,22 @@ capability. What the port adds to the device path:
   projection, reproducing the materialized chain's intermediate BF16 rounding in
   registers. The fused output is byte-identical; a device test checks it across
   150..16392 columns and falls back for views the kernel cannot take.
+- The language layers fuse their normalization into the same row quantizer:
+  qkv's input RMSNorm (`prepare_norm`) and the post-attention bias + residual +
+  RMSNorm (`prepare_residual_norm`) hand the packed INT8 rows straight to the
+  GEMM. The vision layers do the same for LayerNorm and for FC1's bias + GELU,
+  and the action expert's adaptive RMSNorm and gated residual RMSNorm +
+  quantization share the contract. A producer is used only when the consuming
+  projection is quantized and the width/alignment matches; anything else keeps
+  the materialized BF16 chain. Device tests compare every fused producer with
+  the split chain byte-for-byte (`w8a8_norm_tests.rs`,
+  `w8a8_affine_norm_tests.rs`). `APXINF_MUSA_BF16_RMS=scalar` forces the
+  fallback RMS producer onto the scalar two-pass kernel for accuracy runs.
+- The down projection's `(522, 2048, 16384)` shape may take the `256x128`
+  **M-fast** tile. Its assembly image is derived from `qint8_256x128.asm` by
+  `aot/export_qint8_mfast.py`, with the source hash pinned in the script and
+  the asm README; the tile is routed only for that measured shape, and other
+  `m` values keep the shape band's traversal order.
 - The action traversal marks itself as quantized decode, and its short-row GEMMs
   take NN/NT images rendered from the BF16 GEMM template; gate/up's KN weight
   copy is packed once at load, so no transpose runs per call.
@@ -208,6 +224,25 @@ Orin bundle (3 warm-up, 15 samples, equalization set, frozen checkpoint copy):
 | `int8_dynamic` | graph | 363.2 ms | 0.99936157 |
 | `int8_dynamic_no_encode` | eager | 502.2 ms | 0.99963635 |
 | `int8_dynamic_no_encode` | graph | 502.9 ms | 0.99963635 |
+
+The table above is the port's original measurement. The fused branch was
+compared against `musa-dev` with an ABBA sequence on the same machine
+(`int8_dynamic`, graph capture, warm-up 3 / samples 15, equalization set):
+
+| run | branch | L1 p50 |
+|---|---|---:|
+| base-a1 | `musa-dev` | 317.21 ms |
+| base-a2 | `musa-dev` | 318.67 ms |
+| pr-b1 | fused branch | 312.05 ms |
+| pr-b2 | fused branch | 312.23 ms |
+
+The medians are 317.94 ms (base) and 312.14 ms (fused), a 5.80 ms / 1.83%
+reduction. The exported actions were bitwise identical in every round, and all
+four runs scored cosine 0.99936157 / max_abs 0.0504164 against the Orin bundle
+(gate 0.999 PASS). Device validation: `cargo test -p apxinf-musa --lib --
+--ignored kernels::gemm::w8a8` passes 14/14, including the 2*cols style and
+scalar-RMS regressions; `cargo test -p apxinf-model --features musa --lib
+musa_pi05::` passes 36.
 
 The integration branch on the same machine measures 513.4 / 510.1 ms for `bf16`, 406.4 /
 363.2 for `int8_dynamic` and 545.1 / 502.9 for `int8_dynamic_no_encode` (eager /

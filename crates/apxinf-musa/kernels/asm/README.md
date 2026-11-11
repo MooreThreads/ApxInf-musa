@@ -206,7 +206,8 @@ registration fallback and changed-input graph replay against eager/vendor.
 
 # INT8 (W8A8) GEMM tiles, vendored assembly
 
-Six muDNN QY2 `s8mma` convolution tiles configured as a 1x1 GEMM: the whole of
+Six muDNN QY2 `s8mma` convolution tiles configured as a 1x1 GEMM, plus an
+M-fast variant of the 256x128 tile: the whole of
 `gemm::w8a8` on an MP22 target. `adapters/qint8_gemm_adapter.mu` loads and
 launches them and owns the contract (67-argument convolution ABI in the
 H=W=1 degenerate case, `A[m,k]` INT8, `B[n,k]` INT8 output-major, per-row and
@@ -244,7 +245,10 @@ which is what pins the patch's blast radius to the epilogue.
 
 Re-rendering is: render the tile with `OUTPUT_DTYPE=bfloat16`, then apply the
 two bf16-output patch passes to the rendered source. It is only needed to change
-a tile, and it is not part of this build.
+a tile, and it is not part of this build. The M-fast variant is not rendered
+directly: `aot/export_qint8_mfast.py` derives it from `qint8_256x128.asm` by
+swapping the M/N block-index moves and renaming the symbol. The script pins its
+source hash, and the generated file must not be edited by hand.
 
 ## INT8 decode NN/NT GEMM
 
