@@ -45,20 +45,10 @@ impl MusaStream {
         })
     }
 
-    /// A non-blocking stream owned by an isolated graph capture.
-    pub(crate) fn new_isolated() -> Result<Self> {
-        let mut handle = std::ptr::null_mut();
-        unsafe { ffi::check_runtime(ffi::musa::musaStreamCreateWithFlags(&mut handle, 1)) }
-            .map_err(Error::Other)?;
-        Ok(Self {
-            handle: AtomicPtr::new(handle),
-        })
-    }
-
     /// Bind operations using this stream object to `stream` on this thread.
     ///
     /// The override is intentionally scoped and thread-local. It lets a model
-    /// warm and record on a non-blocking capture stream without replacing the
+    /// warm and record on a dedicated capture stream without replacing the
     /// context's normal replay stream or changing any eager caller.
     pub(crate) fn with_override<T>(&self, stream: &Self, operation: impl FnOnce() -> T) -> T {
         struct Restore(usize, Option<*mut c_void>);

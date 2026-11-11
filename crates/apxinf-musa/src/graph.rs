@@ -195,7 +195,7 @@ pub fn capture(
     })
 }
 
-/// Warm and capture one traversal on a dedicated non-blocking stream.
+/// Warm and capture one traversal on a dedicated ordinary stream.
 ///
 /// Some large MUSA graphs replay materially faster when they are recorded on
 /// an isolated stream and launched on the context's normal stream. The caller
@@ -215,7 +215,7 @@ pub fn capture_isolated<T>(
     context.synchronize()?;
     let device = context.device_id();
     unsafe { ffi::check_runtime(ffi::musa::musaSetDevice(device as i32)) }.map_err(Error::Other)?;
-    let stream = MusaStream::new_isolated()?;
+    let stream = MusaStream::new()?;
     let captured = context.stream().with_override(&stream, || {
         unsafe { ffi::check_runtime(ffi::custom::apxinf_musa_capture_anchor(stream.handle())) }
             .map_err(Error::Other)?;

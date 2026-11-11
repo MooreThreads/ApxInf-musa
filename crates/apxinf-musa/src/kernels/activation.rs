@@ -3,8 +3,8 @@
 use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
-    bf16_output, matrix_tensor, output_tensor, require_dtype_on, require_matrix_bf16,
-    require_optional_vector_bf16, require_output_matrix,
+    bf16_output, matrix_tensor, require_matrix_bf16, require_optional_vector_bf16,
+    require_output_matrix, output_tensor, require_dtype_on,
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
@@ -352,7 +352,11 @@ pub fn bias_silu_quant_f16_e4m3(
 }
 
 /// Gated GELU whose output is quantized to E4M3.
-pub fn geglu_quant_f16_e4m3(_ctx: &MusaContext, _gate_up: &Tensor, _scale: f32) -> Result<Tensor> {
+pub fn geglu_quant_f16_e4m3(
+    _ctx: &MusaContext,
+    _gate_up: &Tensor,
+    _scale: f32,
+) -> Result<Tensor> {
     Err(not_ported("activation::geglu_quant_f16_e4m3"))
 }
 
@@ -376,9 +380,7 @@ mod tests {
     use crate::context::MusaContext;
     use crate::kernels::activation::{bias_gelu_bf16, bias_relu_bf16, bias_silu_bf16, geglu_bf16};
     use crate::kernels::elementwise::bias_bf16;
-    use crate::kernels::test_support::{
-        from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values,
-    };
+    use crate::kernels::test_support::{from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values};
 
     /// The kernel's own spellings, in f32, so the reference differs only where
     /// `tanhf`/`expf` differ between the host libm and the device.
@@ -439,11 +441,8 @@ mod tests {
                 // The bias goes in *before* the activation, which is what the
                 // kernel does; getting this order wrong is a mistake worth
                 // having caught here rather than in a diff downstream.
-                let expected = reference(
-                    kind,
-                    &rounded_input[index..index + 1],
-                    Some(rounded_bias[col]),
-                )[0];
+                let expected =
+                    reference(kind, &rounded_input[index..index + 1], Some(rounded_bias[col]))[0];
                 let error = (got[index] - expected).abs();
                 worst = worst.max(error);
                 assert!(

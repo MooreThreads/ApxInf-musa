@@ -70,25 +70,17 @@ pub fn check_fa_d256(status: i32, operation: &str) -> Result<(), String> {
 // MP22 BF16 GEMM and load-time KN -> NK packing. All launches use the supplied
 // engine stream; modules must have been warmed before capture.
 extern "C" {
-    pub fn apxinf_musa_asm_encode_variant(m: i32, n: i32, k: i32) -> i32;
-    pub fn apxinf_musa_asm_gemm(
+    pub fn apxinf_musa_asm_gemm_plan(
         a: *const c_void,
         b: *const c_void,
         out: *mut c_void,
         m: i32,
         n: i32,
         k: i32,
-        nt: i32,
-        stream: *mut c_void,
-    ) -> i32;
-    pub fn apxinf_musa_asm_gemm_variant(
-        a: *const c_void,
-        b: *const c_void,
-        out: *mut c_void,
-        m: i32,
-        n: i32,
-        k: i32,
-        variant: i32,
+        arch: i32,
+        dtype: i32,
+        layout: i32,
+        kernel_id: i32,
         stream: *mut c_void,
     ) -> i32;
     pub fn apxinf_musa_asm_transpose(

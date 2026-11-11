@@ -6,7 +6,8 @@ use std::ffi::c_void;
 use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
-    bf16_tensor, f32_tensor, require_dtype_on, require_optional_vector_bf16, require_output_tensor,
+    bf16_tensor, f32_tensor, require_dtype_on, require_optional_vector_bf16,
+    require_output_tensor,
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, checked_i64, optional_tensor_ptr, tensor_ptr};
@@ -15,10 +16,10 @@ use crate::context::MusaContext;
 use crate::ffi;
 #[cfg(apxinf_musa_available)]
 use crate::ffi::mubin::{check_fa_d256, AsmFaVariant};
-#[cfg(apxinf_musa_available)]
-use crate::ffi::mublas::check_mublas;
 #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
 use crate::ffi::mutlass_fa::MutlassFaVariant;
+#[cfg(apxinf_musa_available)]
+use crate::ffi::mublas::check_mublas;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
@@ -2002,11 +2003,7 @@ mod tests {
         ///
         /// The seeds are `check_mqa`'s, so a shape exercised there and here sees
         /// the same data and the two tests are looking at the same problem.
-        fn mqa_inputs(
-            ctx: &MusaContext,
-            tokens: usize,
-            capacity: usize,
-        ) -> (Tensor, Tensor, Tensor) {
+        fn mqa_inputs(ctx: &MusaContext, tokens: usize, capacity: usize) -> (Tensor, Tensor, Tensor) {
             let width = ASSEMBLY_HEADS * ASSEMBLY_HEAD_DIM;
             (
                 upload(
@@ -2076,11 +2073,7 @@ mod tests {
             assert_eq!(bytes.len() % 2, 0, "{} is not a bf16 file", path.display());
             bytes
                 .chunks_exact(2)
-                .map(|pair| {
-                    crate::kernels::test_support::from_bf16_bits(u16::from_le_bytes([
-                        pair[0], pair[1],
-                    ]))
-                })
+                .map(|pair| crate::kernels::test_support::from_bf16_bits(u16::from_le_bytes([pair[0], pair[1]])))
                 .collect()
         }
 
@@ -2103,24 +2096,13 @@ mod tests {
             // between the two kernels: 16 is the last packed length, 17 the
             // first the rule would have packed at 192, and 522 the first it
             // leaves unpacked.
-            let shapes = [
-                (10usize, 532usize),
-                (10, 10),
-                (16, 16),
-                (17, 17),
-                (33, 33),
-                (522, 522),
-            ];
+            let shapes = [(10usize, 532usize), (10, 10), (16, 16), (17, 17), (33, 33), (522, 522)];
             let mut first = None;
             for (tokens, key_tokens) in shapes {
                 let (q, k, v) = mqa_inputs(&ctx, tokens, key_tokens);
                 let mut bits = Vec::new();
-                for variant in [
-                    MutlassFaVariant::PackedDecodeTile128,
-                    MutlassFaVariant::GeneralTile192,
-                ] {
-                    let output =
-                        mqa_bf16_with_variant(&ctx, &q, &k, &v, tokens, key_tokens, variant);
+                for variant in [MutlassFaVariant::PackedDecodeTile128, MutlassFaVariant::GeneralTile192] {
+                    let output = mqa_bf16_with_variant(&ctx, &q, &k, &v, tokens, key_tokens, variant);
                     bits.push(output_bits(&ctx, &output));
                 }
                 let differing = bits[0].iter().zip(&bits[1]).filter(|(a, b)| a != b).count();

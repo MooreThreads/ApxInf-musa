@@ -5,13 +5,26 @@ Run these commands from the repository root. Keep generated results under
 
 | Script | Purpose |
 | --- | --- |
-| `bench_apxinf_musa.py` | Native MUSA benchmark, W10/R50, strict Graph by default; optional explicit `--reference` |
-| `bench_apxinf_cuda.py` | Existing native CUDA benchmark, relocated without behavioral changes |
+| `bench_apxinf_musa_rust.py` | Native MUSA benchmark, W10/R50, strict Graph by default; optional explicit `--reference` |
+| `bench_apxinf_musa_wheel.py` | In-process MUSA Python wheel benchmark using `apxinf_py.ModelRunner`, W10/R50, BF16 |
+| `../bench_gr00t.py` | Existing native CUDA benchmark, kept at its original location |
 | `bench_torch_eager_musa.py` | Optional NVIDIA PyTorch MUSA reference exporter and benchmark |
 | `compare_outputs.py` | Compare native benchmark JSON or normalized-action NPZ against an explicit reference |
 | `check_gr00t_module_boundaries.py` | Check MUSA model module isolation |
 
 ## Reference selection
+
+The Rust script launches an executable. The wheel script calls the existing
+`ModelRunner.load("gr00t", ...)` and `_infer_preprocessed` bindings directly;
+it does not launch Cargo or a Rust subprocess. Both use the same fixture and
+explicit initial noise. The wheel converts fixture BF16 bits to exact float32
+NumPy values before timing. Its measured boundary includes per-call NumPy/PyO3
+conversion, synchronized model execution, action D2H and NumPy output, but not
+the official processor or action decoding. Do not treat it as the identical
+timing boundary to the Rust executable.
+
+Build/install the wheel and run it as documented in
+[GR00T N1.7](../../doc/gr00t-n1.7.md#musa-python-wheel).
 
 The intended acceptance reference is an output exported on Orin, not an
 automatically launched M1000 PyTorch eager run. No Orin result is bundled or

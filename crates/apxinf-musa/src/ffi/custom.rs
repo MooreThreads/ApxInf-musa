@@ -18,8 +18,8 @@ extern "C" {
     pub fn apxinf_musa_mublas_release_stream(stream: *mut c_void);
     pub fn apxinf_musa_mudnn_release_stream(stream: *mut c_void);
 
-    /// Exact MP22 M=1 BF16 GEMV over row-major `[1, K] @ [K, N]`.
-    pub fn apxinf_musa_bf16_gemv_m1(
+    /// Exact MP22 BF16 GEMV over row-major `[1, K] @ [K, N]`.
+    pub fn apxinf_musa_bf16_gemv(
         activation: *const c_void,
         weight: *const c_void,
         output: *mut c_void,
@@ -693,7 +693,5 @@ fn mudnn_detail(status: i32) -> String {
 /// Turn a status into the adapter's message; `operation` runs only on failure,
 /// so a successful launch does not format a string it would throw away.
 pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<(), String> {
-    crate::ffi::check_status(status, || {
-        format!("{}: {}", operation(), mudnn_detail(status))
-    })
+    crate::ffi::check_status(status, || format!("{}: {}", operation(), mudnn_detail(status)))
 }

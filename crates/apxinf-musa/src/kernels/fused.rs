@@ -2,23 +2,23 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
+#[cfg(apxinf_musa_available)]
+use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matching_bf16, require_matrix_bf16,
     require_optional_vector_bf16, require_output_matrix, require_vector_at_least_bf16,
     require_vector_bf16,
 };
-#[cfg(apxinf_musa_available)]
-use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::error::musa_error;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
+use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
-use crate::kernels::not_ported;
 
 /// The two outputs of a fused residual-plus-normalization step.
 ///
@@ -148,14 +148,7 @@ pub fn bias_residual_rms_bf16_into(
     require_vector_bf16(ctx, weight, cols, "bias residual rms", "weight")?;
     require_optional_vector_bf16(ctx, bias, cols, "bias residual rms", "bias")?;
     require_output_matrix(ctx, hidden, rows, cols, "bias residual rms", "hidden")?;
-    require_output_matrix(
-        ctx,
-        normalized,
-        rows,
-        cols,
-        "bias residual rms",
-        "normalized",
-    )?;
+    require_output_matrix(ctx, normalized, rows, cols, "bias residual rms", "normalized")?;
     launch_bias_residual_rms(
         ctx, projection, bias, residual, weight, hidden, normalized, rows, cols, eps,
     )
@@ -425,14 +418,7 @@ pub fn adaptive_gate_residual_rms_bf16_into(
     require_vector_at_least_bf16(ctx, gate_style, 3 * cols, "ada gate residual", "gate_style")?;
     require_vector_at_least_bf16(ctx, norm_style, 2 * cols, "ada gate residual", "norm_style")?;
     require_output_matrix(ctx, hidden, rows, cols, "ada gate residual", "hidden")?;
-    require_output_matrix(
-        ctx,
-        normalized,
-        rows,
-        cols,
-        "ada gate residual",
-        "normalized",
-    )?;
+    require_output_matrix(ctx, normalized, rows, cols, "ada gate residual", "normalized")?;
     launch(
         ctx, projection, residual, gate_style, norm_style, hidden, normalized, rows, cols, eps,
     )
@@ -551,14 +537,7 @@ pub fn gemm_bias_fp8(
     activation_scale: f32,
     weight_scale: f32,
 ) -> Result<Tensor> {
-    let _ = (
-        ctx,
-        activation,
-        weight,
-        bias,
-        activation_scale,
-        weight_scale,
-    );
+    let _ = (ctx, activation, weight, bias, activation_scale, weight_scale);
     Err(not_ported("fused::gemm_bias_fp8"))
 }
 
@@ -660,11 +639,15 @@ pub fn adaptive_gate_residual_rms_quant_f16_e4m3(
     scale: f32,
 ) -> Result<ResidualNormTensors> {
     let _ = (
-        ctx, projection, residual, gate_style, norm_style, eps, scale,
+        ctx,
+        projection,
+        residual,
+        gate_style,
+        norm_style,
+        eps,
+        scale,
     );
-    Err(not_ported(
-        "fused::adaptive_gate_residual_rms_quant_f16_e4m3",
-    ))
+    Err(not_ported("fused::adaptive_gate_residual_rms_quant_f16_e4m3"))
 }
 
 /// Add bias with BF16 rounding before adding the residual, matching the
@@ -991,8 +974,15 @@ mod tests {
         let weight = upload(ctx, &weight_values, Shape::new(vec![cols]));
         let bias = with_bias.then(|| upload(ctx, &bias_values, Shape::new(vec![cols])));
 
-        let out = bias_residual_rms_bf16(ctx, &projection, bias.as_ref(), &residual, &weight, EPS)
-            .expect("native fused bias residual rms");
+        let out = bias_residual_rms_bf16(
+            ctx,
+            &projection,
+            bias.as_ref(),
+            &residual,
+            &weight,
+            EPS,
+        )
+        .expect("native fused bias residual rms");
         ctx.stream().synchronize().expect("synchronise");
         let got_hidden = read_back(&out.hidden);
         let got_normalized = read_back(&out.normalized);
@@ -1236,11 +1226,7 @@ mod tests {
             Shape::new(vec![rows, cols]),
         );
         let weight = upload(&ctx, &values(cols, 0x0bad_c0de), Shape::new(vec![cols]));
-        let style = upload(
-            &ctx,
-            &values(3 * cols, 0x1357_9bdf),
-            Shape::new(vec![3 * cols]),
-        );
+        let style = upload(&ctx, &values(3 * cols, 0x1357_9bdf), Shape::new(vec![3 * cols]));
 
         // Same shape, same device, F16 instead of BF16.
         let f16_residual = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F16);

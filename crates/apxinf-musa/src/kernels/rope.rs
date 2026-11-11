@@ -3,11 +3,9 @@
 use apxinf_core::{DType, Error, Result, Tensor};
 
 pub use super::attention::QkvTensors;
-use super::contracts::{
-    bf16_tensor, require_optional_vector_bf16, require_output_tensor, require_vector_bf16,
-};
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
+use super::contracts::{bf16_tensor, require_optional_vector_bf16, require_output_tensor, require_vector_bf16};
 use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
 use crate::error::musa_error;
@@ -344,16 +342,7 @@ pub fn split_qkv_apply_f16(
     theta: f32,
     position_offset: usize,
 ) -> Result<QkvTensors> {
-    let _ = (
-        ctx,
-        qkv,
-        bias,
-        q_heads,
-        kv_heads,
-        head_dim,
-        theta,
-        position_offset,
-    );
+    let _ = (ctx, qkv, bias, q_heads, kv_heads, head_dim, theta, position_offset);
     Err(not_ported("rope::split_qkv_apply_f16"))
 }
 
@@ -872,9 +861,7 @@ mod tests {
                         qkv[token * fused + base + half + pair],
                     );
                     match bias {
-                        Some(bias) => {
-                            (first + bias[base + pair], second + bias[base + half + pair])
-                        }
+                        Some(bias) => (first + bias[base + pair], second + bias[base + half + pair]),
                         None => (first, second),
                     }
                 };
@@ -948,11 +935,8 @@ mod tests {
             position_offset,
         );
 
-        for (name, tensor, expected) in [
-            ("q", &split.q, &q),
-            ("k", &split.k, &k),
-            ("v", &split.v, &v),
-        ] {
+        for (name, tensor, expected) in [("q", &split.q, &q), ("k", &split.k, &k), ("v", &split.v, &v)]
+        {
             let got = read_back(tensor);
             let tolerance = gate_for(&got);
             let worst = got
@@ -984,20 +968,12 @@ mod tests {
         let ctx = MusaContext::new(0).expect("MUSA device 0");
         let (tokens, q_heads, kv_heads, head_dim) = (2usize, 2usize, 1usize, 8usize);
         let width = (q_heads + 2 * kv_heads) * head_dim;
-        let qkv = upload(
-            &ctx,
-            &values(tokens * width, 0x5eed_1234),
-            Shape::new(vec![tokens, width]),
-        );
+        let qkv = upload(&ctx, &values(tokens * width, 0x5eed_1234), Shape::new(vec![tokens, width]));
 
         // The caches are written through a raw pointer, so a same-shaped tensor
         // on the wrong device is a fault rather than a wrong answer.
         let k_cache = Tensor::zeros(Shape::new(vec![8, head_dim]), DType::BF16);
-        let v_cache = upload(
-            &ctx,
-            &values(8 * head_dim, 0x0bad_c0de),
-            Shape::new(vec![8, head_dim]),
-        );
+        let v_cache = upload(&ctx, &values(8 * head_dim, 0x0bad_c0de), Shape::new(vec![8, head_dim]));
         let error = apply_q_write_kv_bf16(
             &ctx, &qkv, None, q_heads, kv_heads, head_dim, 10000.0, 0, &k_cache, &v_cache, 0,
         )

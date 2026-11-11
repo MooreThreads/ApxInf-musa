@@ -203,10 +203,6 @@ pub(crate) fn without_autotune<T>(operation: impl FnOnce() -> T) -> T {
     apxinf_musa::tuning::without_autotune(operation)
 }
 
-pub(super) fn cuda_sm(_backend: &RuntimeBackend) -> u32 {
-    0
-}
-
 pub(super) fn try_packed8_bias_activation(
     _backend: &RuntimeBackend,
     _input: &Tensor,
@@ -214,15 +210,4 @@ pub(super) fn try_packed8_bias_activation(
     _activation: i32,
 ) -> Result<Option<Tensor>> {
     Ok(None)
-}
-
-pub(super) const fn qk_rms_mrope_block_threads(
-    _sm: u32,
-    _seq_len: usize,
-    _head_dim: usize,
-    _query_heads: usize,
-    _key_heads: usize,
-    _legacy_threads: bool,
-) -> u32 {
-    256
 }

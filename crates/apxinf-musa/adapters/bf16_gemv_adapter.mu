@@ -1,4 +1,4 @@
-// Exact M=1 BF16 GEMV kernels for MP22. The launch parameters come from the
+// Exact M=1 BF16 GEMV kernels. The launch parameters come from the
 // standalone exact-shape sweep; unmatched shapes remain on the provider path.
 #include <musa_bf16.h>
 #include <musa_runtime.h>
@@ -26,8 +26,8 @@ __device__ __forceinline__ Float8 add_float8(Float8 lhs,
   return lhs;
 }
 
-__device__ __forceinline__ Float8 shfl_down_float8(const Float8& source,
-                                                    int offset, int mask) {
+__device__ __forceinline__ Float8 shfl32_float8(const Float8& source,
+                                                 int offset) {
   Float8 result{};
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -36,14 +36,14 @@ __device__ __forceinline__ Float8 shfl_down_float8(const Float8& source,
       int32_t i;
     } value{}, shuffled{};
     value.f = source.value[i];
-    shuffled.i = __musa_shfl_down_sync_i32(value.i, offset, mask);
+    shuffled.i = __shfl_down_sync(0xffffffffu, value.i, offset, 32);
     result.value[i] = shuffled.f;
   }
   return result;
 }
 
 template <int TileN, int LoadCount>
-__global__ void gemv_m1_mp22_kn(const bf16* __restrict__ activation,
+__global__ void gemv_kn(const bf16* __restrict__ activation,
                                 const bf16* __restrict__ weight,
                                 bf16* __restrict__ output, int n, int k) {
   constexpr int kThreads = 512;
@@ -52,12 +52,14 @@ __global__ void gemv_m1_mp22_kn(const bf16* __restrict__ activation,
   constexpr int kColumnsPerLane = 8;
   constexpr int kThreadsPerRow = TileN / kColumnsPerLane;
   constexpr int kRowCount = kThreads / kThreadsPerRow;
+  constexpr int kGroupCount = kThreads / 32;
+  constexpr int kRowsPerGroup = 32 / kThreadsPerRow;
 
   // The routed steady-state shapes have K=132 or K=1024. Keep the capacity
   // explicit so extending the route requires changing this contract too.
   constexpr int kActivationCapacity = 1024;
   __shared__ bf16 staged_activation[kActivationCapacity];
-  __shared__ Float8 upper_half[kThreads / 2];
+  __shared__ Float8 group_results[kGroupCount * kThreadsPerRow];
 
   const int tid = int(threadIdx.x);
   for (int kk = tid; kk < k; kk += kThreads) {
@@ -86,48 +88,56 @@ __global__ void gemv_m1_mp22_kn(const bf16* __restrict__ activation,
     }
   }
 
-  int offset = kThreads / 2;
-  for (; offset >= 128; offset /= 2) {
-    if (tid >= offset && tid < 2 * offset) {
-      upper_half[tid - offset] = result;
-    }
-    __syncthreads();
-    if (tid < offset) result = add_float8(result, upper_half[tid]);
-    __syncthreads();
-  }
-
-  if (tid < 128) {
-    result = add_float8(result, shfl_down_float8(result, 64, 0x007f));
-    result = add_float8(result, shfl_down_float8(result, 32, 0x203f));
+  const int lane = tid & 31;
+  const int group = tid / 32;
 #pragma unroll
-    for (offset = 16; offset >= kThreadsPerRow; offset /= 2) {
-      result = add_float8(result, shfl_down_float8(result, offset, 0x301f));
-    }
+  for (int offset = 16; offset >= kThreadsPerRow; offset /= 2) {
+    const Float8 shuffled = shfl32_float8(result, offset);
+    if (lane < offset) result = add_float8(result, shuffled);
   }
+  if (lane < kThreadsPerRow) {
+    group_results[group * kThreadsPerRow + lane] = result;
+  }
+  __syncthreads();
 
-  if (tid < kThreadsPerRow && col + kColumnsPerLane <= n) {
-    Bf16x8 packed{};
+  if (group == kGroupCount - 1) {
+    Float8 total{};
+    const int column_lane = lane % kThreadsPerRow;
 #pragma unroll
-    for (int i = 0; i < kColumnsPerLane; ++i) {
-      packed.value[i] = __float2bfloat16_rn(result.value[i]);
+    for (int current_group = lane / kThreadsPerRow;
+         current_group < kGroupCount; current_group += kRowsPerGroup) {
+      total = add_float8(
+          total, group_results[current_group * kThreadsPerRow + column_lane]);
     }
-    *reinterpret_cast<Bf16x8*>(output + col) = packed;
+#pragma unroll
+    for (int offset = 16; offset >= kThreadsPerRow; offset /= 2) {
+      const Float8 shuffled = shfl32_float8(total, offset);
+      if (lane < offset) total = add_float8(total, shuffled);
+    }
+    if (lane < kThreadsPerRow && col + kColumnsPerLane <= n) {
+      Bf16x8 packed{};
+#pragma unroll
+      for (int i = 0; i < kColumnsPerLane; ++i) {
+        packed.value[i] = __float2bfloat16_rn(total.value[i]);
+      }
+      *reinterpret_cast<Bf16x8*>(output + col) = packed;
+    }
   }
 }
 
 template <int TileN, int LoadCount>
 void launch(const bf16* activation, const bf16* weight, bf16* output, int n,
             int k, musaStream_t stream) {
-  gemv_m1_mp22_kn<TileN, LoadCount>
+  gemv_kn<TileN, LoadCount>
       <<<(n + TileN - 1) / TileN, 512, 0, stream>>>(activation, weight,
                                                     output, n, k);
 }
 }  // namespace
 
-extern "C" musaError_t apxinf_musa_bf16_gemv_m1(
+extern "C" musaError_t apxinf_musa_bf16_gemv(
     const void* activation, const void* weight, void* output, int n, int k,
     int tile_n, int load_count, void* stream) {
-  if (!activation || !weight || !output || n <= 0 || k <= 0 || k > 1024 ||
+  if (!activation || !weight || !output || n <= 0 || n % 8 != 0 || k <= 0 || k > 1024 ||
       (tile_n != 64 && tile_n != 128) ||
       (load_count != 4 && load_count != 8)) {
     return musaErrorInvalidValue;

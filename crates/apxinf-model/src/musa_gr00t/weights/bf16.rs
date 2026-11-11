@@ -79,26 +79,6 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
             )?;
             return Ok(Some((fused.hidden, fused.normalized)));
         }
-        #[cfg(any())]
-        {
-            if !matches!(backend.context().caps().sm, 87 | 110)
-                || projection.shape().dims() != [41, 1536]
-                || residual.shape() != projection.shape()
-                || self.weights.bias.shape().dims() != [1536]
-                || modulation.shape().dims() != [3072]
-            {
-                return Ok(None);
-            }
-            let fused = kernels::fused::bias_then_residual_adaptive_layer_bf16(
-                backend.context(),
-                projection,
-                &self.weights.bias,
-                residual,
-                modulation,
-                eps,
-            )?;
-            Ok(Some((fused.hidden, fused.normalized)))
-        }
     }
 
     fn bias_residual_layer_norm(
@@ -130,28 +110,6 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
                 eps,
             )?;
             return Ok(Some((fused.hidden, fused.normalized)));
-        }
-        #[cfg(any())]
-        {
-            if !matches!(backend.context().caps().sm, 87 | 110)
-                || projection.shape().dims() != [41, 1536]
-                || residual.shape() != projection.shape()
-                || self.weights.bias.shape().dims() != [1536]
-                || norm_weight.shape().dims() != [1536]
-                || norm_bias.shape().dims() != [1536]
-            {
-                return Ok(None);
-            }
-            let fused = kernels::fused::bias_then_residual_layer_bf16(
-                backend.context(),
-                projection,
-                &self.weights.bias,
-                residual,
-                norm_weight,
-                norm_bias,
-                eps,
-            )?;
-            Ok(Some((fused.hidden, fused.normalized)))
         }
     }
 

@@ -2,7 +2,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
@@ -30,15 +30,18 @@ pub(crate) struct Gr00tModelRunner<E: Gr00tPrecisionExecution> {
     prepared: RefCell<Option<(Gr00tGraphKey, Rc<Gr00tPreparedInference<E>>)>>,
     #[cfg(feature = "musa")]
     execution_policy: Cell<ExecutionPolicy>,
+    /// Tracks the sole resource-owning plan, including externally held handles.
+    active_strategy: RefCell<Weak<RefCell<Gr00tPreparedStrategy>>>,
 }
 
 pub(super) struct Gr00tPreparedInference<E: Gr00tPrecisionExecution> {
     spec: InferenceSpec,
     engine: Rc<RefCell<Gr00tExecutor<E>>>,
-    strategy: Gr00tPreparedStrategy,
+    strategy: Rc<RefCell<Gr00tPreparedStrategy>>,
 }
 
 enum Gr00tPreparedStrategy {
+    Invalidated,
     /// Compatibility for the legacy shape-only `prepare` entry point, whose
     /// public spec does not carry enough GR00T geometry to allocate a plan.
     RuntimeManaged,
@@ -65,6 +68,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
             prepared: RefCell::new(None),
             #[cfg(feature = "musa")]
             execution_policy: Cell::new(ExecutionPolicy::PreferGraph),
+            active_strategy: RefCell::new(Weak::new()),
         }
     }
 
@@ -166,18 +170,45 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
                 image_layout: None,
             },
             engine: Rc::clone(&self.engine),
-            strategy: Gr00tPreparedStrategy::NoGraph {
+            strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::NoGraph {
                 key,
                 token_groups,
                 inputs,
                 workspace,
                 fallback_reason,
-            },
+            })),
         })
+    }
+
+    /// Release executable resources even when a caller retains the old handle.
+    /// Synchronization must succeed before destroying a graph or its arena.
+    fn invalidate_prepared(&self) -> Result<()> {
+        let active = self.active_strategy.borrow().upgrade();
+        if let Some(active) = active {
+            self.engine.borrow().backend().synchronize()?;
+            *active.borrow_mut() = Gr00tPreparedStrategy::Invalidated;
+        }
+        *self.active_strategy.borrow_mut() = Weak::new();
+        Ok(())
     }
 
     #[cfg(feature = "musa")]
     fn build_prepared(
+        &self,
+        input: &Gr00tObservation,
+        policy: ExecutionPolicy,
+    ) -> Result<Gr00tPreparedInference<E>> {
+        // Validate before retiring a usable plan. Once construction starts,
+        // failure leaves no active plan; a later request can retry safely.
+        self.engine.borrow().prepared_key(input)?;
+        self.invalidate_prepared()?;
+        let plan = self.build_prepared_impl(input, policy)?;
+        *self.active_strategy.borrow_mut() = Rc::downgrade(&plan.strategy);
+        Ok(plan)
+    }
+
+    #[cfg(feature = "musa")]
+    fn build_prepared_impl(
         &self,
         input: &Gr00tObservation,
         policy: ExecutionPolicy,
@@ -194,7 +225,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
                     image_layout: None,
                 },
                 engine: Rc::clone(&self.engine),
-                strategy: Gr00tPreparedStrategy::Graph { key, graph },
+                strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::Graph { key, graph })),
             }),
             Err(error) if policy == ExecutionPolicy::PreferGraph => {
                 let reason = error.to_string();
@@ -216,18 +247,20 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
         let prepared = {
             let mut cache = self.prepared.borrow_mut();
             let matches = match cache.as_ref() {
-                Some((cached_key, _)) => self
-                    .engine
-                    .borrow()
-                    .prepared_input_matches(cached_key, &input)?,
-                None => false,
+                Some((cached_key, plan))
+                    if !matches!(&*plan.strategy.borrow(), Gr00tPreparedStrategy::Invalidated) =>
+                {
+                    self.engine
+                        .borrow()
+                        .prepared_input_matches(cached_key, &input)?
+                }
+                _ => false,
             };
             if !matches {
                 let plan = Rc::new(self.build_prepared(&input, self.execution_policy.get())?);
                 let key = plan
                     .profile_key()
-                    .expect("MUSA implicit preparation always builds a fixed-profile plan")
-                    .clone();
+                    .expect("MUSA implicit preparation always builds a fixed-profile plan");
                 *cache = Some((key, plan));
             }
             Rc::clone(&cache.as_ref().expect("prepared plan was just built").1)
@@ -241,16 +274,21 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
 
 impl<E: Gr00tPrecisionExecution> Gr00tPreparedInference<E> {
     #[cfg(feature = "musa")]
-    fn profile_key(&self) -> Option<&Gr00tGraphKey> {
-        match &self.strategy {
-            Gr00tPreparedStrategy::RuntimeManaged => None,
+    fn profile_key(&self) -> Option<Gr00tGraphKey> {
+        match &*self.strategy.borrow() {
+            Gr00tPreparedStrategy::RuntimeManaged | Gr00tPreparedStrategy::Invalidated => None,
             Gr00tPreparedStrategy::Graph { key, .. }
-            | Gr00tPreparedStrategy::NoGraph { key, .. } => Some(key),
+            | Gr00tPreparedStrategy::NoGraph { key, .. } => Some(key.clone()),
         }
     }
 
     fn run_input(&self, input: &Gr00tObservation, config: &Gr00tConfig) -> Result<Action> {
-        let output = match &self.strategy {
+        let output = match &*self.strategy.borrow() {
+            Gr00tPreparedStrategy::Invalidated => {
+                return Err(Error::Other(
+                    "GR00T prepared plan was invalidated; prepare a new plan".into(),
+                ))
+            }
             Gr00tPreparedStrategy::RuntimeManaged => self.engine.borrow_mut().infer(input)?,
             #[cfg(feature = "musa")]
             Gr00tPreparedStrategy::Graph { key, .. }
@@ -272,7 +310,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tPreparedInference<E> {
         input: &Gr00tObservation,
         config: &Gr00tConfig,
     ) -> Result<Action> {
-        let output = match &self.strategy {
+        let output = match &*self.strategy.borrow() {
+            Gr00tPreparedStrategy::Invalidated => {
+                return Err(Error::Other(
+                    "GR00T prepared plan was invalidated; prepare a new plan".into(),
+                ))
+            }
             Gr00tPreparedStrategy::RuntimeManaged => self.engine.borrow_mut().infer(input)?,
             Gr00tPreparedStrategy::Graph { graph, .. } => {
                 let engine = self.engine.borrow();
@@ -307,7 +350,8 @@ impl<E: Gr00tPrecisionExecution> PreparedInference for Gr00tPreparedInference<E>
     }
 
     fn status(&self) -> PreparationStatus {
-        match &self.strategy {
+        match &*self.strategy.borrow() {
+            Gr00tPreparedStrategy::Invalidated => PreparationStatus::Invalidated,
             Gr00tPreparedStrategy::RuntimeManaged => PreparationStatus::RuntimeManaged,
             #[cfg(feature = "musa")]
             Gr00tPreparedStrategy::Graph { .. } => PreparationStatus::Ready {
@@ -375,7 +419,7 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
         Ok(Box::new(Gr00tPreparedInference {
             spec: *spec,
             engine: Rc::clone(&self.engine),
-            strategy: Gr00tPreparedStrategy::RuntimeManaged,
+            strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged)),
         }))
     }
 
@@ -384,14 +428,6 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
         sample: &VlaRequest<'_>,
         policy: ExecutionPolicy,
     ) -> Result<Box<dyn PreparedInference>> {
-        #[cfg(any())]
-        {
-            let _ = (sample, policy);
-            return Err(Error::Other(
-                "GR00T CUDA retains its executor-managed graph lifecycle; explicit prepare_for is not adopted yet"
-                    .into(),
-            ));
-        }
         #[cfg(feature = "musa")]
         {
             let config = self.engine.borrow().config().clone();
@@ -401,14 +437,9 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
     }
 
     fn clear_prepared(&self) -> Result<()> {
-        #[cfg(any())]
-        {
-            return Err(Error::Other(
-                "GR00T CUDA executor-managed graph eviction is not exposed yet".into(),
-            ));
-        }
         #[cfg(feature = "musa")]
         {
+            self.invalidate_prepared()?;
             drop(self.prepared.borrow_mut().take());
             Ok(())
         }
@@ -417,7 +448,8 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
     fn execution_mode(&self) -> &'static str {
         #[cfg(feature = "musa")]
         if let Some((_, plan)) = self.prepared.borrow().as_ref() {
-            return match &plan.strategy {
+            return match &*plan.strategy.borrow() {
+                Gr00tPreparedStrategy::Invalidated => "no_graph",
                 Gr00tPreparedStrategy::Graph { .. } => "musa-graph",
                 Gr00tPreparedStrategy::NoGraph { .. } => "no_graph",
                 Gr00tPreparedStrategy::RuntimeManaged => "runtime-managed",

@@ -16,13 +16,56 @@ pub(crate) struct PreparedWeights {
 }
 
 #[cfg(apxinf_musa_available)]
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum KernelId {
+    Mp22Bf16Nt128_128x128,
+    Mp22Bf16Nt128_128x64,
+    Mp22Bf16Nt128_32x128,
+    Mp22Bf16Nt256_256x128,
+    Mp22Bf16Nt256_256x64,
+    Mp22Bf16Nt512_256x256,
+    Mp22Bf16Nn128_128x128,
+    Mp22Bf16Nn128_128x64,
+    Mp22Bf16Nn128_32x128,
+    Mp22Bf16Nn256_256x128,
+    Mp22Bf16Nn256_256x64,
+    Mp22Bf16Nn512_256x256,
+    Mp22Bf16Nn128_128x128WideMFast,
+    Mp22Bf16Nn256_128x256WideMFast,
+    Mp22Bf16Nn128_128x128NormalMFast,
+    Mp22Bf16Nn256_256x128WideNFast,
+}
+
+#[cfg(apxinf_musa_available)]
+#[repr(i32)]
+#[derive(Clone, Copy)]
+enum Layout {
+    Nt,
+    Nn,
+}
+
+#[cfg(apxinf_musa_available)]
+#[repr(i32)]
+enum Arch {
+    Mp22,
+}
+
+#[cfg(apxinf_musa_available)]
+#[repr(i32)]
+enum Precision {
+    Bf16,
+}
+
+#[cfg(apxinf_musa_available)]
 #[derive(Clone, Copy)]
 struct ExactKernel {
     m_min: usize,
     m_max: usize,
     n: usize,
     k: usize,
-    variant: i32,
+    kernel_id: KernelId,
     transpose: bool,
 }
 
@@ -44,7 +87,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 32,
         n: 1536,
         k: 2048,
-        variant: 2,
+        kernel_id: KernelId::Mp22Bf16Nt128_32x128,
         transpose: true,
     },
     ExactKernel {
@@ -52,7 +95,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 40,
         n: 1536,
         k: 1536,
-        variant: 7,
+        kernel_id: KernelId::Mp22Bf16Nn128_128x64,
         transpose: false,
     },
     ExactKernel {
@@ -60,7 +103,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 40,
         n: 1536,
         k: 3072,
-        variant: 2,
+        kernel_id: KernelId::Mp22Bf16Nt128_32x128,
         transpose: true,
     },
     ExactKernel {
@@ -68,7 +111,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 128,
         n: 1536,
         k: 2048,
-        variant: 7,
+        kernel_id: KernelId::Mp22Bf16Nn128_128x64,
         transpose: false,
     },
     ExactKernel {
@@ -76,7 +119,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 128,
         n: 2048,
         k: 4096,
-        variant: 1,
+        kernel_id: KernelId::Mp22Bf16Nt128_128x64,
         transpose: true,
     },
     ExactKernel {
@@ -84,7 +127,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 128,
         n: 4096,
         k: 4096,
-        variant: 7,
+        kernel_id: KernelId::Mp22Bf16Nn128_128x64,
         transpose: false,
     },
     ExactKernel {
@@ -92,7 +135,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 1024,
         k: 2048,
-        variant: 7,
+        kernel_id: KernelId::Mp22Bf16Nn128_128x64,
         transpose: false,
     },
     ExactKernel {
@@ -100,7 +143,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 2048,
         k: 8192,
-        variant: 10,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x64,
         transpose: false,
     },
     ExactKernel {
@@ -108,7 +151,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 2048,
         k: 6144,
-        variant: 10,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x64,
         transpose: false,
     },
     ExactKernel {
@@ -116,7 +159,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 2048,
         k: 2048,
-        variant: 10,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x64,
         transpose: false,
     },
     ExactKernel {
@@ -124,7 +167,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 6144,
         k: 2048,
-        variant: 9,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x128,
         transpose: false,
     },
     ExactKernel {
@@ -132,7 +175,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 256,
         n: 8192,
         k: 2048,
-        variant: 5,
+        kernel_id: KernelId::Mp22Bf16Nt512_256x256,
         transpose: true,
     },
     ExactKernel {
@@ -140,7 +183,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 512,
         n: 1024,
         k: 1024,
-        variant: 7,
+        kernel_id: KernelId::Mp22Bf16Nn128_128x64,
         transpose: false,
     },
     ExactKernel {
@@ -148,7 +191,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 512,
         n: 1024,
         k: 1536,
-        variant: 1,
+        kernel_id: KernelId::Mp22Bf16Nt128_128x64,
         transpose: true,
     },
     ExactKernel {
@@ -156,7 +199,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 512,
         n: 1024,
         k: 4096,
-        variant: 10,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x64,
         transpose: false,
     },
     ExactKernel {
@@ -164,7 +207,7 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 512,
         n: 3072,
         k: 1024,
-        variant: 9,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x128,
         transpose: false,
     },
     ExactKernel {
@@ -172,10 +215,82 @@ const EXACT_KERNELS: &[ExactKernel] = &[
         m_max: 512,
         n: 4096,
         k: 1024,
-        variant: 10,
+        kernel_id: KernelId::Mp22Bf16Nn256_256x64,
         transpose: false,
     },
 ];
+
+#[cfg(apxinf_musa_available)]
+fn encode_kernel(m: usize, n: usize, k: usize) -> Option<KernelId> {
+    match (m, n, k) {
+        (522, 2560, 2048) => Some(KernelId::Mp22Bf16Nn128_128x128WideMFast),
+        (522, 2048, 2048) => Some(KernelId::Mp22Bf16Nn256_128x256WideMFast),
+        (522, 16384 | 32768, 2048) => Some(KernelId::Mp22Bf16Nn128_128x128NormalMFast),
+        (522, 2048, 16384) => Some(KernelId::Mp22Bf16Nn256_256x128WideNFast),
+        _ => None,
+    }
+}
+
+#[cfg(apxinf_musa_available)]
+fn select_kernel(m: usize, n: usize, k: usize, nt: bool) -> KernelId {
+    if !nt {
+        if let Some(kernel) = encode_kernel(m, n, k) {
+            return kernel;
+        }
+    }
+  let block_512_256x256 = m.div_ceil(256) * n.div_ceil(256);
+  let block_256_256x128 = m.div_ceil(256) * n.div_ceil(128);
+  let block_128_128x128 = m.div_ceil(128) * n.div_ceil(128);
+  let block_128_128x64 = m.div_ceil(128) * n.div_ceil(64);
+  let block_256_256x64 = m.div_ceil(256) * n.div_ceil(64);
+
+  let dispatch_round_512_256x256 = block_512_256x256.div_ceil(8);
+  let dispatch_round_256_256x128 = block_256_256x128.div_ceil(8);
+  let dispatch_round_128_128x128 = block_128_128x128.div_ceil(8);
+  let dispatch_round_128_128x64 = block_128_128x64.div_ceil(8);
+  let dispatch_round_256_256x64 = block_256_256x64.div_ceil(8);
+
+  let is_balance_256_256x128 = block_256_256x128 % 8 == 0;
+  let is_prefered_128_128x64 =
+      ((dispatch_round_256_256x128 * 4 > dispatch_round_128_128x64) && (dispatch_round_256_256x128 < 2) && m >= 256) ||
+      ((dispatch_round_256_256x64 * 2 > dispatch_round_128_128x64) && (dispatch_round_256_256x64 < 2)) ||
+      ((n < 384) && (n % 64 == 0) && (n % 128 != 0) && (dispatch_round_512_256x256 < 4)) || m <= 128;
+
+  let is_prefered_512_256x256 =
+      ((((dispatch_round_512_256x256 * 2) <= dispatch_round_256_256x128) && (dispatch_round_512_256x256 >= 2)) ||
+       (dispatch_round_512_256x256 >= 4)) &&
+      k > 256;
+
+  let is_prefered_256_256x128 = ((dispatch_round_256_256x128 * 2 <= dispatch_round_256_256x64) &&
+                                        !(dispatch_round_256_256x128 == 1 && !is_balance_256_256x128)) ||
+                                       ((dispatch_round_256_256x128 * 2 <= dispatch_round_128_128x128) &&
+                                        !(dispatch_round_256_256x128 == 1 && !is_balance_256_256x128)) ||
+                                       dispatch_round_256_256x128 >= 4;
+
+  let is_prefered_256_256x64 =
+      is_prefered_256_256x128 && (k <= 1024 || ((dispatch_round_256_256x64 * 2 <= dispatch_round_256_256x128) &&
+                                                (dispatch_round_256_256x64 <= 4)));
+
+  if n < 128 {
+    return if nt { KernelId::Mp22Bf16Nt128_128x64 } else { KernelId::Mp22Bf16Nn128_128x64 };
+  }
+  if m <= 32 {
+    return if nt { KernelId::Mp22Bf16Nt128_32x128 } else { KernelId::Mp22Bf16Nn128_32x128 };
+  }
+  if is_prefered_128_128x64 {
+    return if nt { KernelId::Mp22Bf16Nt128_128x64 } else { KernelId::Mp22Bf16Nn128_128x64 };
+  }
+  if is_prefered_512_256x256 {
+    return if nt { KernelId::Mp22Bf16Nt512_256x256 } else { KernelId::Mp22Bf16Nn512_256x256 };
+  }
+  if is_prefered_256_256x64 {
+    return if nt { KernelId::Mp22Bf16Nt256_256x64 } else { KernelId::Mp22Bf16Nn256_256x64 };
+  }
+  if is_prefered_256_256x128 {
+    return if nt { KernelId::Mp22Bf16Nt256_256x128 } else { KernelId::Mp22Bf16Nn256_256x128 };
+  }
+  return if nt { KernelId::Mp22Bf16Nt256_256x64 } else { KernelId::Mp22Bf16Nn256_256x64 };
+}
 
 #[cfg(apxinf_musa_available)]
 fn exact_kernel(m: usize, n: usize, k: usize) -> Option<ExactKernel> {
@@ -340,7 +455,7 @@ pub(super) fn launch_exact(
     if crate::MUSA_ARCH == "mp_22" {
         if let Some(kernel) = exact_gemv_kernel(m, n, k) {
             let status = unsafe {
-                ffi::custom::apxinf_musa_bf16_gemv_m1(
+                ffi::custom::apxinf_musa_bf16_gemv(
                     tensor_ptr(a)?,
                     tensor_ptr(w)?,
                     tensor_ptr(out)?,
@@ -369,14 +484,17 @@ pub(super) fn launch_exact(
         w
     };
     let status = unsafe {
-        ffi::mubin::apxinf_musa_asm_gemm_variant(
+        ffi::mubin::apxinf_musa_asm_gemm_plan(
             tensor_ptr(a)?,
             tensor_ptr(weight)?,
             tensor_ptr(out)?,
             m as i32,
             n as i32,
             k as i32,
-            kernel.variant,
+            Arch::Mp22 as i32,
+            Precision::Bf16 as i32,
+            if kernel.transpose { Layout::Nt } else { Layout::Nn } as i32,
+            kernel.kernel_id as i32,
             ctx.stream().handle(),
         )
     };
@@ -409,10 +527,7 @@ pub(super) fn launch_encode(
     n: usize,
     k: usize,
 ) -> Result<bool> {
-    if !supports(m, n, k)
-        || unsafe {
-            crate::ffi::mubin::apxinf_musa_asm_encode_variant(m as i32, n as i32, k as i32)
-        } < 0
+    if !supports(m, n, k) || encode_kernel(m, n, k).is_none()
     {
         return Ok(false);
     }
@@ -457,14 +572,17 @@ fn launch_impl(
     // Shape checks above cover the int32 ABI and allocation bounds; the
     // context retains both source and packed weights for graph replay.
     let status = unsafe {
-        mubin::apxinf_musa_asm_gemm(
+        mubin::apxinf_musa_asm_gemm_plan(
             tensor_ptr(a)?,
             tensor_ptr(weight)?,
             tensor_ptr(out)?,
             m as i32,
             n as i32,
             k as i32,
-            i32::from(transposed.is_some()),
+            Arch::Mp22 as i32,
+            Precision::Bf16 as i32,
+            if transposed.is_some() { Layout::Nt } else { Layout::Nn } as i32,
+            select_kernel(m, n, k, transposed.is_some()) as i32,
             ctx.stream().handle(),
         )
     };
@@ -475,6 +593,25 @@ fn launch_impl(
 #[cfg(test)]
 mod support_tests {
     use super::*;
+    #[cfg(apxinf_musa_available)]
+    #[test]
+    fn encode_plans_preserve_measured_choices() {
+        for (n, k, expected) in [
+            (2560, 2048, KernelId::Mp22Bf16Nn128_128x128WideMFast),
+            (2048, 2048, KernelId::Mp22Bf16Nn256_128x256WideMFast),
+            (16384, 2048, KernelId::Mp22Bf16Nn128_128x128NormalMFast),
+            (32768, 2048, KernelId::Mp22Bf16Nn128_128x128NormalMFast),
+            (2048, 16384, KernelId::Mp22Bf16Nn256_256x128WideNFast),
+        ] {
+            assert_eq!(encode_kernel(522, n, k), Some(expected));
+            assert_eq!(select_kernel(522, n, k, false), expected);
+            assert!(encode_kernel(521, n, k).is_none());
+            assert_ne!(select_kernel(522, n, k, true), expected);
+        }
+        assert_eq!(select_kernel(10, 1024, 1024, true), KernelId::Mp22Bf16Nt128_32x128);
+        assert_eq!(select_kernel(10, 1024, 1024, false), KernelId::Mp22Bf16Nn128_32x128);
+    }
+
     #[test]
     fn unsupported_shapes_do_not_enter_assembly() {
         for shape in [
@@ -511,11 +648,11 @@ mod support_tests {
         assert!(exact_gemv_kernel(2, 1024, 132).is_none());
         for rows in [129, 141, 145, 255, 256] {
             let kernel = exact_kernel(rows, 2048, 2048).expect("dynamic text GEMM");
-            assert_eq!(kernel.variant, 10);
+            assert_eq!(kernel.kernel_id, KernelId::Mp22Bf16Nn256_256x64);
             assert!(!kernel.transpose);
         }
         let short = exact_kernel(17, 1536, 2048).expect("short text GEMM");
-        assert_eq!(short.variant, 2);
+        assert_eq!(short.kernel_id, KernelId::Mp22Bf16Nt128_32x128);
         assert!(short.transpose);
         assert!(exact_kernel(128, 2048, 2048).is_none());
         assert!(exact_kernel(257, 2048, 2048).is_none());

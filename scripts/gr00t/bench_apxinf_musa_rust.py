@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the maintained MUSA GR00T Rust fixed-input benchmark and optional parity gate."""
+"""Launch the MUSA GR00T Rust executable benchmark and optional parity gate."""
 
 from __future__ import annotations
 

@@ -28,23 +28,10 @@ impl Gr00tPrecisionExecution for Gr00tBf16Execution {
     const USE_CACHED_VISION_RESIDUAL_LAYER_NORM: bool = true;
     const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = true;
     const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = true;
-    #[cfg(any())]
-    const USE_HDIM96_BM64_ATTENTION: bool = true;
     const USE_FUSED_QK_RMS_MROPE: bool = true;
-    #[cfg(any())]
-    const OPTIMIZED_SMS: &'static [u32] = &[87, 110];
-    #[cfg(any())]
-    const USE_VISION_POINTWISE_PACK: bool = true;
     const USE_BATCHED_VISION_ATTENTION: bool = true;
-    #[cfg(any())]
-    const VISION_POINTWISE_LEGACY_ENV: Option<&'static str> =
-        Some("APXINF_GR00T_BF16_LEGACY_VISION_POINTWISE_PACK");
     const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> =
         Some("APXINF_GR00T_BF16_LEGACY_QK_RMS_MROPE");
-    #[cfg(any())]
-    const USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT: bool = true;
-    #[cfg(any())]
-    const USE_PACKED8_BF16_BIAS_ACTIVATION: bool = true;
 
     fn transfer_dense(
         &self,

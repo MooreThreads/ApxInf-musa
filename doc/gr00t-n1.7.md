@@ -220,7 +220,7 @@ Its timing boundary starts at those host tensors and ends after model-core
 action D2H; it excludes simulator and raw-observation preprocessing time.
 
 ```bash
-python scripts/gr00t/bench_apxinf_cuda.py \
+python scripts/bench_gr00t.py \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
   --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
   --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
@@ -254,7 +254,7 @@ APXINF_MUSA_ARCH=mp_22 \
 cargo build --release -p apxinf-model --features musa \
   --example gr00t_bench_musa
 
-python scripts/gr00t/bench_apxinf_musa.py \
+python scripts/gr00t/bench_apxinf_musa_rust.py \
   --precision bf16 \
   --binary target/release/examples/gr00t_bench_musa \
   --checkpoint path_to/GR00T-N1.7-LIBERO/libero_10 \
@@ -274,6 +274,46 @@ NoGraph comparison, or `--execution prefer-graph` when an observable eager
 fallback is acceptable. The timing boundary starts with the preprocessed host
 tensors and ends after action D2H, matching the native CUDA fixed-input
 benchmark.
+
+MUSA fixed-profile plans use a single-active-plan contract per model instance.
+Building a replacement through `infer` or `prepare_for` synchronizes and
+invalidates the previous plan before allocating the replacement arena.
+Externally held old handles report `PreparationStatus::Invalidated` and reject
+`run`; retaining a handle does not retain its Graph or 4 GiB arena.
+`clear_prepared` also invalidates externally held fixed-profile plans.
+If replacement construction fails after retirement, no active plan remains;
+prepare again or retry inference. Input validation failures before retirement
+leave the existing plan intact. This contract covers prepared Graph and Eager
+execution; calibration and the legacy runtime-managed path are unchanged.
+
+#### MUSA Python wheel
+
+The existing Python bindings also support GR00T preprocessed inputs. Build
+and install the MUSA wheel in the intended Python environment:
+
+```bash
+APXINF_MUSA_ARCH=mp_22 maturin build --release \
+  --manifest-path crates/apxinf-py/Cargo.toml --features musa \
+  --interpreter python --compatibility linux --out path_to/wheels
+python -m pip install path_to/wheels/apxinf_py-0.1.0-cp310-cp310-linux_aarch64.whl
+
+python scripts/gr00t/bench_apxinf_musa_wheel.py \
+  --precision bf16 \
+  --checkpoint path_to/GR00T-N1.7-LIBERO/libero_10 \
+  --backbone path_to/Cosmos-Reason2-2B \
+  --fixture path_to/libero-two-view \
+  --reference path_to/orin_gold/debug.npz \
+  --execution require-graph --warmup 10 --iterations 50 \
+  --output path_to/gr00t-musa-wheel.json
+```
+
+Use the wheel filename produced for your Python version and architecture.
+This script calls `apxinf_py.ModelRunner` in process, without a Rust executable.
+It preserves the fixture's BF16 values via exact float32 NumPy conversion.
+Timing includes the NumPy/PyO3 conversion and NumPy output allocation in
+addition to synchronized inference and action D2H. Official processor work
+and action decoding are excluded. The report records the installed extension
+path, all timing samples, repeatability and optional reference comparisons.
 
 The optimized text paths admit dynamic sequence lengths in
 `128 < sequence_length <= 256`. Shapes outside an exact optimization predicate

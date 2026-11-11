@@ -58,10 +58,6 @@ fn fused_vision_mlp_residual_norm_shape_supported(
 }
 
 fn add_bias(b: &GpuBackend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        return kernels::elementwise::bias_bf16(cuda.context(), input, Some(bias));
-    }
     b.add_bias(input, bias)
 }
 
@@ -72,10 +68,6 @@ fn layer_norm(
     bias: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        return kernels::norm::layer_bf16(cuda.context(), input, weight, bias, eps);
-    }
     b.layer_norm(input, weight, bias, eps)
 }
 
@@ -88,10 +80,6 @@ fn vision_attention(
     n_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        return kernels::attention::noncausal(cuda.context(), query, key, value, n_heads, head_dim);
-    }
     #[cfg(feature = "musa")]
     if let Some(musa) = b.as_any().downcast_ref::<GpuBackend>() {
         return kernels::attention::noncausal(musa.context(), query, key, value, n_heads, head_dim);
@@ -99,7 +87,7 @@ fn vision_attention(
     b.vision_sdpa(query, key, value, sequence_len, n_heads, head_dim)
 }
 
-/// Fixed-grid CUDA inputs that must keep stable addresses across graph replay.
+/// Fixed-grid MUSA inputs that must keep stable addresses across graph replay.
 /// The portable variant retains only the host position IDs.
 pub(crate) struct PreparedVisionPositions {
     embeddings: Tensor,
@@ -121,34 +109,6 @@ pub(crate) fn prepare_positions(
     let position_ids = compute_vision_pos_ids(grid_thw, cfg.vision.spatial_merge_size)?;
     #[cfg_attr(not(feature = "musa"), allow(unused_mut))]
     let mut device_position_ids = prepare_vision_position_ids(b, &position_ids)?;
-    #[cfg(any())]
-    if allow_precomputed_bf16_rope
-        && precomputed_vision_rope_shape_supported(
-            position_ids.len() / 2,
-            cfg.vision.num_heads,
-            cfg.vision.head_dim(),
-        )
-    {
-        if let PreparedVisionPositionBuffer::Cuda {
-            positions,
-            rotation_table,
-        } = &mut device_position_ids
-        {
-            let cuda = b
-                .as_any()
-                .downcast_ref::<GpuBackend>()
-                .ok_or_else(|| Error::Other("Qwen3-VL CUDA position/backend mismatch".into()))?;
-            let table = kernels::rope::prepare_vision_2d_rotation_table(
-                cuda.context(),
-                position_ids.len() / 2,
-                cfg.vision.head_dim(),
-                10000.0,
-                positions,
-            )?;
-            cuda.context().synchronize().map_err(Error::Cuda)?;
-            *rotation_table = Some(table);
-        }
-    }
     #[cfg(feature = "musa")]
     if allow_precomputed_bf16_rope
         && precomputed_vision_rope_shape_supported(
@@ -398,70 +358,6 @@ fn forward_impl(
         // We need to extract Q = qkv[:, 0:1024], K = qkv[:, 1024:2048],
         // V = qkv[:, 2048:3072] as [N, n_heads, head_dim] tensors.
         let fused_qkv_rope: Option<(Tensor, Tensor, Tensor)> = {
-            #[cfg(any())]
-            {
-                if allow_gr00t_fused_qkv_rope && USE_FUSED_VISION_QKV_ROPE {
-                    if let PreparedVisionPositionBuffer::Cuda {
-                        positions,
-                        rotation_table,
-                    } = prepared_pos_ids
-                    {
-                        let cuda = b.as_any().downcast_ref::<GpuBackend>().ok_or_else(|| {
-                            Error::Other("Qwen3-VL CUDA position/backend mismatch".into())
-                        })?;
-                        let split = match rotation_table {
-                            Some(rotation_table)
-                                if cuda.context().caps().sm != 87
-                                    || std::env::var_os(
-                                        "APXINF_GR00T_LEGACY_VISION_ROPE_POSITIONS",
-                                    )
-                                    .is_none() =>
-                            {
-                                if prefer_precomputed_qkv_vec2
-                                    && n_patches == 512
-                                    && n_heads == 16
-                                    && head_dim == 64
-                                {
-                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed_vec2(
-                                        cuda.context(),
-                                        &qkv,
-                                        &blk.qkv_b,
-                                        n_heads,
-                                        head_dim,
-                                        rotation_table,
-                                    )
-                                } else {
-                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed(
-                                        cuda.context(),
-                                        &qkv,
-                                        &blk.qkv_b,
-                                        n_heads,
-                                        head_dim,
-                                        rotation_table,
-                                    )
-                                }
-                            }
-                            _ => kernels::rope::split_qkv_bias_apply_vision_2d(
-                                cuda.context(),
-                                &qkv,
-                                &blk.qkv_b,
-                                n_heads,
-                                head_dim,
-                                10000.0,
-                                positions,
-                            ),
-                        }
-                        .map_err(|error| {
-                            Error::Other(format!("vision block {i} fused QKV/RoPE failed: {error}"))
-                        })?;
-                        Some((split.q, split.k, split.v))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
             #[cfg(feature = "musa")]
             {
                 if allow_gr00t_fused_qkv_rope && USE_FUSED_VISION_QKV_ROPE {
@@ -754,11 +650,6 @@ fn merge_deepstack(
 }
 
 fn apply_bias_gelu(b: &GpuBackend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        return kernels::activation::bias_gelu_bf16(cuda.context(), input, Some(bias));
-    }
-
     let biased = add_bias(b, input, bias)?;
     b.gelu_tanh(&biased)
 }
@@ -782,16 +673,6 @@ fn apply_bias_residual(
     bias: &Tensor,
     residual: &Tensor,
 ) -> Result<Tensor> {
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        return kernels::fused::bias_residual_bf16(
-            cuda.context(),
-            projection,
-            Some(bias),
-            residual,
-        );
-    }
-
     let projection = add_bias(b, projection, bias)?;
     b.add(residual, &projection)
 }
@@ -937,11 +818,6 @@ fn split_vision_qkv(
 
 enum PreparedVisionPositionBuffer {
     Portable,
-    #[cfg(any())]
-    Cuda {
-        positions: DeviceBuffer,
-        rotation_table: Option<DeviceBuffer>,
-    },
     #[cfg(feature = "musa")]
     Musa {
         positions: DeviceBuffer,
@@ -963,19 +839,6 @@ fn prepare_vision_position_ids(
 ) -> Result<PreparedVisionPositionBuffer> {
     #[cfg(not(feature = "musa"))]
     let _ = (b, position_ids);
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        let bytes = position_ids
-            .iter()
-            .flat_map(|position| position.to_ne_bytes())
-            .collect::<Vec<_>>();
-        let positions = DeviceBuffer::alloc(bytes.len(), cuda.device_id()).map_err(Error::Cuda)?;
-        positions.copy_from_host(&bytes).map_err(Error::Cuda)?;
-        return Ok(PreparedVisionPositionBuffer::Cuda {
-            positions,
-            rotation_table: None,
-        });
-    }
     #[cfg(feature = "musa")]
     if let Some(musa) = b.as_any().downcast_ref::<GpuBackend>() {
         let bytes = position_ids
@@ -1003,23 +866,6 @@ fn apply_vision_rope_pair(
     position_ids: &[u32],
     prepared: &PreparedVisionPositionBuffer,
 ) -> Result<(Tensor, Tensor)> {
-    #[cfg(any())]
-    if let PreparedVisionPositionBuffer::Cuda { positions, .. } = prepared {
-        let cuda = b
-            .as_any()
-            .downcast_ref::<GpuBackend>()
-            .ok_or_else(|| Error::Other("Qwen3-VL CUDA position/backend mismatch".into()))?;
-        return kernels::rope::apply_vision_2d_pair(
-            cuda.context(),
-            q,
-            k,
-            n_heads,
-            head_dim,
-            theta,
-            positions,
-        );
-    }
-
     #[cfg(feature = "musa")]
     if let PreparedVisionPositionBuffer::Musa { positions, .. } = prepared {
         let musa = b
@@ -1108,74 +954,6 @@ fn segmented_vision_sdpa(
             v.dtype(),
             v.shape().dims()
         )));
-    }
-
-    #[cfg(any())]
-    if let Some(cuda) = b.as_any().downcast_ref::<GpuBackend>() {
-        if direct_segmented_attention_shape_supported(segment_lengths, n_heads, head_dim) {
-            if let Some(segmented_attention) = segmented_attention {
-                if let Some(output) =
-                    segmented_attention(q, k, v, segment_lengths, n_heads, head_dim)?
-                {
-                    return Ok(output);
-                }
-            }
-        }
-        if allow_batched_segmented_attention
-            && cuda.context().caps().sm == 87
-            && segment_lengths == [256, 256]
-            && n_heads == 16
-            && head_dim == 64
-            && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
-        {
-            if let Some(output) = kernels::attention::try_noncausal_batched_equal(
-                cuda.context(),
-                q,
-                k,
-                v,
-                2,
-                256,
-                n_heads,
-                head_dim,
-            )? {
-                return Ok(output);
-            }
-        }
-        let q = q.reshape(vec![total_rows, row_width])?;
-        let k = k.reshape(vec![total_rows, row_width])?;
-        let v = v.reshape(vec![total_rows, row_width])?;
-        let mut segments = Vec::with_capacity(segment_lengths.len());
-        let mut first_row = 0usize;
-        for &row_count in segment_lengths {
-            let shape = vec![row_count, n_heads, head_dim];
-            let q_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &q, first_row, row_count)?
-                    .reshape(shape.clone())?;
-            let k_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &k, first_row, row_count)?
-                    .reshape(shape.clone())?;
-            let v_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &v, first_row, row_count)?
-                    .reshape(shape)?;
-            segments.push(vision_attention(
-                b, &q_segment, &k_segment, &v_segment, row_count, n_heads, head_dim,
-            )?);
-            first_row = first_row
-                .checked_add(row_count)
-                .ok_or_else(|| Error::Other("Qwen3-VL attention row range overflow".into()))?;
-        }
-        if segments.len() == 2 {
-            if let Some(concat_quant) = concat_quant {
-                if let Some(output) = concat_quant(output_name, &segments[0], &segments[1])? {
-                    return Ok(output);
-                }
-            }
-        }
-        let mut output = segments.remove(0);
-        for segment in segments {
-            output = kernels::elementwise::concat_rows_bf16(cuda.context(), &output, &segment)?;
-        }
-        return Ok(output);
     }
 
     #[cfg(feature = "musa")]

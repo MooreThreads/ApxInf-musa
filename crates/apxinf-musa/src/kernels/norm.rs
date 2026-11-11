@@ -2,20 +2,20 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
+#[cfg(apxinf_musa_available)]
+use super::contracts::{checked_i32, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matrix_bf16, require_output_matrix,
     require_vector_at_least_bf16, require_vector_bf16,
 };
-#[cfg(apxinf_musa_available)]
-use super::contracts::{checked_i32, tensor_ptr};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
+use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
-use crate::kernels::not_ported;
 
 /// BF16 RMS normalization over the last axis.
 ///
@@ -544,16 +544,12 @@ mod tests {
             let base = row * cols;
             let row_values = &input_values[base..base + cols];
             let mean = row_values.iter().sum::<f32>() / cols as f32;
-            let variance = row_values
-                .iter()
-                .map(|v| (v - mean) * (v - mean))
-                .sum::<f32>()
-                / cols as f32;
+            let variance =
+                row_values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
             let inverse_std = 1.0 / (variance + EPS).sqrt();
             for col in 0..cols {
-                let expected = round(
-                    (row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col],
-                );
+                let expected =
+                    round((row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col]);
                 let error = (got[base + col] - expected).abs();
                 worst = worst.max(error);
                 assert!(

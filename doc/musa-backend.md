@@ -232,10 +232,13 @@ measured steady-state shapes `(1,1024,132)` and `(1,1536,1024)`. In particular,
 the optimized text interval is
 `128 < sequence_length <= 256`, not an exact 145-token contract.
 
-Use `scripts/gr00t/bench_apxinf_musa.py` to launch the native Rust benchmark and apply
+Use `scripts/gr00t/bench_apxinf_musa_rust.py` to launch the native Rust benchmark and apply
 the BF16 parity gate. The script does not execute the model in Python. See
 [GR00T N1.7](gr00t-n1.7.md#musa-bf16) for the fixed-input contract and command.
 The MUSA GR00T loader accepts a tactics JSON file through `--tactics`.
+For direct in-process use of the installed Python wheel, use
+`scripts/gr00t/bench_apxinf_musa_wheel.py`; its timing also includes NumPy/PyO3
+conversion. Both scripts accept the same preprocessed fixture.
 Use `--autotune --tactics path_to/tactics.json` to measure missing BF16 GEMM
 choices before Graph capture. Exact assembly routes retain their existing
 dispatch; other supported BF16 shapes tune between muBLAS and muDNN.

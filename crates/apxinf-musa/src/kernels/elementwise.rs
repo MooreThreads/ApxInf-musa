@@ -14,17 +14,21 @@ use crate::context::MusaContext;
 use crate::error::musa_error;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
+use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
-use crate::kernels::not_ported;
 
 /// Add a bias vector to every row (or copy the input when there is none).
 ///
 /// Shares the activation kernel with [`super::activation`], selected by the
 /// `none` code, exactly as the CUDA facade does.
-pub fn bias_bf16(ctx: &MusaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
+pub fn bias_bf16(
+    ctx: &MusaContext,
+    input: &Tensor,
+    value: Option<&Tensor>,
+) -> Result<Tensor> {
     let (rows, cols) = require_matrix_bf16(ctx, input, "bias", "input")?;
     let mut output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
     bias_bf16_into(ctx, input, value, &mut output)?;
@@ -54,15 +58,7 @@ pub fn concat_rows_bf16(ctx: &MusaContext, first: &Tensor, second: &Tensor) -> R
         .checked_add(second_rows)
         .ok_or_else(|| Error::Other("MUSA concat_rows row count overflow".into()))?;
     let output = matrix_tensor(ctx, rows, first_cols, bf16_output(ctx, rows, first_cols)?);
-    launch_concat(
-        ctx,
-        first,
-        second,
-        &output,
-        first_rows,
-        second_rows,
-        first_cols,
-    )?;
+    launch_concat(ctx, first, second, &output, first_rows, second_rows, first_cols)?;
     Ok(output)
 }
 
@@ -227,13 +223,7 @@ fn require_mul_channels(
     channel_scale: &Tensor,
 ) -> Result<(usize, usize)> {
     let (rows, cols) = require_matrix_bf16(ctx, input, "mul_channels", "input")?;
-    require_dtype_on(
-        ctx,
-        channel_scale,
-        DType::F32,
-        "mul_channels",
-        "channel_scale",
-    )?;
+    require_dtype_on(ctx, channel_scale, DType::F32, "mul_channels", "channel_scale")?;
     if channel_scale.shape().dims() != [cols] {
         return Err(Error::Other(format!(
             "MUSA mul_channels needs a [{cols}] channel scale, got {:?}",
@@ -659,11 +649,7 @@ mod tests {
         let bias_values = values(cols, 0x1357_9bdf);
 
         let projection = upload(ctx, &projection_values, Shape::new(vec![rows, cols]));
-        let position = upload(
-            ctx,
-            &position_values,
-            Shape::new(vec![tokens_per_view, cols]),
-        );
+        let position = upload(ctx, &position_values, Shape::new(vec![tokens_per_view, cols]));
         let bias_tensor = bias.then(|| upload(ctx, &bias_values, Shape::new(vec![cols])));
 
         let out = add_position_bf16(
