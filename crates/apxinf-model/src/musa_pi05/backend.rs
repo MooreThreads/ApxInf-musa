@@ -28,7 +28,7 @@ pub(crate) mod gemm {
         adaptive_gate_residual_rms_quantize_w8a8_activation,
         adaptive_rms_quantize_w8a8_activation, decode_scope, install_bf16_observer,
         norm_quantize_w8a8_activation, prepare_bf16_nn_weight, prepare_bf16_nt_weight,
-        Bf16ActivationObserver,
+        Bf16ActivationObserver, tilelang_serves_gemm,
     };
 }
 
