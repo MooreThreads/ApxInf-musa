@@ -123,29 +123,8 @@ pub(crate) fn norm_quantize_with_scalar_rms(
             };
             return Ok((hidden, quantize_w8a8_activation(ctx, &normalized, inv_c)?));
         }
-        let rows_i32 = checked_i32(op, "rows", rows)?;
-        let cols_i32 = checked_i32(op, "cols", cols)?;
-        let elements = rows
-            .checked_mul(cols)
-            .ok_or_else(|| Error::Other(format!("{op}: size overflow")))?;
-        let hidden = if residual.is_some() {
-            let bytes = elements
-                .checked_mul(2)
-                .ok_or_else(|| Error::Other(format!("{op}: size overflow")))?;
-            Some(
-                crate::workspace::output_buffer(ctx, bytes)?
-                    .as_tensor(Shape::new(vec![rows, cols]), DType::BF16)
-                    .map_err(musa_error)?,
-            )
-        } else {
-            None
-        };
-        let quantized = crate::workspace::output_buffer(ctx, elements)?;
-        let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, op)?)?;
-        let hidden_ptr = match hidden.as_ref() {
-            Some(t) => ptr(t)? as *mut c_void,
-            None => std::ptr::null_mut(),
-        };
+        let buffers = ProducerBuffers::allocate(ctx, op, rows, cols, residual.is_some())?;
+        let hidden_ptr = buffers.hidden_ptr()?;
         // SAFETY: shapes, dtypes, devices and vector alignment are checked above.
         // Workspace owns disjoint outputs with full scale padding on this stream.
         unsafe {
@@ -157,10 +136,10 @@ pub(crate) fn norm_quantize_with_scalar_rms(
                     weights,
                     bias,
                     hidden_ptr,
-                    quantized.ptr(),
-                    row_scales.ptr(),
-                    rows_i32,
-                    cols_i32,
+                    buffers.quantized.ptr(),
+                    buffers.row_scales.ptr(),
+                    buffers.rows_i32,
+                    buffers.cols_i32,
                     eps,
                     factors,
                     ctx.stream().handle(),
@@ -168,14 +147,6 @@ pub(crate) fn norm_quantize_with_scalar_rms(
                 op,
             )?;
         }
-        Ok((
-            hidden,
-            W8A8Activation {
-                quantized,
-                row_scales,
-                rows,
-                input_dim: cols,
-            },
-        ))
+        Ok(buffers.into_activation(rows, cols))
     }
 }

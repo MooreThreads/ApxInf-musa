@@ -48,12 +48,9 @@ __global__ void rms_quantize_bf16_int8_kernel(
     values[lane] = __bfloat162float(rounded);
     maximum = fmaxf(maximum, fabsf(values[lane]));
   }
-  const float scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
-  if (row == 0)
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x)
-      scales[rows + pad] = __float2half_rn(0.0f);
+  if (row == 0) w8a8_scale_pad(scales, rows);
   PackedI8x8 quantized;
 #pragma unroll
   for (int lane = 0; lane < 8; ++lane)
@@ -71,9 +68,7 @@ __global__ void layer_quantize_bf16_int8_kernel(
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * WARPS + (threadIdx.x >> 5);
   // Include inactive rows in padding initialization for short/partial blocks.
-  if (blockIdx.x == 0)
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x)
-      scales[rows + pad] = __float2half_rn(0.0f);
+  if (blockIdx.x == 0) w8a8_scale_pad(scales, rows);
   if (row >= rows) return;
   const int64_t base = static_cast<int64_t>(row) * cols;
   float values[36], sum = 0.0f, square_sum = 0.0f;

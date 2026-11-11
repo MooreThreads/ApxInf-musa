@@ -237,10 +237,71 @@ pub struct W8A8Activation {
     input_dim: usize,
 }
 
-impl W8A8Activation {
-    /// Rows of the quantized activation, for callers sizing its GEMM output.
-    pub fn rows(&self) -> usize {
-        self.rows
+/// Owner for the allocations a fused producer writes before it hands them to
+/// [`W8A8Activation`]. The `hidden` stream is only present for producers whose
+/// kernel writes the residual/normalized BF16 tensor back.
+#[cfg(apxinf_musa_available)]
+struct ProducerBuffers {
+    hidden: Option<Tensor>,
+    quantized: MusaBuffer,
+    row_scales: MusaBuffer,
+    rows_i32: i32,
+    cols_i32: i32,
+}
+
+#[cfg(apxinf_musa_available)]
+impl ProducerBuffers {
+    fn allocate(
+        ctx: &MusaContext,
+        operation: &str,
+        rows: usize,
+        input_dim: usize,
+        hidden: bool,
+    ) -> Result<Self> {
+        let elements = rows
+            .checked_mul(input_dim)
+            .ok_or_else(|| Error::Other(format!("{operation}: size overflow")))?;
+        let hidden = if hidden {
+            let bytes = elements
+                .checked_mul(2)
+                .ok_or_else(|| Error::Other(format!("{operation}: size overflow")))?;
+            Some(
+                crate::workspace::output_buffer(ctx, bytes)?
+                    .as_tensor(Shape::new(vec![rows, input_dim]), DType::BF16)
+                    .map_err(musa_error)?,
+            )
+        } else {
+            None
+        };
+        let quantized = crate::workspace::output_buffer(ctx, elements)?;
+        let row_scales =
+            crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, operation)?)?;
+        Ok(Self {
+            hidden,
+            quantized,
+            row_scales,
+            rows_i32: checked_i32(operation, "rows", rows)?,
+            cols_i32: checked_i32(operation, "cols", input_dim)?,
+        })
+    }
+
+    fn hidden_ptr(&self) -> Result<*mut c_void> {
+        match self.hidden.as_ref() {
+            Some(t) => Ok(MusaBuffer::from_tensor(t).map_err(musa_error)?.ptr() as *mut c_void),
+            None => Ok(std::ptr::null_mut()),
+        }
+    }
+
+    fn into_activation(self, rows: usize, input_dim: usize) -> (Option<Tensor>, W8A8Activation) {
+        (
+            self.hidden,
+            W8A8Activation {
+                quantized: self.quantized,
+                row_scales: self.row_scales,
+                rows,
+                input_dim,
+            },
+        )
     }
 }
 
@@ -342,13 +403,7 @@ pub fn quantize_w8a8_activation(
     let (rows, input_dim) = activation_matrix(ctx, activation, operation)?;
     let source = MusaBuffer::from_tensor(activation).map_err(musa_error)?;
     let factors = equalization_factors_ptr(ctx, operation, inv_c, input_dim)?;
-    let elements = rows
-        .checked_mul(input_dim)
-        .ok_or_else(|| Error::Other(format!("MUSA {operation} size overflow")))?;
-    let quantized = crate::workspace::output_buffer(ctx, elements)?;
-    let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, operation)?)?;
-    let rows_i32 = checked_i32(operation, "rows", rows)?;
-    let cols_i32 = checked_i32(operation, "cols", input_dim)?;
+    let buffers = ProducerBuffers::allocate(ctx, operation, rows, input_dim, false)?;
     // SAFETY: `activation_matrix` established that the activation is a
     // contiguous 2-D BF16 tensor on this context's device, so `source` borrows
     // `rows * input_dim` readable bytes; `factors` is null or borrows the
@@ -360,22 +415,17 @@ pub fn quantize_w8a8_activation(
         check_native(
             ffi::custom::apxinf_musa_quantize_rows_bf16_int8(
                 source.ptr() as *const c_void,
-                quantized.ptr(),
-                row_scales.ptr(),
-                rows_i32,
-                cols_i32,
+                buffers.quantized.ptr(),
+                buffers.row_scales.ptr(),
+                buffers.rows_i32,
+                buffers.cols_i32,
                 factors,
                 ctx.stream().handle(),
             ),
             operation,
         )?;
     }
-    Ok(W8A8Activation {
-        quantized,
-        row_scales,
-        rows,
-        input_dim,
-    })
+    Ok(buffers.into_activation(rows, input_dim).1)
 }
 
 /// No toolkit: report the gap, do not fall back.
@@ -420,13 +470,7 @@ pub fn quantize_w8a8_geglu_activation(
         let activated = crate::kernels::activation::geglu_bf16(ctx, activation)?;
         return quantize_w8a8_activation(ctx, &activated, inv_c);
     }
-    let elements = rows
-        .checked_mul(input_dim)
-        .ok_or_else(|| Error::Other(format!("MUSA {operation} size overflow")))?;
-    let quantized = crate::workspace::output_buffer(ctx, elements)?;
-    let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, operation)?)?;
-    let rows_i32 = checked_i32(operation, "rows", rows)?;
-    let cols_i32 = checked_i32(operation, "cols", input_dim)?;
+    let buffers = ProducerBuffers::allocate(ctx, operation, rows, input_dim, false)?;
     // SAFETY: `activation_matrix` established that the activation is a
     // contiguous 2-D BF16 tensor on this context's device, so `source` borrows
     // `rows * 2 * input_dim` readable BF16 elements; `factors` is null or borrows
@@ -438,22 +482,17 @@ pub fn quantize_w8a8_geglu_activation(
         check_native(
             ffi::custom::apxinf_musa_geglu_quantize_rows_bf16_int8(
                 source.ptr() as *const c_void,
-                quantized.ptr(),
-                row_scales.ptr(),
-                rows_i32,
-                cols_i32,
+                buffers.quantized.ptr(),
+                buffers.row_scales.ptr(),
+                buffers.rows_i32,
+                buffers.cols_i32,
                 factors,
                 ctx.stream().handle(),
             ),
             operation,
         )?;
     }
-    Ok(W8A8Activation {
-        quantized,
-        row_scales,
-        rows,
-        input_dim,
-    })
+    Ok(buffers.into_activation(rows, input_dim).1)
 }
 
 /// No toolkit: report the gap, do not fall back.
@@ -495,13 +534,7 @@ pub fn quantize_w8a8_bias_gelu_activation(
         let activated = crate::kernels::activation::bias_gelu_bf16(ctx, activation, bias)?;
         return quantize_w8a8_activation(ctx, &activated, inv_c);
     }
-    let elements = rows
-        .checked_mul(input_dim)
-        .ok_or_else(|| Error::Other(format!("MUSA {operation} size overflow")))?;
-    let quantized = crate::workspace::output_buffer(ctx, elements)?;
-    let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, operation)?)?;
-    let rows_i32 = checked_i32(operation, "rows", rows)?;
-    let cols_i32 = checked_i32(operation, "cols", input_dim)?;
+    let buffers = ProducerBuffers::allocate(ctx, operation, rows, input_dim, false)?;
     // SAFETY: `activation_matrix` established that the activation is a
     // contiguous 2-D BF16 tensor on this context's device, so `source` borrows
     // `rows * input_dim` readable BF16 elements; `bias_pointer` is null or
@@ -515,22 +548,17 @@ pub fn quantize_w8a8_bias_gelu_activation(
             ffi::custom::apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
                 source.ptr() as *const c_void,
                 bias_pointer,
-                quantized.ptr(),
-                row_scales.ptr(),
-                rows_i32,
-                cols_i32,
+                buffers.quantized.ptr(),
+                buffers.row_scales.ptr(),
+                buffers.rows_i32,
+                buffers.cols_i32,
                 factors,
                 ctx.stream().handle(),
             ),
             operation,
         )?;
     }
-    Ok(W8A8Activation {
-        quantized,
-        row_scales,
-        rows,
-        input_dim,
-    })
+    Ok(buffers.into_activation(rows, input_dim).1)
 }
 
 /// No toolkit: report the gap, do not fall back.

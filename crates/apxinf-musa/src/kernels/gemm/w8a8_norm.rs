@@ -1,5 +1,6 @@
 //! Adaptive RMSNorm producers for W8A8, with BF16 residual/activation rounding.
 use super::*;
+use apxinf_core::Error;
 
 /// Adaptive RMSNorm followed by dynamic row quantization. Aligned 1024-column
 /// inputs share the existing BF16 producer's reduction order in a single kernel.
@@ -33,7 +34,16 @@ pub fn adaptive_gate_residual_rms_quantize_w8a8_activation(
         eps,
         inv_c,
     )?;
-    Ok((hidden.expect("gated norm produces a residual"), quantized))
+    Ok((
+        hidden.ok_or_else(|| {
+            Error::Other(
+                "gemm::adaptive_gate_residual_rms_quantize_w8a8_activation: \
+                 gated norm produced no residual"
+                    .into(),
+            )
+        })?,
+        quantized,
+    ))
 }
 
 #[cfg_attr(not(apxinf_musa_available), allow(unused_variables))]
@@ -105,29 +115,8 @@ fn norm_quantize(
             };
             return Ok((hidden, quantize_w8a8_activation(ctx, &normalized, inv_c)?));
         }
-        let rows_i32 = checked_i32(op, "rows", rows)?;
-        let cols_i32 = checked_i32(op, "cols", cols)?;
-        let elements = rows
-            .checked_mul(cols)
-            .ok_or_else(|| Error::Other(format!("{op}: size overflow")))?;
-        let hidden = if gated.is_some() {
-            let bytes = elements
-                .checked_mul(2)
-                .ok_or_else(|| Error::Other(format!("{op}: size overflow")))?;
-            Some(
-                crate::workspace::output_buffer(ctx, bytes)?
-                    .as_tensor(Shape::new(vec![rows, cols]), DType::BF16)
-                    .map_err(musa_error)?,
-            )
-        } else {
-            None
-        };
-        let quantized = crate::workspace::output_buffer(ctx, elements)?;
-        let row_scales = crate::workspace::output_buffer(ctx, padded_scale_bytes(rows, op)?)?;
-        let hidden_ptr = match hidden.as_ref() {
-            Some(t) => ptr(t)? as *mut c_void,
-            None => std::ptr::null_mut(),
-        };
+        let buffers = ProducerBuffers::allocate(ctx, op, rows, cols, gated.is_some())?;
+        let hidden_ptr = buffers.hidden_ptr()?;
         // SAFETY: all sources have validated BF16 shapes/device; optional factors
         // are cols F32. Outputs are workspace-owned, disjoint and correctly sized,
         // including the 512 FP16 scale pad. Every vector address is aligned.
@@ -139,10 +128,10 @@ fn norm_quantize(
                     gate_style,
                     norm_style,
                     hidden_ptr,
-                    quantized.ptr(),
-                    row_scales.ptr(),
-                    rows_i32,
-                    cols_i32,
+                    buffers.quantized.ptr(),
+                    buffers.row_scales.ptr(),
+                    buffers.rows_i32,
+                    buffers.cols_i32,
                     eps,
                     factors,
                     ctx.stream().handle(),
@@ -150,14 +139,6 @@ fn norm_quantize(
                 op,
             )?;
         }
-        Ok((
-            hidden,
-            W8A8Activation {
-                quantized,
-                row_scales,
-                rows,
-                input_dim: cols,
-            },
-        ))
+        Ok(buffers.into_activation(rows, cols))
     }
 }

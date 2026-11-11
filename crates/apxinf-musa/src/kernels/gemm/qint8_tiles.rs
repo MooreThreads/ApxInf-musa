@@ -276,4 +276,27 @@ mod tests {
         }
         assert_eq!(pick(10, 2048, 16384), index_of("32x64"));
     }
+
+    #[test]
+    fn mfast_asm_matches_the_checked_in_derivation() {
+        const SYMBOL: &str =
+            "musa_asm_s8mma_nhwc_conv_KRSC_256_256x128_lin_ol_outbf16";
+        let source = std::str::from_utf8(include_bytes!(
+            "../../../kernels/asm/qint8_256x128.asm"
+        ))
+        .expect("the source image is ASCII");
+        let checked_in: &[u8] =
+            include_bytes!("../../../kernels/asm/qint8_256x128_mfast.asm");
+        let mut derived = source.to_string();
+        for (old, new) in [
+            ("MOV.LD.LM.B32 R20, LM4", "MOV.LD.LM.B32 R20, LM5"),
+            ("MOV.LD.LM.B32 R21, LM5", "MOV.LD.LM.B32 R21, LM4"),
+        ] {
+            assert_eq!(derived.matches(old).count(), 1, "anchor {old:?}");
+            derived = derived.replace(old, new);
+        }
+        assert_eq!(derived.matches(SYMBOL).count(), 10, "symbol sites");
+        derived = derived.replace(SYMBOL, &format!("{SYMBOL}_mfast"));
+        assert_eq!(derived.as_bytes(), checked_in, "M-fast image is stale");
+    }
 }

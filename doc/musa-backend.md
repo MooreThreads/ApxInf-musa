@@ -115,7 +115,7 @@ The current relationship is:
 - **Interior follows legacy CUDA.** `kernels/`, `ffi/`, `buffer`/`context`/
   `stream`/`device_caps` and the flat `adapters/*.mu` are ported from
   `apxinf-cuda`, which is the tree this backend was taken from.
-- **Kernels are a subset, rewritten where the hardware forced it.** 35 device
+- **Kernels are a subset, rewritten where the hardware forced it.** 39 device
   kernels against the original CUDA tree's 221; the 16 that keep the same name
   are the ones PI0.5 uses. Their bodies differ where M1000 made the upstream shape wrong:
   row-grid launches (64-bit integer division is a software routine here), a
@@ -187,10 +187,14 @@ capability. What the port adds to the device path:
   and the action expert's adaptive RMSNorm and gated residual RMSNorm +
   quantization share the contract. A producer is used only when the consuming
   projection is quantized and the width/alignment matches; anything else keeps
-  the materialized BF16 chain. Device tests compare every fused producer with
-  the split chain byte-for-byte (`w8a8_norm_tests.rs`,
-  `w8a8_affine_norm_tests.rs`). `APXINF_MUSA_BF16_RMS=scalar` forces the
-  fallback RMS producer onto the scalar two-pass kernel for accuracy runs.
+  the materialized BF16 chain. Device-only tests compare every fused producer
+  with the split chain byte-for-byte (`w8a8_norm_tests.rs`,
+  `w8a8_affine_norm_tests.rs`); they are `#[ignore]`d and no CI job runs a
+  MUSA device, so run them manually with
+  `cargo test -p apxinf-musa --lib -- --ignored kernels::gemm::w8a8
+  --test-threads=1`. `APXINF_MUSA_BF16_RMS=scalar` forces only the language
+  qkv input RMSNorm's fallback onto the scalar two-pass kernel for accuracy
+  runs; the other norm producers have no scalar form.
 - The down projection's `(522, 2048, 16384)` shape may take the `256x128`
   **M-fast** tile. Its assembly image is derived from `qint8_256x128.asm` by
   `aot/export_qint8_mfast.py`, with the source hash pinned in the script and
@@ -240,9 +244,9 @@ The medians are 317.94 ms (base) and 312.14 ms (fused), a 5.80 ms / 1.83%
 reduction. The exported actions were bitwise identical in every round, and all
 four runs scored cosine 0.99936157 / max_abs 0.0504164 against the Orin bundle
 (gate 0.999 PASS). Device validation: `cargo test -p apxinf-musa --lib --
---ignored kernels::gemm::w8a8` passes 14/14, including the 2*cols style and
-scalar-RMS regressions; `cargo test -p apxinf-model --features musa --lib
-musa_pi05::` passes 36.
+--ignored kernels::gemm::w8a8 --test-threads=1` passes 14/14 (device-only; see
+the INT8 note above), including the 2*cols style and scalar-RMS regressions;
+`cargo test -p apxinf-model --features musa --lib musa_pi05::` passes 36.
 
 The integration branch on the same machine measures 513.4 / 510.1 ms for `bf16`, 406.4 /
 363.2 for `int8_dynamic` and 545.1 / 502.9 for `int8_dynamic_no_encode` (eager /

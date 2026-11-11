@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use apxinf_core::{NormalGenerator, Result, Tensor};
+use apxinf_core::{DType, NormalGenerator, Result, Tensor};
 
 pub(crate) use apxinf_musa::{
     ops, CapturedGraph, ExecutionSession, MusaBuffer as DeviceBuffer, MusaContext as Context,
@@ -57,6 +57,23 @@ pub(crate) fn to_device(ctx: &Context, tensor: &Tensor) -> Result<Tensor> {
 
 pub(crate) fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     transfers::to_cpu(tensor)
+}
+
+/// Apply an optional bias and elementwise activation in one typed pointwise
+/// pass. Shared by the block path's SiLU/GELU sites and the weights fallback.
+pub(crate) fn bias_activation_bf16(
+    ctx: &Context,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    activation: ops::PointwiseActivation,
+) -> Result<Tensor> {
+    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    let mut args =
+        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+    args.bias = bias;
+    args.activation = activation;
+    ops::pointwise(ctx, args)?;
+    Ok(output)
 }
 
 pub(crate) fn synchronize(ctx: &Context) -> Result<()> {

@@ -15,7 +15,7 @@
 //! borrows the values, both scale vectors and the dimensions together so a call
 //! site cannot mismatch them.
 
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use apxinf_core::{Result, Tensor};
 
 use crate::kernels::elementwise;
 use crate::kernels::gemm as gemm_kernels;
@@ -121,18 +121,7 @@ pub fn gemm_quantized_alloc(
     activation: &W8A8Activation,
     weight: W8A8WeightView<'_>,
 ) -> Result<Tensor> {
-    let elements = activation
-        .rows()
-        .checked_mul(weight.output_dim)
-        .ok_or_else(|| Error::Other("MUSA gemm::w8a8 output size overflow".into()))?;
-    let bytes = elements
-        .checked_mul(DType::BF16.size_in_bytes())
-        .ok_or_else(|| Error::Other("MUSA gemm::w8a8 output size overflow".into()))?;
-    let output = crate::workspace::output_buffer(ctx, bytes)?;
-    let mut tensor =
-        output.into_tensor(Shape::new(vec![activation.rows(), weight.output_dim]), DType::BF16);
-    gemm_quantized(ctx, activation, weight, &mut tensor)?;
-    Ok(tensor)
+    gemm_kernels::gemm_quantized_w8a8(ctx, activation, weight)
 }
 
 /// Whether a tile serves a `[rows, k] @ [k, n]` contraction.

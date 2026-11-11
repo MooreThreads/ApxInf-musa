@@ -61,17 +61,6 @@ mod linear {
         Ok(output)
     }
 
-    /// Materialized bias+GELU for the BF16-fallback combination.
-    fn bias_gelu_bf16(ctx: &Context, input: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-        let mut args =
-            ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
-        args.bias = bias;
-        args.activation = ops::PointwiseActivation::Gelu;
-        ops::pointwise(ctx, args)?;
-        Ok(output)
-    }
-
     /// Multiply a BF16 matrix by a per-channel f32 vector, allocating the output.
     fn scale_channels(ctx: &Context, input: &Tensor, channel_scale: &Tensor) -> Result<Tensor> {
         let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
@@ -511,7 +500,12 @@ mod linear {
             gemm_policy: &ops::GemmPolicy,
         ) -> Result<Tensor> {
             if self.bf16_fallback.is_some() {
-                let activated = bias_gelu_bf16(ctx, input, bias)?;
+                let activated = crate::musa_pi05::backend::bias_activation_bf16(
+                    ctx,
+                    input,
+                    bias,
+                    ops::PointwiseActivation::Gelu,
+                )?;
                 return self.gemm_with_policies(ctx, &activated, gemm_policy);
             }
             let rows = input.shape().dims()[0];

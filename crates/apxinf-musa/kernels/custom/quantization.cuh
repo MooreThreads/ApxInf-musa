@@ -51,6 +51,18 @@
 // `scale_pad`.
 constexpr int kW8A8ScalePad = 512;
 
+// One row's FP16 dequantization scale. The caller keeps its thread guard.
+__device__ __forceinline__ float w8a8_row_scale(float maximum, float* scratch) {
+  return fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+}
+
+// Zero-fill the pad the tile's guarded scale load can reach. The caller keeps
+// its block/row guard.
+__device__ __forceinline__ void w8a8_scale_pad(__half* scales, int rows) {
+  for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x)
+    scales[rows + pad] = __float2half_rn(0.0f);
+}
+
 // The quantizer's per-element arithmetic, shared by both forms below so that
 // they cannot drift apart: `value / scale`, rounded to nearest, clamped to the
 // INT8 range.
@@ -126,14 +138,9 @@ __global__ void quantize_rows_bf16_int8_kernel(const __mt_bfloat16* input,
                     fabsf(__bfloat162float(
                         equalize_bf16(input[base + col], inv_c, col))));
   }
-  const float scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
-  if (blockIdx.x == 0) {
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x) {
-      scales[rows + pad] = __float2half_rn(0.0f);
-    }
-  }
+  if (blockIdx.x == 0) w8a8_scale_pad(scales, rows);
   // `block_max_parallel_unsafe` leaves its result in `scratch[0]` after a
   // barrier, but does not protect the read of it: every thread reads the value
   // into a register before the next writer. There is no next writer here, so the
@@ -223,14 +230,9 @@ __global__ void quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat16* input,
       }
     }
   }
-  const float scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
-  if (blockIdx.x == 0) {
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x) {
-      scales[rows + pad] = __float2half_rn(0.0f);
-    }
-  }
+  if (blockIdx.x == 0) w8a8_scale_pad(scales, rows);
   // Same contract as the scalar form: the scale is read out of `scratch[0]`
   // once and every thread works from its register copy of it.
 #pragma unroll
@@ -298,14 +300,9 @@ __global__ void geglu_quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat16* 
       }
     }
   }
-  const float scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
-  if (blockIdx.x == 0) {
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x) {
-      scales[rows + pad] = __float2half_rn(0.0f);
-    }
-  }
+  if (blockIdx.x == 0) w8a8_scale_pad(scales, rows);
   // Same contract as the scalar form: the scale is read out of `scratch[0]`
   // once and every thread works from its register copy of it.
 #pragma unroll
@@ -373,14 +370,9 @@ __global__ void bias_gelu_quantize_rows_bf16_int8_lanes_kernel(const __mt_bfloat
       }
     }
   }
-  const float scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(scale);
-  if (blockIdx.x == 0) {
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x) {
-      scales[rows + pad] = __float2half_rn(0.0f);
-    }
-  }
+  if (blockIdx.x == 0) w8a8_scale_pad(scales, rows);
   // Same contract as the scalar form: the scale is read out of `scratch[0]`
   // once and every thread works from its register copy of it.
 #pragma unroll
@@ -455,13 +447,9 @@ __global__ void ada_rms_quantize_bf16_int8_kernel(
     values[lane] = __bfloat162float(rounded);
     maximum = fmaxf(maximum, fabsf(values[lane]));
   }
-  const float row_scale =
-      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float row_scale = w8a8_row_scale(maximum, scratch);
   if (threadIdx.x == 0) scales[row] = __float2half_rn(row_scale);
-  if (row == 0) {
-    for (int pad = threadIdx.x; pad < kW8A8ScalePad; pad += blockDim.x)
-      scales[rows + pad] = __float2half_rn(0.0f);
-  }
+  if (row == 0) w8a8_scale_pad(scales, rows);
   uint32_t packed;
   auto* bytes = reinterpret_cast<int8_t*>(&packed);
 #pragma unroll
