@@ -35,7 +35,7 @@ pub(crate) mod gemm {
 ///
 /// The quantized variant carries the fused norm+quantize producer's rows and
 /// scales; BF16 heads and excluded projections keep the materialized tensor.
-pub(crate) enum NormalizedW8A8Input {
+pub enum NormalizedW8A8Input {
     Bf16(Tensor),
     Quantized(ops::w8a8::W8A8Activation),
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::kernels::test_support::{bf16_bytes, read_back, upload, values, zeros_as};
+use apxinf_core::Graph;
 use std::sync::Arc;
 
 fn compare(a: &W8A8Activation, b: &W8A8Activation) {
@@ -45,6 +46,10 @@ fn action_norm_quant_matches_split_and_validates_views() {
             let residual = upload(&ctx, &values(rows * cols, 25), Shape::new(vec![rows, cols]));
             let gate = upload(&ctx, &values(cols * 3, 26), Shape::new(vec![cols * 3]));
             let style = upload(&ctx, &values(cols * 3, 27), Shape::new(vec![cols * 3]));
+            // A modulation vector that carries only the scale/shift segments:
+            // the fused producers must accept the same prefix the unfused
+            // producers do.
+            let style_prefix = upload(&ctx, &values(cols * 2, 28), Shape::new(vec![cols * 2]));
             let factors = factors(&ctx, cols);
             for inv in [None, Some(&factors)] {
                 let normalized =
@@ -61,6 +66,44 @@ fn action_norm_quant_matches_split_and_validates_views() {
                 let expected = quantize_w8a8_activation(&ctx, &split.normalized, inv).unwrap();
                 let (hidden, actual) = adaptive_gate_residual_rms_quantize_w8a8_activation(
                     &ctx, &input, &residual, &gate, &style, 1e-6, inv,
+                )
+                .unwrap();
+                ctx.synchronize().unwrap();
+                compare(&actual, &expected);
+                assert_eq!(read_back(&hidden), read_back(&split.hidden));
+
+                let normalized =
+                    crate::kernels::norm::adaptive_rms_bf16(&ctx, &input, &style_prefix, 1e-6)
+                        .unwrap();
+                let expected = quantize_w8a8_activation(&ctx, &normalized, inv).unwrap();
+                let actual = adaptive_rms_quantize_w8a8_activation(
+                    &ctx,
+                    &input,
+                    &style_prefix,
+                    1e-6,
+                    inv,
+                )
+                .unwrap();
+                ctx.synchronize().unwrap();
+                compare(&actual, &expected);
+                let split = crate::kernels::fused::adaptive_gate_residual_rms_bf16(
+                    &ctx,
+                    &input,
+                    &residual,
+                    &gate,
+                    &style_prefix,
+                    1e-6,
+                )
+                .unwrap();
+                let expected = quantize_w8a8_activation(&ctx, &split.normalized, inv).unwrap();
+                let (hidden, actual) = adaptive_gate_residual_rms_quantize_w8a8_activation(
+                    &ctx,
+                    &input,
+                    &residual,
+                    &gate,
+                    &style_prefix,
+                    1e-6,
+                    inv,
                 )
                 .unwrap();
                 ctx.synchronize().unwrap();
@@ -150,8 +193,8 @@ fn action_norm_quant_graph_replays_changed_inputs() {
         for gated in [false, true] {
             let a_workspace = crate::workspace::GraphWorkspace::new(131072, 0).unwrap();
             let b_workspace = crate::workspace::GraphWorkspace::new(131072, 0).unwrap();
-            let (a_graph, (expected_hidden, expected)) = crate::graph::capture(ctx.clone(), || {
-                crate::workspace::with_workspace(&a_workspace, || {
+            let (a_graph, (expected_hidden, expected)) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                crate::kernels::test_support::with_workspace(a_workspace, || {
                     let (hidden, normalized) = if gated {
                         let out = crate::kernels::fused::adaptive_gate_residual_rms_bf16(
                             &ctx, &input, &residual, &gate, &style, 1e-6,
@@ -167,8 +210,8 @@ fn action_norm_quant_graph_replays_changed_inputs() {
                 })
             })
             .unwrap();
-            let (b_graph, (hidden, actual)) = crate::graph::capture(ctx.clone(), || {
-                crate::workspace::with_workspace(&b_workspace, || {
+            let (b_graph, (hidden, actual)) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                crate::kernels::test_support::with_workspace(b_workspace, || {
                     if gated {
                         let (h, q) = adaptive_gate_residual_rms_quantize_w8a8_activation(
                             &ctx, &input, &residual, &gate, &style, 1e-6, inv,

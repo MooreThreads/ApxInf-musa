@@ -137,6 +137,17 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// The scalar two-pass RMSNorm, bypassing the width-directed lane kernel.
+    pub fn apxinf_musa_rms_norm_bf16_scalar(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// adaLN RMSNorm: `style` is `[3 * cols]` and its first two segments are
     /// the scale and shift; the third belongs to the gated variant.
     pub fn apxinf_musa_ada_rms_norm_bf16(

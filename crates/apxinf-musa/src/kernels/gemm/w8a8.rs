@@ -486,25 +486,7 @@ pub fn quantize_w8a8_bias_gelu_activation(
         None => std::ptr::null(),
     };
     let source = MusaBuffer::from_tensor(activation).map_err(musa_error)?;
-    let factors = match inv_c {
-        Some(factors) => {
-            if factors.dtype() != DType::F32
-                || factors.device() != Device::Musa(ctx.device_id())
-                || factors.shape().dims() != [input_dim]
-            {
-                return Err(Error::Other(format!(
-                    "MUSA {operation} expects the equalization factors to be {} f32 on {}, got {} {:?} on {}",
-                    input_dim,
-                    Device::Musa(ctx.device_id()),
-                    factors.dtype(),
-                    factors.shape().dims(),
-                    factors.device()
-                )));
-            }
-            MusaBuffer::from_tensor(factors).map_err(musa_error)?.ptr() as *const c_void
-        }
-        None => std::ptr::null(),
-    };
+    let factors = equalization_factors_ptr(ctx, operation, inv_c, input_dim)?;
     if input_dim != 4352
         || source.ptr() as usize % 16 != 0
         || factors as usize % 16 != 0
@@ -856,7 +838,7 @@ mod tests {
 
     use std::time::Instant;
 
-    use apxinf_core::{DType, Shape, Tensor};
+    use apxinf_core::{DType, Graph, Shape, Tensor};
 
     use crate::buffer::MusaBuffer;
     use crate::context::MusaContext;
@@ -1115,16 +1097,16 @@ mod tests {
                 crate::workspace::GraphWorkspace::new(rows * width * 4 + 8192, 0).unwrap();
             let b_workspace =
                 crate::workspace::GraphWorkspace::new(rows * width + 8192, 0).unwrap();
-            let (a_graph, expected) = crate::graph::capture(ctx.clone(), || {
-                crate::workspace::with_workspace(&a_workspace, || {
+            let (a_graph, expected) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                crate::kernels::test_support::with_workspace(a_workspace, || {
                     let activated =
                         crate::kernels::activation::bias_gelu_bf16(&ctx, &input, Some(&bias))?;
                     super::quantize_w8a8_activation(&ctx, &activated, inv)
                 })
             })
             .unwrap();
-            let (b_graph, actual) = crate::graph::capture(ctx.clone(), || {
-                crate::workspace::with_workspace(&b_workspace, || {
+            let (b_graph, actual) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                crate::kernels::test_support::with_workspace(b_workspace, || {
                     super::quantize_w8a8_bias_gelu_activation(&ctx, &input, Some(&bias), inv)
                 })
             })
@@ -1391,13 +1373,13 @@ mod tests {
         let reference = gemm_quantized_w8a8(&ctx, &activation, weight).unwrap();
         ctx.synchronize().unwrap();
         let expected = read_back(&reference);
-        let arena = crate::workspace::GraphWorkspace::new(1 << 23, ctx.device_id()).unwrap();
-        let run = || {
-            crate::workspace::with_workspace(&arena, || {
-                gemm_quantized_w8a8(&ctx, &activation, weight)
-            })
-        };
-        let (graph, out) = crate::graph::capture(std::sync::Arc::clone(&ctx), run).unwrap();
+        let arena =
+            crate::workspace::ExecutionSession::with_capacity(1 << 23, ctx.device_id()).unwrap();
+        arena
+            .prepare(|| gemm_quantized_w8a8(&ctx, &activation, weight))
+            .unwrap();
+        let run = || arena.run(|| gemm_quantized_w8a8(&ctx, &activation, weight));
+        let (graph, out) = crate::kernels::test_support::capture_with_output(std::sync::Arc::clone(&ctx), run).unwrap();
         for sign in [1i8, -1, 0, -1].into_iter().cycle().take(16) {
             let changed: Vec<u8> = av.iter().map(|value| (*value * sign) as u8).collect();
             activation.quantized.copy_from_host(&changed).unwrap();

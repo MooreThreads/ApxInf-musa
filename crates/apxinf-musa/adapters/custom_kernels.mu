@@ -248,6 +248,24 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16(
   return musaGetLastError();
 }
 
+// The scalar two-pass RMSNorm, selected explicitly by the accuracy harness.
+// The ordinary entry above takes the register-cached lane kernel for
+// `[522, 2048]`, so a switch that only disables the fused producer would never
+// exercise this kernel; this entry makes that path reachable.
+extern "C" musaError_t apxinf_musa_rms_norm_bf16_scalar(
+    const void* input, const void* weight, void* output, int rows, int cols,
+    float eps, musaStream_t stream) {
+  if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  rms_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(weight),
+      static_cast<__mt_bfloat16*>(output), rows, cols, eps);
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
     const void* input, const void* style, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
@@ -854,7 +872,7 @@ extern "C" musaError_t apxinf_musa_quantize_rows_bf16_int8(
     const void* input, void* output, void* scales, int rows, int cols,
     const void* inv_c, musaStream_t stream) {
   if (input == nullptr || output == nullptr || scales == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !aligned_to(scales, 2)) {
     return musaErrorInvalidValue;
   }
   const auto* source = static_cast<const __mt_bfloat16*>(input);
@@ -906,8 +924,9 @@ extern "C" musaError_t apxinf_musa_geglu_quantize_rows_bf16_int8(
     const void* input, void* output, void* scales, int rows, int cols,
     const void* inv_c, musaStream_t stream) {
   if (input == nullptr || output == nullptr || scales == nullptr || rows <= 0 ||
-      cols <= 0 || cols % 8 != 0 || cols > 16384 || !aligned_to(input, 16) ||
-      !aligned_to(output, 8) || (inv_c != nullptr && !aligned_to(inv_c, 16))) {
+      cols <= 0 || cols % 8 != 0 || cols > 16384 || !aligned_to(scales, 2) ||
+      !aligned_to(input, 16) || !aligned_to(output, 8) ||
+      (inv_c != nullptr && !aligned_to(inv_c, 16))) {
     return musaErrorInvalidValue;
   }
   const auto* source = static_cast<const __mt_bfloat16*>(input);
@@ -932,8 +951,9 @@ extern "C" musaError_t apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
   // Measured 4352-column specialization; the Rust facade keeps other widths
   // and unaligned views on bias/GELU followed by the ordinary row quantizer.
   if (!input || !output || !scales || rows <= 0 || cols != 4352 ||
-      !aligned_to(input, 16) || !aligned_to(output, 8) ||
-      (bias && !aligned_to(bias, 16)) || (inv_c && !aligned_to(inv_c, 16)))
+      !aligned_to(scales, 2) || !aligned_to(input, 16) ||
+      !aligned_to(output, 8) || (bias && !aligned_to(bias, 16)) ||
+      (inv_c && !aligned_to(inv_c, 16)))
     return musaErrorInvalidValue;
   const auto* source = static_cast<const __mt_bfloat16*>(input);
   const auto* bias_values = static_cast<const __mt_bfloat16*>(bias);
@@ -959,7 +979,8 @@ extern "C" musaError_t apxinf_musa_ada_rms_quantize_bf16_int8(
     const void* norm_style, void* hidden, void* output, void* scales,
     int rows, int cols, float eps, const void* inv_c, musaStream_t stream) {
   if (!input || !norm_style || !output || !scales || rows <= 0 || cols != 1024 ||
-      !aligned_to(input, 8) || !aligned_to(norm_style, 8) || !aligned_to(output, 4) ||
+      !aligned_to(scales, 2) || !aligned_to(input, 8) ||
+      !aligned_to(norm_style, 8) || !aligned_to(output, 4) ||
       (inv_c && !aligned_to(inv_c, 16)) ||
       (residual && (!gate_style || !hidden || !aligned_to(residual, 8) ||
                     !aligned_to(gate_style, 8) || !aligned_to(hidden, 8))))

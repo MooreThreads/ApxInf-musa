@@ -53,13 +53,17 @@ fn norm_quantize(
     }
     #[cfg(apxinf_musa_available)]
     {
-        use crate::kernels::contracts::{require_dtype_on, require_vector_bf16};
+        use crate::kernels::contracts::require_vector_at_least_bf16;
         let op = "gemm::adaptive_rms_quantize_w8a8_activation";
         let (rows, cols) = activation_matrix(ctx, input, op)?;
-        let style_len = cols
-            .checked_mul(3)
+        // The kernel reads only the scale/shift segments of the norm style; the
+        // gate style carries the third segment. The unfused producers accept
+        // the same prefixes, so a checkpoint that ships 2*cols must not be
+        // rejected here.
+        let norm_style_len = cols
+            .checked_mul(2)
             .ok_or_else(|| Error::Other(format!("{op}: style size overflow")))?;
-        require_vector_bf16(ctx, style, style_len, op, "norm style")?;
+        require_vector_at_least_bf16(ctx, style, norm_style_len, op, "norm style")?;
         let ptr = |t: &Tensor| -> Result<*const c_void> {
             Ok(MusaBuffer::from_tensor(t).map_err(musa_error)?.ptr() as *const c_void)
         };
@@ -72,21 +76,15 @@ fn norm_quantize(
                         "{op}: residual shape must match input"
                     )));
                 }
-                require_vector_bf16(ctx, gate, style_len, op, "gate style")?;
+                let gate_style_len = cols
+                    .checked_mul(3)
+                    .ok_or_else(|| Error::Other(format!("{op}: style size overflow")))?;
+                require_vector_at_least_bf16(ctx, gate, gate_style_len, op, "gate style")?;
                 (ptr(residual)?, ptr(gate)?)
             }
             None => (std::ptr::null(), std::ptr::null()),
         };
-        let factors = match inv_c {
-            Some(t) => {
-                require_dtype_on(ctx, t, DType::F32, op, "equalization")?;
-                if t.shape().dims() != [cols] {
-                    return Err(Error::Other(format!("{op}: equalization must be [{cols}]")));
-                }
-                ptr(t)?
-            }
-            None => std::ptr::null(),
-        };
+        let factors = equalization_factors_ptr(ctx, op, inv_c, cols)?;
         if cols != 1024
             || [source, norm_style, residual, gate_style]
                 .iter()

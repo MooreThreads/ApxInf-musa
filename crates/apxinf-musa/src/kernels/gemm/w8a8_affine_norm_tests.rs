@@ -1,5 +1,6 @@
 use super::*;
-use crate::kernels::test_support::{bf16_bytes, upload, values, zeros_as};
+use crate::kernels::test_support::{bf16_bytes, read_back, upload, values, zeros_as};
+use apxinf_core::Graph;
 use std::sync::Arc;
 
 fn compare(a: &W8A8Activation, b: &W8A8Activation) {
@@ -62,8 +63,8 @@ fn encode_norm_quant_matches_split_and_graph_replay() {
                 let nb = layer.then_some(&nb);
                 let aw = crate::workspace::GraphWorkspace::new(32 * 1024 * 1024, 0).unwrap();
                 let bw = crate::workspace::GraphWorkspace::new(32 * 1024 * 1024, 0).unwrap();
-                let (ag, (expected_hidden, expected)) = crate::graph::capture(ctx.clone(), || {
-                    crate::workspace::with_workspace(&aw, || {
+                let (ag, (expected_hidden, expected)) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                    crate::kernels::test_support::with_workspace(aw, || {
                         let (h, n) = match (r, nb) {
                             (Some((r, b)), Some(nb)) => {
                                 let o = crate::kernels::fused::bias_residual_layer_bf16(
@@ -90,8 +91,8 @@ fn encode_norm_quant_matches_split_and_graph_replay() {
                     })
                 })
                 .unwrap();
-                let (bg, (hidden, actual)) = crate::graph::capture(ctx.clone(), || {
-                    crate::workspace::with_workspace(&bw, || {
+                let (bg, (hidden, actual)) = crate::kernels::test_support::capture_with_output(ctx.clone(), || {
+                    crate::kernels::test_support::with_workspace(bw, || {
                         norm_quantize_w8a8_activation(&ctx, &input, r, &weight, nb, 1e-6, inv)
                     })
                 })
@@ -205,4 +206,44 @@ fn encode_norm_quant_validates_and_falls_back_for_unaligned_views() {
         )
         .is_err());
     }
+}
+
+#[test]
+#[ignore = "needs a MUSA device"]
+fn scalar_rms_producer_matches_the_scalar_kernel() {
+    let ctx = MusaContext::new(0).unwrap();
+    let (rows, cols) = (522, 2048);
+    let input = upload(&ctx, &values(rows * cols, 61), Shape::new(vec![rows, cols]));
+    let weight = upload(&ctx, &values(cols, 62), Shape::new(vec![cols]));
+    let factors = factors(&ctx, cols);
+
+    let normalized = crate::kernels::norm::rms_bf16_scalar(&ctx, &input, &weight, 1e-6).unwrap();
+    let expected = quantize_w8a8_activation(&ctx, &normalized, Some(&factors)).unwrap();
+    let (_, actual) = affine_norm_quant::norm_quantize_with_scalar_rms(
+        &ctx,
+        &input,
+        None,
+        &weight,
+        None,
+        1e-6,
+        Some(&factors),
+        true,
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    compare(&actual, &expected);
+
+    // The two RMS kernels reduce in different orders, so they are not
+    // bit-identical; they must still agree to BF16 rounding.
+    let vector = crate::kernels::norm::rms_bf16(&ctx, &input, &weight, 1e-6).unwrap();
+    let scalar_values = read_back(&normalized);
+    let vector_values = read_back(&vector);
+    let dot: f32 = scalar_values
+        .iter()
+        .zip(&vector_values)
+        .map(|(a, b)| a * b)
+        .sum();
+    let norm_scalar: f32 = scalar_values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let norm_vector: f32 = vector_values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(dot / (norm_scalar * norm_vector) > 0.9999);
 }

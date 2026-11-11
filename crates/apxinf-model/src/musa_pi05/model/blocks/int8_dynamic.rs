@@ -42,10 +42,19 @@ pub(in crate::musa_pi05) type Int8DynamicL3Policies = super::L3Policies;
 /// Off unless `APXINF_PI05_INT8_STATS` is set, and it reads the tensor back to
 /// the host, so it is instrumentation, not a product path — keep it off while
 /// timing or capturing.
+/// Whether the row-level calibration diagnostic is enabled.
+///
+/// Read once: this is a process-level collection mode, and caching it keeps the
+/// product path from taking the environment lock once per layer.
+fn int8_stats_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("APXINF_PI05_INT8_STATS").is_some())
+}
+
 fn report_row_levels(name: &str, activation: &Tensor) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    if std::env::var_os("APXINF_PI05_INT8_STATS").is_none() {
+    if !int8_stats_requested() {
         return;
     }
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
@@ -476,7 +485,11 @@ fn language_layer_int8_dynamic_with_policies(
     rope_theta: f32,
     policies: &Int8DynamicL3Policies,
 ) -> Result<Int8DynamicLanguageLayerOutput> {
-    let first_normalized = if weights.qkv.is_quantized() {
+    // Calibration rebuilds need the materialized pre-projection rows; the fused
+    // producer keeps them on device and exposes no host-side equivalent. STATS
+    // runs therefore take the same BF16 chain the baseline recorded from.
+    let collect_stats = int8_stats_requested();
+    let first_normalized = if weights.qkv.is_quantized() && !collect_stats {
         weights.qkv.prepare_norm(
             ctx,
             input,
@@ -522,7 +535,7 @@ fn language_layer_int8_dynamic_with_policies(
     let projected = weights
         .output
         .gemm_with_policies(ctx, &attention, &policies.gemm)?;
-    let (residual, normalized) = if weights.gate_up.is_quantized() {
+    let (residual, normalized) = if weights.gate_up.is_quantized() && !collect_stats {
         weights.gate_up.prepare_residual_norm(
             ctx,
             &projected,
@@ -551,7 +564,7 @@ fn language_layer_int8_dynamic_with_policies(
         .gemm_normalized(ctx, &normalized, &policies.gemm)?;
     // Diagnostics keep the materialized activation they inspect; the product
     // path hands the packed gate/up straight to the fused quantizer.
-    let projected = if std::env::var_os("APXINF_PI05_INT8_STATS").is_some() {
+    let projected = if collect_stats {
         let activated = l3_geglu_bf16(ctx, &gate_up)?;
         report_row_levels("lang.down_in", &activated);
         weights
