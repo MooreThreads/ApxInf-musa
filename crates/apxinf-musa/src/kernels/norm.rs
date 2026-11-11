@@ -19,11 +19,41 @@ use crate::kernels::native_unavailable;
 
 /// BF16 RMS normalization over the last axis.
 ///
+/// Which RMS kernel the caller requires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RmsKernel {
+    /// Width-directed: the register-cached lane kernel where it applies.
+    Auto,
+    /// The scalar two-pass kernel, selected by the accuracy harness.
+    Scalar,
+}
+
 /// `input` is 2-D BF16 `[rows, cols]`, `weight` a BF16 `[cols]` vector.
 pub fn rms_bf16(ctx: &MusaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    rms_bf16_with_kernel(ctx, input, weight, eps, RmsKernel::Auto)
+}
+
+/// The scalar two-pass RMSNorm, bypassing the width-directed lane kernel.
+#[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
+pub(crate) fn rms_bf16_scalar(
+    ctx: &MusaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    rms_bf16_with_kernel(ctx, input, weight, eps, RmsKernel::Scalar)
+}
+
+fn rms_bf16_with_kernel(
+    ctx: &MusaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    kernel: RmsKernel,
+) -> Result<Tensor> {
     let (rows, cols) = require_matrix_bf16(ctx, input, "rms_norm", "input")?;
     let mut output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
-    rms_bf16_into(ctx, input, weight, &mut output, eps)?;
+    rms_bf16_into_with_kernel(ctx, input, weight, &mut output, eps, kernel)?;
     Ok(output)
 }
 
@@ -35,10 +65,21 @@ pub fn rms_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    rms_bf16_into_with_kernel(ctx, input, weight, output, eps, RmsKernel::Auto)
+}
+
+fn rms_bf16_into_with_kernel(
+    ctx: &MusaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    output: &mut Tensor,
+    eps: f32,
+    kernel: RmsKernel,
+) -> Result<()> {
     let (rows, cols) = require_matrix_bf16(ctx, input, "rms_norm", "input")?;
     require_vector_bf16(ctx, weight, cols, "rms_norm", "weight")?;
     require_output_matrix(ctx, output, rows, cols, "rms_norm", "normalized")?;
-    launch_rms(ctx, input, weight, output, rows, cols, eps)
+    launch_rms(ctx, input, weight, output, rows, cols, eps, kernel)
 }
 
 #[cfg(apxinf_musa_available)]
@@ -50,6 +91,7 @@ fn launch_rms(
     rows: usize,
     cols: usize,
     eps: f32,
+    kernel: RmsKernel,
 ) -> Result<()> {
     let rows = checked_i32("rms_norm", "rows", rows)?;
     let cols = checked_i32("rms_norm", "cols", cols)?;
@@ -57,8 +99,8 @@ fn launch_rms(
     // outputs are `[rows, cols]` BF16 allocations owned by the caller's
     // `Tensor`, which outlives the asynchronous launch on `ctx.stream()`.
     unsafe {
-        check_native(
-            ffi::custom::apxinf_musa_rms_norm_bf16(
+        let status = match kernel {
+            RmsKernel::Auto => ffi::custom::apxinf_musa_rms_norm_bf16(
                 tensor_ptr(input)?,
                 tensor_ptr(weight)?,
                 tensor_ptr(output)?,
@@ -67,8 +109,17 @@ fn launch_rms(
                 eps,
                 ctx.stream().handle(),
             ),
-            "rms_norm",
-        )
+            RmsKernel::Scalar => ffi::custom::apxinf_musa_rms_norm_bf16_scalar(
+                tensor_ptr(input)?,
+                tensor_ptr(weight)?,
+                tensor_ptr(output)?,
+                rows,
+                cols,
+                eps,
+                ctx.stream().handle(),
+            ),
+        };
+        check_native(status, "rms_norm")
     }
 }
 
@@ -81,6 +132,7 @@ fn launch_rms(
     _rows: usize,
     _cols: usize,
     _eps: f32,
+    _kernel: RmsKernel,
 ) -> Result<()> {
     Err(native_unavailable("norm::rms_bf16"))
 }
@@ -178,7 +230,7 @@ fn launch_layer(
 
 /// Adaptive (adaLN) BF16 RMS normalization.
 ///
-/// `style` is a single BF16 `[3 * cols]` vector holding gate, shift and scale
+/// `style` is a single BF16 `[3 * cols]` vector holding scale, shift and gate
 /// in that order.
 pub fn adaptive_rms_bf16(
     ctx: &MusaContext,

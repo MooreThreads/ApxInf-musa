@@ -83,6 +83,8 @@ struct TileInfo {
   uint32_t tile_k;
   /// Threads per block.
   unsigned block_x;
+  /// M blocks advance along grid X; must match the image's LM4/LM5 reads.
+  bool m_fast = false;
 };
 
 const TileInfo kTiles[] = {
@@ -98,6 +100,10 @@ const TileInfo kTiles[] = {
      "musa_asm_s8mma_nhwc_conv_KRSC_128_32x128_lin_ol_outbf16", 32, 128, 64, 128},
     {"32x64", kApxinfMusaQint8Gemm32x64Image, kApxinfMusaQint8Gemm32x64ImageSize,
      "musa_asm_s8mma_nhwc_conv_KRSC_128_32x64_lin_ol_outbf16", 32, 64, 64, 128},
+    {"256x128-mfast", kApxinfMusaQint8Gemm256x128MfastImage,
+     kApxinfMusaQint8Gemm256x128MfastImageSize,
+     "musa_asm_s8mma_nhwc_conv_KRSC_256_256x128_lin_ol_outbf16_mfast",
+     256, 128, 64, 256, true},
 };
 constexpr int kTileCount = static_cast<int>(sizeof(kTiles) / sizeof(kTiles[0]));
 
@@ -339,10 +345,12 @@ MUresult launch_rows(MUfunction function, const TileInfo& info, const void* a, c
   static_assert(sizeof(args) / sizeof(args[0]) == 67, "generated ABI parameter count changed");
 
   // `n` is a multiple of `tile_n` by construction (the caller gates on it), so
-  // `grid_x` is exact; `m` is rounded up because the kernel writes a partial row
-  // tile with the `remain_m` epilogue predicate.
-  const unsigned grid_x = n / info.tile_n;
-  const unsigned grid_y = (rows + info.tile_m - 1) / info.tile_m;
+  // the N grid extent is exact; `m` is rounded up because the kernel writes a
+  // partial row tile with the `remain_m` epilogue predicate.
+  const unsigned grid_n = n / info.tile_n;
+  const unsigned grid_m = (rows + info.tile_m - 1) / info.tile_m;
+  const unsigned grid_x = info.m_fast ? grid_m : grid_n;
+  const unsigned grid_y = info.m_fast ? grid_n : grid_m;
   return muLaunchKernel(function, grid_x, grid_y, 1, info.block_x, 1, 1, 0,
                         reinterpret_cast<MUstream>(stream), args, nullptr);
 }

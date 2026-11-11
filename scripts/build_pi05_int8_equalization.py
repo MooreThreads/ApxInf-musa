@@ -25,7 +25,9 @@ Regenerate an equivalent table with
         --alpha 0.5 --site-alpha lang.gate_up_in=0.6 --site-alpha lang.down_in=0.6
 
 after collecting `row_levels.jsonl` from a
-`APXINF_PI05_INT8_STATS=1 APXINF_PI05_INT8_CHANNELS=<path>` bench run.
+`APXINF_PI05_INT8_STATS=1 APXINF_PI05_INT8_CHANNELS=<path>` bench run. Leave
+`APXINF_INT8_EQUALIZATION` unset while collecting: the statistics are meant to
+describe the unfolded activations, exactly as the baseline recorded them.
 
 Provenance of the checked-in table: collected on a `--model-variant
 int8_dynamic` bench of the PI0.5 LIBERO checkpoint, aggregating every call's
@@ -103,6 +105,19 @@ def main() -> int:
         print(f"{name}: cols={len(channels)} top={peak:.3f} median={median:.3f} "
               f"alpha={alpha} top/median {ratio_before:.1f}x -> {ratio_after:.1f}x, "
               f"typical levels {levels_before:.2f} -> {levels_after:.2f}")
+
+    # `equalization_site()` consumes these three; a table missing one silently
+    # disables equalization for that projection at run time.
+    required = ("lang.qkv_in", "lang.gate_up_in", "lang.down_in")
+    missing = [name for name in required if name not in table]
+    if missing:
+        print(
+            f"missing required sites in {args.input}: {', '.join(missing)}; "
+            "collect them with an APXINF_PI05_INT8_STATS run that leaves "
+            "APXINF_INT8_EQUALIZATION unset",
+            file=sys.stderr,
+        )
+        return 1
 
     with open(args.output, "w") as handle:
         json.dump(table, handle)

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use apxinf_core::{NormalGenerator, Result, Tensor};
+use apxinf_core::{DType, NormalGenerator, Result, Tensor};
 
 pub(crate) use apxinf_musa::{
     ops, CapturedGraph, ExecutionSession, MusaBuffer as DeviceBuffer, MusaContext as Context,
@@ -25,8 +25,19 @@ pub(crate) use apxinf_musa::sampling;
 /// keeps the vendor path, silently.
 pub(crate) mod gemm {
     pub(crate) use apxinf_musa::kernels::gemm::{
-        decode_scope, prepare_bf16_nn_weight, prepare_bf16_nt_weight,
+        adaptive_gate_residual_rms_quantize_w8a8_activation,
+        adaptive_rms_quantize_w8a8_activation, decode_scope, norm_quantize_w8a8_activation,
+        prepare_bf16_nn_weight, prepare_bf16_nt_weight,
     };
+}
+
+/// A normalized input prepared for its consuming projection.
+///
+/// The quantized variant carries the fused norm+quantize producer's rows and
+/// scales; BF16 heads and excluded projections keep the materialized tensor.
+pub enum NormalizedW8A8Input {
+    Bf16(Tensor),
+    Quantized(ops::w8a8::W8A8Activation),
 }
 
 /// Where this device's tactic measurements live, and how a session takes them.
@@ -46,6 +57,23 @@ pub(crate) fn to_device(ctx: &Context, tensor: &Tensor) -> Result<Tensor> {
 
 pub(crate) fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     transfers::to_cpu(tensor)
+}
+
+/// Apply an optional bias and elementwise activation in one typed pointwise
+/// pass. Shared by the block path's SiLU/GELU sites and the weights fallback.
+pub(crate) fn bias_activation_bf16(
+    ctx: &Context,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    activation: ops::PointwiseActivation,
+) -> Result<Tensor> {
+    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    let mut args =
+        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+    args.bias = bias;
+    args.activation = activation;
+    ops::pointwise(ctx, args)?;
+    Ok(output)
 }
 
 pub(crate) fn synchronize(ctx: &Context) -> Result<()> {

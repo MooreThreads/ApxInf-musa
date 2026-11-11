@@ -14,6 +14,46 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    /// RMSNorm (norm_bias null, cols 2048) or LayerNorm (cols 1152), optional
+    /// bias+residual producer, and row quantization. BF16 inputs/hidden; INT8
+    /// output [rows,cols]; FP16 scales [rows+512]; optional F32 inv_c [cols].
+    pub fn apxinf_musa_norm_quantize_bf16_int8(
+        input: *const c_void,
+        residual: *const c_void,
+        projection_bias: *const c_void,
+        weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inv_c: *const c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+
+    /// Adaptive RMSNorm + row quantization for 1024 columns. A non-null
+    /// residual enables gated addition and writes BF16 hidden; otherwise
+    /// residual, gate_style and hidden are null. Styles are BF16 [3 * cols]
+    /// in scale/shift/gate order; output is INT8 [rows, cols], scales FP16
+    /// [rows + 512], and optional inv_c is F32 [cols]. Asynchronous on stream.
+    pub fn apxinf_musa_ada_rms_quantize_bf16_int8(
+        input: *const c_void,
+        residual: *const c_void,
+        gate_style: *const c_void,
+        norm_style: *const c_void,
+        hidden: *mut c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inv_c: *const c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     pub fn apxinf_musa_capture_anchor(stream: *mut c_void) -> musaError_t;
     pub fn apxinf_musa_mublas_release_stream(stream: *mut c_void);
     pub fn apxinf_musa_mudnn_release_stream(stream: *mut c_void);
@@ -88,6 +128,17 @@ extern "C" {
 
     /// RMSNorm over `[rows, cols]` with a `[cols]` weight.
     pub fn apxinf_musa_rms_norm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// The scalar two-pass RMSNorm, bypassing the width-directed lane kernel.
+    pub fn apxinf_musa_rms_norm_bf16_scalar(
         input: *const c_void,
         weight: *const c_void,
         output: *mut c_void,
@@ -331,6 +382,18 @@ extern "C" {
     /// with FP16 scales and 512 trailing zero scales.
     pub fn apxinf_musa_geglu_quantize_rows_bf16_int8(
         input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        inv_c: *const c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Bias + GELU with BF16 rounding, then optional equalization and INT8 rows.
+    pub fn apxinf_musa_bias_gelu_quantize_rows_bf16_int8(
+        input: *const c_void,
+        bias: *const c_void,
         output: *mut c_void,
         scales: *mut c_void,
         rows: i32,

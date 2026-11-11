@@ -87,6 +87,43 @@ pub fn gemm_geglu(
     gemm_quantized(ctx, &quantized, weight, out)
 }
 
+/// `out = bias_gelu(input) @ weight`, with the activation quantized as it is
+/// produced.
+///
+/// Mirrors [`gemm_geglu`] for the vision MLP's FC1->FC2 chain: the fused
+/// producer applies the weight view's equalization factors while it measures
+/// each row, so the BF16 intermediate never lands in the arena. Callers
+/// without a fused kernel materialize with the pointwise operator and take
+/// [`gemm`] instead.
+pub fn gemm_bias_gelu(
+    ctx: &MusaContext,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    weight: W8A8WeightView<'_>,
+    out: &mut Tensor,
+) -> Result<()> {
+    let quantized = gemm_kernels::quantize_w8a8_bias_gelu_activation(
+        ctx,
+        input,
+        bias,
+        weight.equalization_inv_c,
+    )?;
+    gemm_quantized(ctx, &quantized, weight, out)
+}
+
+/// INT8 GEMM over an already-quantized activation, allocating the BF16 output.
+///
+/// Serves model code that holds a [`W8A8Activation`] from a fused producer and
+/// owns the result's lifetime itself; the typed operator surface otherwise
+/// hands every operator a caller-owned output.
+pub fn gemm_quantized_alloc(
+    ctx: &MusaContext,
+    activation: &W8A8Activation,
+    weight: W8A8WeightView<'_>,
+) -> Result<Tensor> {
+    gemm_kernels::gemm_quantized_w8a8(ctx, activation, weight)
+}
+
 /// Whether a tile serves a `[rows, k] @ [k, n]` contraction.
 ///
 /// `rows` is not consulted: the tiles mask a partial row tile, so only `n` and
