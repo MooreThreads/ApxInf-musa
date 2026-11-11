@@ -1021,21 +1021,37 @@ pub(in crate::musa_pi05::model) mod backbone {
                     &self.policies,
                 )?;
             }
-            let hidden = l3_layer_bf16(
-                self.ctx(),
-                &hidden,
-                &self.weights.vision_post_norm.weight,
-                &self.weights.vision_post_norm.bias,
-                self.config.layer_norm_eps,
+            // The projector is quantized, so its input LayerNorm folds into the
+            // row quantizer: one kernel replaces the norm plus a standalone
+            // quantize pass, and the `[tokens, 1152]` BF16 intermediate never
+            // reaches the arena. A projection without an INT8 route keeps the
+            // materialized chain.
+            let normalized = normalized_input(
+                self.weights.multimodal_projector.is_quantized(),
+                || {
+                    self.weights.multimodal_projector.prepare_norm(
+                        self.ctx(),
+                        &hidden,
+                        &self.weights.vision_post_norm.weight,
+                        Some(&self.weights.vision_post_norm.bias),
+                        self.config.layer_norm_eps,
+                    )
+                },
+                || {
+                    l3_layer_bf16(
+                        self.ctx(),
+                        &hidden,
+                        &self.weights.vision_post_norm.weight,
+                        &self.weights.vision_post_norm.bias,
+                        self.config.layer_norm_eps,
+                    )
+                },
             )?;
-            let projected = self
-                .weights
-                .multimodal_projector
-                .gemm_with_policies(
-                    self.ctx(),
-                    &hidden,
-                    &self.policies.gemm,
-                )?;
+            let projected = self.weights.multimodal_projector.gemm_normalized(
+                self.ctx(),
+                &normalized,
+                &self.policies.gemm,
+            )?;
             l3_bias_activation_bf16(
                 self.ctx(),
                 &projected,

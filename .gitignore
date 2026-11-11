@@ -26,4 +26,3 @@ target-p92i/
 
 /configs/tuning/**/*.recipe
 /configs/tuning/**/*.recipe.*.tmp
-target-new/

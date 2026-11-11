@@ -186,7 +186,8 @@ capability. What the port adds to the device path:
 - The language layers fuse their normalization into the same row quantizer:
   qkv's input RMSNorm (`prepare_norm`) and the post-attention bias + residual +
   RMSNorm (`prepare_residual_norm`) hand the packed INT8 rows straight to the
-  GEMM. The vision layers do the same for LayerNorm and for FC1's bias + GELU,
+  GEMM. The vision layers do the same for LayerNorm -- including the post-norm
+  that feeds the multimodal projector -- and for FC1's bias + GELU,
   and the action expert's adaptive RMSNorm and gated residual RMSNorm +
   quantization share the contract. A producer is used only when the consuming
   projection is quantized and the width/alignment matches; anything else keeps
