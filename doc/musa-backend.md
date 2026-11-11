@@ -127,9 +127,12 @@ The current relationship is:
   rewritten kernel reviewable against its origin; it is not something to trim
   into line with upstream.
 
-Relative to that historical source, the `kernels/custom` file set maps one-for-one
-onto `apxinf-cuda`'s, `custom_kernels.mu` uses the same anonymous-namespace plus
-single-C-ABI translation-unit pattern, and every ported `extern "C"` signature
+Relative to that historical source, the `kernels/custom` files correspond
+one-for-one to files in `apxinf-cuda`'s set, except `graph.cuh` (a MUSA capture
+anchor) and `norm_quantization.cuh` (the fused normalization-plus-quantization
+producers), which have no CUDA counterpart; `custom_kernels.mu` uses the same
+anonymous-namespace plus single-C-ABI translation-unit pattern, and every ported
+`extern "C"` signature
 has the same parameter order and meaning. Where a signature does differ —
 `quantize_rows_bf16_int8` grew the per-channel equalization vector — the adapter
 README says so.
