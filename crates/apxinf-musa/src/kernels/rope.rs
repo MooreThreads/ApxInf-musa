@@ -5,7 +5,10 @@ use apxinf_core::{DType, Error, Result, Tensor};
 pub use super::attention::QkvTensors;
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
-use super::contracts::{bf16_tensor, require_optional_vector_bf16, require_output_tensor, require_vector_bf16};
+use super::contracts::{
+    bf16_tensor, require_optional_vector_bf16, require_output_tensor, require_positive_eps,
+    require_vector_bf16,
+};
 use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
 use crate::error::musa_error;
@@ -698,6 +701,7 @@ pub fn rms_norm_apply_mrope_qk_precomputed(
     rotation_table: &MusaBuffer,
     block_threads: u32,
 ) -> Result<(Tensor, Tensor)> {
+    require_positive_eps(eps, "fused Q/K RMSNorm+mRoPE")?;
     let query_dims = query.shape().dims();
     let key_dims = key.shape().dims();
     let query_rows = seq_len
@@ -714,8 +718,6 @@ pub fn rms_norm_apply_mrope_qk_precomputed(
         || key_dims != [key_rows, head_dim]
         || seq_len == 0
         || head_dim != 128
-        || !eps.is_finite()
-        || eps < 0.0
         || block_threads != 128
     {
         return Err(Error::Other(

@@ -1,14 +1,15 @@
-import json
+# 精度比较函数的 CPU 单元测试：验证 cosine/relative L2 及零数组、
+# 非有限值、空数组、形状不匹配等边界情况，不验证模型本身的精度。
+# 使用人工 NumPy 数组，不加载模型、不调用 benchmark、不使用 GPU。
+
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from bench_apxinf_musa import load_reference
 from compare_outputs import compare_array
 
 
@@ -41,18 +42,6 @@ class ComparisonTests(unittest.TestCase):
     def test_rejects_shape_mismatch_with_equal_size(self):
         with self.assertRaises(ValueError):
             compare_array(np.ones((2, 3)), np.ones((3, 2)))
-
-    def test_npz_prefers_normalized_actions(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "gold.npz"
-            np.savez(path, normalized_actions=np.ones((2, 3)), actions=np.zeros((2, 3)))
-            np.testing.assert_array_equal(load_reference(path), np.ones((2, 3)))
-
-    def test_json_preserves_output_shape(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "gold.json"
-            path.write_text(json.dumps({"output": {"shape": [2, 3], "values": [1] * 6}}))
-            self.assertEqual(load_reference(path).shape, (2, 3))
 
 
 if __name__ == "__main__":

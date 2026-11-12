@@ -18,6 +18,28 @@ use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
 use crate::error::musa_error;
 
+pub(super) fn require_positive_eps(eps: f32, operation: &str) -> Result<()> {
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other(format!(
+            "MUSA {operation} eps must be finite and positive"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scalar_tests {
+    #[test]
+    fn normalization_eps_must_be_finite_and_positive() {
+        for eps in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(super::require_positive_eps(eps, "test").is_err());
+        }
+        for eps in [1e-6, 1e-5, f32::MIN_POSITIVE, f32::MAX] {
+            assert!(super::require_positive_eps(eps, "test").is_ok());
+        }
+    }
+}
+
 /// Assert that `tensor` lives on `ctx`'s device.
 ///
 /// Earns a function of its own because a same-shaped tensor on *another* device
@@ -388,4 +410,3 @@ pub(super) fn f16_output(ctx: &MusaContext, rows: usize, cols: usize) -> Result<
             .ok_or_else(|| Error::Other("FP16 output size overflow".into()))?,
     )
 }
-

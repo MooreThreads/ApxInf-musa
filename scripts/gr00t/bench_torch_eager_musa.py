@@ -14,6 +14,8 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
+from formats import load_noise, normalize_actions, normalize_noise
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -23,10 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wrist-image", type=Path, required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--state", type=float, nargs=8, required=True)
-    parser.add_argument("--noise-input", type=Path, required=True)
+    parser.add_argument("--noise-input", type=Path, required=True,
+                        help="NPY or NPZ noise: floating values or raw BF16 uint16 bits")
     parser.add_argument("--device", default="musa:0")
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--repeat", type=int, default=50)
+    parser.add_argument("--repeat", type=int, default=50,
+                        help="number of measured runs (at least 2); outputs must match exactly")
     parser.add_argument(
         "--chrome-trace",
         type=Path,
@@ -54,18 +58,6 @@ def load_rgb(path: Path, label: str) -> np.ndarray:
     path = require_path(path, label)
     with Image.open(path) as image:
         return np.ascontiguousarray(np.asarray(image.convert("RGB")), dtype=np.uint8)
-
-
-def load_array(path: Path, key: str) -> np.ndarray:
-    path = require_path(path, key)
-    if path.suffix == ".npy":
-        return np.asarray(np.load(path))
-    if path.suffix == ".npz":
-        with np.load(path) as archive:
-            if key not in archive:
-                raise ValueError(f"{path} has no {key!r} array")
-            return np.asarray(archive[key])
-    raise ValueError(f"{path} must be .npy or .npz")
 
 
 def timing_summary(values: list[float]) -> dict[str, Any]:
@@ -97,20 +89,32 @@ def make_observation(base_rgb: np.ndarray, wrist_rgb: np.ndarray, state: np.ndar
     }
 
 
+def validate_repeat_outputs(measured: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(measured) < 2:
+        raise ValueError("at least two measured runs are required to verify repeatability")
+    for item in measured:
+        for name in ("normalized_actions", "actions"):
+            item[name] = normalize_actions(item[name], name)
+    for name in ("normalized_actions", "actions"):
+        if any(not np.array_equal(measured[0][name], item[name]) for item in measured[1:]):
+            raise RuntimeError(f"repeat captures differ ({name}); refusing to publish reference")
+    return measured[0]
+
+
 def main() -> int:
     args = parse_args()
-    if args.warmup < 0 or args.repeat <= 0:
-        raise ValueError("--warmup must be non-negative and --repeat must be positive")
+    if args.warmup < 0 or args.repeat < 2:
+        raise ValueError("--warmup must be non-negative and --repeat must be at least 2")
     checkpoint = require_path(args.checkpoint, "checkpoint", directory=True)
     backbone = require_path(args.backbone, "backbone", directory=True)
     base_rgb = load_rgb(args.base_image, "base image")
     wrist_rgb = load_rgb(args.wrist_image, "wrist image")
     state = np.asarray(args.state, dtype=np.float32)
-    noise = np.ascontiguousarray(load_array(args.noise_input, "noise"), dtype=np.float32)
-    if noise.shape == (40, 132):
-        noise = noise[None]
-    if noise.shape != (1, 40, 132):
-        raise ValueError(f"noise must have shape [1,40,132], got {noise.shape}")
+    if not np.isfinite(state).all():
+        raise ValueError("state must contain finite values")
+    noise = load_noise(args.noise_input)
+    if args.output.suffix != ".npz":
+        raise ValueError("--output must end in .npz")
 
     import torch
     import torch_musa  # noqa: F401 - registers the MUSA device with PyTorch.
@@ -178,6 +182,7 @@ def main() -> int:
 
     observation = make_observation(base_rgb, wrist_rgb, state, args.prompt)
     fixed_noise = torch.from_numpy(noise).to(device=args.device, dtype=torch.bfloat16)
+    noise = normalize_noise(fixed_noise.float().cpu().numpy())
     original_randn = torch.randn
     random_calls = 0
 
@@ -258,12 +263,7 @@ def main() -> int:
             f"expected one fixed-noise torch.randn call per inference, got {random_calls}"
         )
 
-    result = measured[-1]
-    repeat_reference = measured[0]["normalized_actions"]
-    repeat_max_abs = max(
-        float(np.max(np.abs(item["normalized_actions"] - repeat_reference)))
-        for item in measured
-    )
+    result = validate_repeat_outputs(measured)
     model_samples = [float(item["model_ms"]) for item in measured]
     total_samples = [float(item["total_ms"]) for item in measured]
     report: dict[str, Any] = {
@@ -276,7 +276,8 @@ def main() -> int:
         "repeat": args.repeat,
         "model_ms": timing_summary(model_samples),
         "total_ms": timing_summary(total_samples),
-        "repeat_normalized_max_abs": repeat_max_abs,
+        "repeat_normalized_max_abs": 0.0,
+        "repeat_exact": True,
         "normalized_shape": list(result["normalized_actions"].shape),
         "actions_shape": list(result["actions"].shape),
     }

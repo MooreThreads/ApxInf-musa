@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Error, Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
 
 use super::backbone::Qwen3VLConfig;
 use super::backend::RuntimeBackend;

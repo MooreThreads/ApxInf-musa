@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from compare_outputs import compare_array
+from compare_outputs import compare_array, load_archive
+from formats import load_fixture
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,8 +54,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.warmup < 0 or args.iterations <= 0:
-        raise SystemExit("--warmup must be non-negative and --iterations must be positive")
+    if args.warmup <= 0 or args.iterations <= 0:
+        raise SystemExit("--warmup and --iterations must be positive")
+    if args.output.suffix != ".json":
+        raise ValueError("--output must end in .json")
+    args.fixture = args.fixture.expanduser().resolve()
+    _, arrays = load_fixture(args.fixture)
+    reference = load_archive(args.reference) if args.reference else None
+    if reference is not None and "noise" in reference and not np.array_equal(arrays["noise"], reference["noise"]):
+        raise ValueError("fixture and reference noise differ")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     executable = (
         [str(args.binary)]
@@ -94,11 +102,8 @@ def main() -> None:
     subprocess.run(command, check=True)
     report = json.loads(args.output.read_text())
     if args.reference is not None:
-        actual = np.asarray(report["output"]["values"], dtype=np.float64).reshape(
-            report["output"]["shape"]
-        )
-        reference = load_reference(args.reference).astype(np.float64)
-        metrics = compare_array(actual, reference)
+        actual = load_archive(args.output)["normalized_actions"]
+        metrics = compare_array(actual, reference["normalized_actions"])
         cosine = metrics["cosine"]
         relative_l2 = metrics["relative_l2"]
         parity = {
@@ -130,31 +135,7 @@ def main() -> None:
 
 
 def load_reference(path: Path) -> np.ndarray:
-    if path.suffix == ".npy":
-        return np.load(path)
-    if path.suffix == ".npz":
-        with np.load(path) as archive:
-            for key in ("normalized_actions", "final_action", "output", "actions"):
-                if key in archive:
-                    return np.asarray(archive[key])
-            raise ValueError(
-                f"cannot find normalized_actions, final_action, output, or actions in reference {path}; "
-                f"available keys: {archive.files}"
-            )
-    document = json.loads(path.read_text())
-    if isinstance(document, list):
-        return np.asarray(document)
-    if isinstance(document.get("output"), dict) and "shape" in document["output"]:
-        return np.asarray(document["output"]["values"]).reshape(document["output"]["shape"])
-    for keys in (("output", "values"), ("output",), ("actions",)):
-        value = document
-        try:
-            for key in keys:
-                value = value[key]
-        except (KeyError, TypeError):
-            continue
-        return np.asarray(value)
-    raise ValueError(f"cannot find output values in reference {path}")
+    return load_archive(path)["normalized_actions"]
 
 
 if __name__ == "__main__":

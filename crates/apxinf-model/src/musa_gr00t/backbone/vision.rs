@@ -890,14 +890,6 @@ fn apply_vision_rope_pair(
 /// `cu_seqlens`. CUDA uses zero-copy row views plus device concatenation;
 /// other backends retain the materialized correctness path. Both keep the
 /// portable `Backend` trait unchanged.
-fn direct_segmented_attention_shape_supported(
-    segment_lengths: &[usize],
-    n_heads: usize,
-    head_dim: usize,
-) -> bool {
-    segment_lengths == [256, 256] && n_heads == 16 && head_dim == 64
-}
-
 fn segmented_vision_sdpa(
     b: &GpuBackend,
     q: &Tensor,
@@ -1231,31 +1223,6 @@ mod tests {
         assert_eq!(segments, vec![4, 4, 8]);
         assert!(validate_grid_layout(&[[1, 3, 2]], 6, 2).is_err());
         assert!(validate_grid_layout(&[[1, 2, 2]], 5, 2).is_err());
-    }
-
-    #[test]
-    fn direct_segmented_attention_gate_is_exact() {
-        assert!(direct_segmented_attention_shape_supported(
-            &[256, 256],
-            16,
-            64
-        ));
-        assert!(!direct_segmented_attention_shape_supported(&[256], 16, 64));
-        assert!(!direct_segmented_attention_shape_supported(
-            &[128, 128],
-            16,
-            64
-        ));
-        assert!(!direct_segmented_attention_shape_supported(
-            &[256, 256],
-            8,
-            64
-        ));
-        assert!(!direct_segmented_attention_shape_supported(
-            &[256, 256],
-            16,
-            128
-        ));
     }
 
     #[test]

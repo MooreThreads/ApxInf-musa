@@ -67,21 +67,15 @@ pub(crate) trait Gr00tPrecisionExecution: Sized + 'static {
 
     const NAME: &'static str;
     const SUPPORTS_CALIBRATION: bool;
-    const USE_HDIM96_BM64_ATTENTION: bool = false;
     const USE_FUSED_QK_RMS_MROPE: bool = false;
     const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> = None;
-    const USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT: bool = false;
     const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = false;
     const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = false;
     const USE_PACKED8_BF16_BIAS_ACTIVATION: bool = false;
     const USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM: bool = false;
     const USE_BIAS_RESIDUAL_LAYER_NORM: bool = false;
     const USE_CACHED_VISION_RESIDUAL_LAYER_NORM: bool = false;
-    const USE_VISION_POINTWISE_PACK: bool = false;
     const USE_BATCHED_VISION_ATTENTION: bool = false;
-    const USE_PACKED_ATTENTION_BIAS_RESIDUAL: bool = false;
-    const USE_PACKED_VISION_FC2_RESIDUAL: bool = false;
-    const VISION_POINTWISE_LEGACY_ENV: Option<&'static str> = None;
 
     fn transfer_dense(
         &self,
@@ -378,8 +372,13 @@ impl Gr00tCapturedGraph {
         observation: &Gr00tObservation,
         backend: &RuntimeBackend,
         config: &Gr00tConfig,
+        token_cache: &mut Option<(Vec<u32>, DeviceBuffer)>,
     ) -> Result<Tensor> {
+        let previous_cache = token_cache.take();
         self.inputs.update(observation)?;
+        let mut tokens = previous_cache.map(|(tokens, _)| tokens).unwrap_or_default();
+        tokens.clone_from(&observation.token_ids);
+        *token_cache = Some((tokens, self.inputs.token_ids.clone()));
         self.graph.replay()?;
         backend.synchronize()?;
         let output = self
@@ -606,10 +605,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             let key = Gr00tGraphKey::new(observation, &self.config, &self.backbone_config)?;
             if let Some((cached, graph)) = &self.captured_graph {
                 if cached == &key {
-                    if let Some((tokens, _)) = &mut self.backbone_token_cache {
-                        *tokens = observation.token_ids.clone();
-                    }
-                    return graph.run(observation, &*self.backend, &self.config);
+                    return graph.run(
+                        observation,
+                        &self.backend,
+                        &self.config,
+                        &mut self.backbone_token_cache,
+                    );
                 }
             }
 
@@ -630,7 +631,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             }
             match self.capture_graph(observation) {
                 Ok(graph) => {
-                    let result = graph.run(observation, &*self.backend, &self.config);
+                    let result = graph.run(
+                        observation,
+                        &self.backend,
+                        &self.config,
+                        &mut self.backbone_token_cache,
+                    );
                     self.captured_graph = Some((key, graph));
                     return result;
                 }
@@ -982,6 +988,19 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 inputs,
             },
         ))
+    }
+
+    pub(crate) fn run_prepared_graph(
+        &mut self,
+        graph: &Gr00tCapturedGraph,
+        observation: &Gr00tObservation,
+    ) -> Result<Tensor> {
+        graph.run(
+            observation,
+            &self.backend,
+            &self.config,
+            &mut self.backbone_token_cache,
+        )
     }
 
     fn capture_whole_graph(

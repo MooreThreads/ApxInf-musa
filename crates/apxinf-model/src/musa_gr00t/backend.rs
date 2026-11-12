@@ -10,7 +10,6 @@ use apxinf_core::{Device, Error, Graph, Result, Tensor};
 
 pub(crate) use apxinf_musa::MusaBuffer as DeviceBuffer;
 pub(crate) use apxinf_musa::MusaContext as Context;
-pub(crate) use apxinf_musa::{CapturedGraph, OperationShape};
 
 pub(crate) mod transfers {
     pub(crate) use apxinf_musa::transfers::{copy_cpu_to_device, to_cpu, to_device};

@@ -93,21 +93,8 @@ mod tests {
     }
 
     #[test]
-    fn bf16_explicitly_opts_into_hdim96_bm64_attention() {
-        assert_eq!(Gr00tBf16Execution::USE_HDIM96_BM64_ATTENTION, false);
-    }
-
-    #[test]
     fn bf16_enables_qk_rms_mrope_fusion() {
         assert!(Gr00tBf16Execution::USE_FUSED_QK_RMS_MROPE);
-    }
-
-    #[test]
-    fn bf16_explicitly_opts_into_direct_vision_segment_output() {
-        assert_eq!(
-            Gr00tBf16Execution::USE_DIRECT_BF16_VISION_SEGMENT_OUTPUT,
-            false
-        );
     }
 
     #[test]

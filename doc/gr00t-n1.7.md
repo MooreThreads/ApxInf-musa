@@ -284,7 +284,62 @@ Externally held old handles report `PreparationStatus::Invalidated` and reject
 If replacement construction fails after retirement, no active plan remains;
 prepare again or retry inference. Input validation failures before retirement
 leave the existing plan intact. This contract covers prepared Graph and Eager
-execution; calibration and the legacy runtime-managed path are unchanged.
+execution. Calibration and legacy runtime-managed inference (including handles
+returned by shape-only `prepare`) also synchronize and invalidate the active
+fixed-profile plan before entering the executor, so cache replacement cannot
+leave a replayable graph referencing retired buffers. This retirement is
+conservative even when the request would reuse the same caches. A subsequent
+implicit `infer` rebuilds its invalidated plan; explicit fixed-profile handles
+must be prepared again. If synchronization fails, execution stops before
+retiring the plan or modifying executor caches.
+
+GPU lifecycle regression tests live in the `gr00t_bench_musa` example and are
+ignored by default because they load the real checkpoint. Set
+`APXINF_TEST_CHECKPOINT`, `APXINF_TEST_BACKBONE`, and `APXINF_TEST_FIXTURE` to the
+local assets; `APXINF_TEST_DEVICE` defaults to `0`.
+`APXINF_TEST_OTHER_EMBODIMENT` defaults to `0` and must be a valid checkpoint
+embodiment different from the fixture's ID. The tests deliberately switch
+embodiments to replace executor-owned device weights, retain the obsolete
+Graph handle, and assert that replay is rejected. They also compare rebuilt
+Graph outputs exactly against the original fixed-input Graph output.
+
+Run these in separate processes because the implicit-arena setting is cached:
+
+```bash
+APXINF_GR00T_PREPARED_ARENA=1 cargo test --release -p apxinf-model --features musa \
+  --example gr00t_bench_musa gpu_lifecycle_tests::graph_calibration_and_runtime_managed_gpu \
+  -- --ignored --exact --nocapture --test-threads=1
+APXINF_GR00T_PREPARED_ARENA=0 cargo test --release -p apxinf-model --features musa \
+  --example gr00t_bench_musa gpu_lifecycle_tests::graph_direct_eager_gpu \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The first test covers calibration coverage, explicit-plan retirement, implicit
+Graph rebuilding, execution through an old shape-only `prepare` handle, and
+replacement with a prepared Eager plan. The second covers direct eager `infer`
+with the implicit arena disabled. These are lifecycle checks, not latency
+benchmarks or an independent accuracy comparison against Orin gold. Calibration
+only collects BF16 activation maxima; it does not quantize or change weights.
+
+Graph input uploads also refresh the executor's token-cache key, matching the
+CUDA cache-consistency policy. The key is committed only after input upload
+succeeds; an upload failure clears the cache so eager/calibration cannot trust
+potentially stale device bytes. The host token vector reuses its allocation
+through `clone_from`; replay adds no extra device upload or synchronization.
+The existing eager cache-hit optimization remains enabled.
+
+`gpu_lifecycle_tests::graph_token_cache_gpu` specifically exercises Graph(A) →
+Graph(B) on the same plan → eager(A), then repeats the transition into
+calibration(A). It swaps ordinary text tokens without changing topology or
+embodiment, verifies B changes the action output, and compares eager actions
+and calibration maxima against clean A baselines. Run it with the same test
+environment and `APXINF_GR00T_PREPARED_ARENA=1`:
+
+```bash
+cargo test --release -p apxinf-model --features musa --example gr00t_bench_musa \
+  gpu_lifecycle_tests::graph_token_cache_gpu \
+  -- --ignored --exact --nocapture --test-threads=1
+```
 
 #### MUSA Python wheel
 

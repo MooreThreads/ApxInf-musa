@@ -203,6 +203,10 @@ fn observation_shape(observation: &Observation) -> &[usize] {
 
 fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     let values = std::env::args().collect::<Vec<_>>();
+    parse_argument_values(&values)
+}
+
+fn parse_argument_values(values: &[String]) -> Result<Arguments, Box<dyn std::error::Error>> {
     if values.len() < 5 {
         return Err(format!(
             "usage: {} <checkpoint> <backbone> <fixture> <bf16|fp8|int8> [device=0] [warmup=10] [iterations=50] [calibration|-] [tactics|-] [output|-] [--autotune] [--execution <eager|prefer-graph|require-graph>]",
@@ -233,6 +237,10 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
         "int8" => ModelPrecision::W8A8,
         value => return Err(format!("invalid precision {value:?}; expected bf16|fp8|int8").into()),
     };
+    let warmup = integer(6, 10, "warmup count")?;
+    if warmup == 0 {
+        return Err("warmup count must be non-zero".into());
+    }
     let iterations = integer(7, 50, "iteration count")?;
     if iterations == 0 {
         return Err("iteration count must be non-zero".into());
@@ -271,7 +279,7 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
         fixture: PathBuf::from(&values[3]),
         precision,
         device: integer(5, 0, "MUSA device")?,
-        warmup: integer(6, 10, "warmup count")?,
+        warmup,
         iterations,
         calibration: optional_path(8),
         tactics: optional_path(9),
@@ -472,10 +480,320 @@ fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Box<dyn std::err
 }
 
 #[cfg(test)]
+mod gpu_lifecycle_tests {
+    use super::*;
+    use apxinf_model::vla::{ExecutionMode, PreparationStatus, PreparedInference};
+    use apxinf_model::LoadedModel;
+
+    fn setup() -> Result<(LoadedModel, RequestInput, RequestInput), Box<dyn std::error::Error>> {
+        let checkpoint = PathBuf::from(std::env::var("APXINF_TEST_CHECKPOINT")?);
+        let backbone = PathBuf::from(std::env::var("APXINF_TEST_BACKBONE")?);
+        let fixture = PathBuf::from(std::env::var("APXINF_TEST_FIXTURE")?);
+        let input = RequestInput::from_fixture(load_fixture(&fixture)?);
+        let mut changed = RequestInput::from_fixture(load_fixture(&fixture)?);
+        changed.embodiment_id = std::env::var("APXINF_TEST_OTHER_EMBODIMENT")
+            .unwrap_or_else(|_| "0".into())
+            .parse()?;
+        assert_ne!(input.embodiment_id, changed.embodiment_id);
+        let device = std::env::var("APXINF_TEST_DEVICE")
+            .unwrap_or_else(|_| "0".into())
+            .parse()?;
+        let mut options = LoadOptions {
+            model_name: Some("gr00t".into()),
+            precision: ModelPrecision::Bf16,
+            execution_policy: Some(ExecutionPolicy::RequireGraph),
+            ..LoadOptions::default()
+        };
+        options.assets.insert("backbone".into(), backbone);
+        println!(
+            "Loading BF16 on MUSA device {device}; A embodiment={}, B embodiment={} (forces selected_embodiment replacement)",
+            input.embodiment_id, changed.embodiment_id
+        );
+        let model = AutoModel::load_model(Device::Musa(device), &checkpoint, &options)?;
+        Ok((model, input, changed))
+    }
+
+    fn assert_graph(plan: &dyn PreparedInference) {
+        assert_eq!(
+            plan.status(),
+            PreparationStatus::Ready {
+                mode: ExecutionMode::Graph,
+                fallback_reason: None,
+            }
+        );
+    }
+
+    fn assert_retired(plan: &dyn PreparedInference, input: &RequestInput) {
+        assert_eq!(plan.status(), PreparationStatus::Invalidated);
+        let error = match plan.run(&input.request()) {
+            Ok(_) => panic!("retired Graph must not execute"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalidated"), "unexpected error: {error}");
+        println!("PASS old Graph rejected: {error}");
+    }
+
+    fn assert_output(label: &str, actual: &[f32], reference: &[f32]) {
+        assert!(!actual.is_empty());
+        assert_eq!(actual.len(), reference.len());
+        assert!(actual
+            .iter()
+            .chain(reference)
+            .all(|value| value.is_finite()));
+        assert_eq!(
+            actual, reference,
+            "{label}: output changed after cache replacement"
+        );
+        println!(
+            "PASS {label}: {} finite values, exactly equal f32 values",
+            actual.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires MUSA GPU, GR00T checkpoint and preprocessed fixture"]
+    fn graph_calibration_and_runtime_managed_gpu() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(std::env::var("APXINF_GR00T_PREPARED_ARENA")?, "1");
+        let (model, input, changed) = setup()?;
+        let runtime = model.vla()?;
+        let request = input.request();
+        let changed_request = changed.request();
+        let legacy = runtime.prepare(&input.observation.inference_spec())?;
+        assert_eq!(legacy.status(), PreparationStatus::RuntimeManaged);
+        let eager_reference = legacy.run(&changed_request)?.tensor().to_f32_vec()?;
+
+        println!("[1/5] Explicit RequireGraph(A): capture and replay twice");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*graph);
+        let reference = graph.run(&request)?.tensor().to_f32_vec()?;
+        assert_output(
+            "repeated Graph(A)",
+            &graph.run(&request)?.tensor().to_f32_vec()?,
+            &reference,
+        );
+
+        println!("[2/5] calibration_amax(B): replace embodiment cache, retire Graph(A)");
+        let records = runtime.calibration_amax(&changed_request)?;
+        let expected = runtime.calibration_plan()?;
+        assert!(!records.is_empty());
+        assert_eq!(records.len(), expected.len());
+        assert!(expected.iter().all(|name| records.contains_key(name)));
+        assert!(records
+            .values()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        println!(
+            "PASS calibration coverage: {} finite amax sites",
+            records.len()
+        );
+        assert_retired(&*graph, &input);
+        assert_output(
+            "Graph(A) rebuilt after calibration(B)",
+            &runtime.infer_host_f32(&request)?,
+            &reference,
+        );
+        assert_eq!(runtime.execution_mode(), "musa-graph");
+
+        println!("[3/5] Implicit Graph(A) -> calibration(B) -> implicit infer(A) rebuild");
+        runtime.calibration_amax(&changed_request)?;
+        assert_ne!(runtime.execution_mode(), "musa-graph");
+        assert_output(
+            "invalidated implicit cache rebuilt",
+            &runtime.infer_host_f32(&request)?,
+            &reference,
+        );
+        assert_eq!(runtime.execution_mode(), "musa-graph");
+
+        println!("[4/5] Explicit Graph(A) -> old shape-only prepare handle runs eager(B)");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*graph);
+        graph.run(&request)?;
+        assert_output(
+            "runtime-managed eager(B)",
+            &legacy.run(&changed_request)?.tensor().to_f32_vec()?,
+            &eager_reference,
+        );
+        assert_retired(&*graph, &input);
+        assert_output(
+            "Graph(A) rebuilt after runtime-managed(B)",
+            &runtime.infer_host_f32(&request)?,
+            &reference,
+        );
+        assert_eq!(runtime.execution_mode(), "musa-graph");
+
+        println!("[5/5] Explicit Graph(A) -> prepare_for(B, Eager) -> Graph(A) rebuilt");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*graph);
+        graph.run(&request)?;
+        let eager = runtime.prepare_for(&changed_request, ExecutionPolicy::Eager)?;
+        assert!(matches!(
+            eager.status(),
+            PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                ..
+            }
+        ));
+        assert_retired(&*graph, &input);
+        let output = eager.run(&changed_request)?.tensor().to_f32_vec()?;
+        assert!(!output.is_empty() && output.iter().all(|value| value.is_finite()));
+        assert_output(
+            "Graph(A) rebuilt after prepared eager(B)",
+            &runtime.infer_host_f32(&request)?,
+            &reference,
+        );
+        assert_eq!(runtime.execution_mode(), "musa-graph");
+        assert_eq!(eager.status(), PreparationStatus::Invalidated);
+        println!("PASS all calibration/runtime-managed/prepared-eager GPU lifecycle checks");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MUSA GPU, GR00T checkpoint and preprocessed fixture"]
+    fn graph_token_cache_gpu() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(std::env::var("APXINF_GR00T_PREPARED_ARENA")?, "1");
+        let (model, input, mut changed) = setup()?;
+        changed.embodiment_id = input.embodiment_id;
+        let text_positions = input
+            .observation
+            .token_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (1000..100000).contains(token).then_some(index))
+            .collect::<Vec<_>>();
+        let first = *text_positions
+            .first()
+            .ok_or("fixture needs ordinary text tokens")?;
+        let last = *text_positions
+            .last()
+            .ok_or("fixture needs ordinary text tokens")?;
+        assert_ne!(
+            input.observation.token_ids[first],
+            input.observation.token_ids[last]
+        );
+        changed.observation.token_ids.swap(first, last);
+        println!(
+            "Token-cache scenario: same embodiment={}, length={}, swap ordinary tokens at {first}/{last}; image tokens unchanged",
+            input.embodiment_id, input.observation.token_ids.len()
+        );
+        let runtime = model.vla()?;
+        let request = input.request();
+        let changed_request = changed.request();
+        let legacy = runtime.prepare(&input.observation.inference_spec())?;
+        let eager_reference = legacy.run(&request)?.tensor().to_f32_vec()?;
+        let calibration_reference = runtime.calibration_amax(&request)?;
+
+        println!("[1/3] Capture Graph(A), replay A then B using the SAME plan");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*graph);
+        let graph_reference = graph.run(&request)?.tensor().to_f32_vec()?;
+        let changed_output = graph.run(&changed_request)?.tensor().to_f32_vec()?;
+        let changed_max_abs = changed_output
+            .iter()
+            .zip(&graph_reference)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(changed_output.iter().all(|value| value.is_finite()));
+        assert!(
+            changed_max_abs > 1e-5,
+            "changed tokens must affect model output"
+        );
+        println!("PASS B changes output: max_abs(A,B)={changed_max_abs}");
+
+        println!("[2/3] Eager(A) after Graph(B) must match clean eager(A), not read B tokens");
+        let actual = legacy.run(&request)?.tensor().to_f32_vec()?;
+        assert_eq!(actual.len(), eager_reference.len());
+        assert!(actual.iter().all(|value| value.is_finite()));
+        let max_abs = actual
+            .iter()
+            .zip(&eager_reference)
+            .map(|(value, expected)| (value - expected).abs())
+            .fold(0.0_f32, f32::max);
+        println!("Eager(A) vs clean eager(A): max_abs={max_abs}");
+        assert_eq!(max_abs, 0.0, "stale token cache changed eager(A) output");
+        assert_retired(&*graph, &input);
+
+        println!("[3/3] Capture A, replay B, then calibration(A) must match clean calibration(A)");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        graph.run(&changed_request)?;
+        let calibration = runtime.calibration_amax(&request)?;
+        assert!(!calibration.is_empty());
+        assert_eq!(calibration.len(), calibration_reference.len());
+        let mismatches = calibration
+            .iter()
+            .filter(|(name, value)| {
+                !value.is_finite() || calibration_reference.get(*name) != Some(*value)
+            })
+            .count();
+        assert_eq!(mismatches, 0, "calibration(A) used stale token data");
+        println!(
+            "PASS {} calibration sites exactly match clean A",
+            calibration.len()
+        );
+        assert_retired(&*graph, &input);
+        assert_output(
+            "Graph(A) rebuilt after token changes",
+            &runtime.infer_host_f32(&request)?,
+            &graph_reference,
+        );
+        assert_eq!(runtime.execution_mode(), "musa-graph");
+        println!("PASS token-cache GPU regression");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a separate process with APXINF_GR00T_PREPARED_ARENA=0"]
+    fn graph_direct_eager_gpu() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(std::env::var("APXINF_GR00T_PREPARED_ARENA")?, "0");
+        let (model, input, changed) = setup()?;
+        let runtime = model.vla()?;
+        let request = input.request();
+        let changed_request = changed.request();
+        let eager_reference = runtime.infer_host_f32(&changed_request)?;
+
+        println!("[1/3] Explicit RequireGraph(A) even though implicit arena is disabled");
+        let graph = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*graph);
+        let reference = graph.run(&request)?.tensor().to_f32_vec()?;
+        println!("[2/3] Direct infer(B) takes eager path and must retire Graph(A)");
+        assert_output(
+            "direct eager(B)",
+            &runtime.infer_host_f32(&changed_request)?,
+            &eager_reference,
+        );
+        assert_eq!(runtime.execution_mode(), "no_graph");
+        assert_retired(&*graph, &input);
+
+        println!("[3/3] Explicit RequireGraph(A) rebuilt and replayed");
+        let rebuilt = runtime.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+        assert_graph(&*rebuilt);
+        assert_output(
+            "Graph(A) rebuilt after direct eager(B)",
+            &rebuilt.run(&request)?.tensor().to_f32_vec()?,
+            &reference,
+        );
+        println!("PASS direct-eager GPU lifecycle checks");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         execution_policy_name, parse_execution_policy, ExecutionPolicy, DEFAULT_EXECUTION_POLICY,
     };
+
+    #[test]
+    fn benchmark_rejects_zero_warmup() {
+        let mut values: Vec<String> = ["bench", "checkpoint", "backbone", "fixture", "bf16", "0", "0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let error = super::parse_argument_values(&values).err().unwrap();
+        assert_eq!(error.to_string(), "warmup count must be non-zero");
+        values[6] = "1".into();
+        assert_eq!(super::parse_argument_values(&values).unwrap().warmup, 1);
+        values.truncate(5);
+        assert_eq!(super::parse_argument_values(&values).unwrap().warmup, 10);
+    }
 
     #[test]
     fn execution_policy_defaults_to_strict_graph_and_parses_all_modes() {

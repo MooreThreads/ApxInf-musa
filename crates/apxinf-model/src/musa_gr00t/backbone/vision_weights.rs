@@ -56,10 +56,6 @@ pub struct Qwen3VLMerger {
 }
 
 impl Qwen3VLVisionWeights {
-    pub fn from_map(cfg: &Qwen3VLConfig, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
-        Self::take_from_map(cfg, &mut tensors)
-    }
-
     /// Consume the vision tensors from a shared Qwen3-VL checkpoint map.
     pub(crate) fn take_from_map(
         cfg: &Qwen3VLConfig,

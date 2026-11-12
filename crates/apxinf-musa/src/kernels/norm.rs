@@ -6,7 +6,7 @@ use apxinf_core::{Error, Result, Tensor};
 use super::contracts::{checked_i32, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matrix_bf16, require_output_matrix,
-    require_vector_at_least_bf16, require_vector_bf16,
+    require_positive_eps, require_vector_at_least_bf16, require_vector_bf16,
 };
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
@@ -21,6 +21,7 @@ use crate::kernels::native_unavailable;
 ///
 /// `input` is 2-D BF16 `[rows, cols]`, `weight` a BF16 `[cols]` vector.
 pub fn rms_bf16(ctx: &MusaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    require_positive_eps(eps, "rms_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "rms_norm", "input")?;
     let mut output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
     rms_bf16_into(ctx, input, weight, &mut output, eps)?;
@@ -35,6 +36,7 @@ pub fn rms_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "rms_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "rms_norm", "input")?;
     require_vector_bf16(ctx, weight, cols, "rms_norm", "weight")?;
     require_output_matrix(ctx, output, rows, cols, "rms_norm", "normalized")?;

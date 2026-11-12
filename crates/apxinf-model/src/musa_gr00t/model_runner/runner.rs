@@ -3,7 +3,6 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
@@ -14,7 +13,7 @@ use crate::vla::{
     VisionObservation, VlaContract, VlaRequest, VlaRuntime,
 };
 
-use super::super::backend::{kernels, RuntimeBackend};
+use super::super::backend::kernels;
 #[cfg(feature = "musa")]
 use super::super::geometry::Gr00tBackboneTokenGroups;
 #[cfg(feature = "musa")]
@@ -31,13 +30,35 @@ pub(crate) struct Gr00tModelRunner<E: Gr00tPrecisionExecution> {
     #[cfg(feature = "musa")]
     execution_policy: Cell<ExecutionPolicy>,
     /// Tracks the sole resource-owning plan, including externally held handles.
-    active_strategy: RefCell<Weak<RefCell<Gr00tPreparedStrategy>>>,
+    active_strategy: Rc<Gr00tActiveStrategy>,
 }
 
 pub(super) struct Gr00tPreparedInference<E: Gr00tPrecisionExecution> {
     spec: InferenceSpec,
     engine: Rc<RefCell<Gr00tExecutor<E>>>,
     strategy: Rc<RefCell<Gr00tPreparedStrategy>>,
+    active_strategy: Rc<Gr00tActiveStrategy>,
+}
+
+#[derive(Default)]
+struct Gr00tActiveStrategy {
+    strategy: RefCell<Weak<RefCell<Gr00tPreparedStrategy>>>,
+}
+
+impl Gr00tActiveStrategy {
+    fn register(&self, strategy: &Rc<RefCell<Gr00tPreparedStrategy>>) {
+        *self.strategy.borrow_mut() = Rc::downgrade(strategy);
+    }
+
+    fn invalidate(&self, synchronize: impl FnOnce() -> Result<()>) -> Result<()> {
+        let active = self.strategy.borrow().upgrade();
+        if let Some(active) = active {
+            synchronize()?;
+            *active.borrow_mut() = Gr00tPreparedStrategy::Invalidated;
+        }
+        *self.strategy.borrow_mut() = Weak::new();
+        Ok(())
+    }
 }
 
 enum Gr00tPreparedStrategy {
@@ -68,7 +89,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
             prepared: RefCell::new(None),
             #[cfg(feature = "musa")]
             execution_policy: Cell::new(ExecutionPolicy::PreferGraph),
-            active_strategy: RefCell::new(Weak::new()),
+            active_strategy: Rc::new(Gr00tActiveStrategy::default()),
         }
     }
 
@@ -149,7 +170,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
     }
 
     fn run_runtime_managed(&self, request: &VlaRequest<'_>) -> Result<Action> {
-        run_engine(&self.engine, request)
+        run_engine(&self.engine, &self.active_strategy, request)
     }
 
     #[cfg(feature = "musa")]
@@ -170,6 +191,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
                 image_layout: None,
             },
             engine: Rc::clone(&self.engine),
+            active_strategy: Rc::clone(&self.active_strategy),
             strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::NoGraph {
                 key,
                 token_groups,
@@ -183,13 +205,8 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
     /// Release executable resources even when a caller retains the old handle.
     /// Synchronization must succeed before destroying a graph or its arena.
     fn invalidate_prepared(&self) -> Result<()> {
-        let active = self.active_strategy.borrow().upgrade();
-        if let Some(active) = active {
-            self.engine.borrow().backend().synchronize()?;
-            *active.borrow_mut() = Gr00tPreparedStrategy::Invalidated;
-        }
-        *self.active_strategy.borrow_mut() = Weak::new();
-        Ok(())
+        self.active_strategy
+            .invalidate(|| self.engine.borrow().backend().synchronize())
     }
 
     #[cfg(feature = "musa")]
@@ -203,7 +220,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
         self.engine.borrow().prepared_key(input)?;
         self.invalidate_prepared()?;
         let plan = self.build_prepared_impl(input, policy)?;
-        *self.active_strategy.borrow_mut() = Rc::downgrade(&plan.strategy);
+        self.active_strategy.register(&plan.strategy);
         Ok(plan)
     }
 
@@ -225,6 +242,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
                     image_layout: None,
                 },
                 engine: Rc::clone(&self.engine),
+                active_strategy: Rc::clone(&self.active_strategy),
                 strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::Graph { key, graph })),
             }),
             Err(error) if policy == ExecutionPolicy::PreferGraph => {
@@ -289,7 +307,9 @@ impl<E: Gr00tPrecisionExecution> Gr00tPreparedInference<E> {
                     "GR00T prepared plan was invalidated; prepare a new plan".into(),
                 ))
             }
-            Gr00tPreparedStrategy::RuntimeManaged => self.engine.borrow_mut().infer(input)?,
+            Gr00tPreparedStrategy::RuntimeManaged => {
+                infer_runtime_managed(&self.engine, &self.active_strategy, input)?
+            }
             #[cfg(feature = "musa")]
             Gr00tPreparedStrategy::Graph { key, .. }
             | Gr00tPreparedStrategy::NoGraph { key, .. } => {
@@ -316,10 +336,11 @@ impl<E: Gr00tPrecisionExecution> Gr00tPreparedInference<E> {
                     "GR00T prepared plan was invalidated; prepare a new plan".into(),
                 ))
             }
-            Gr00tPreparedStrategy::RuntimeManaged => self.engine.borrow_mut().infer(input)?,
+            Gr00tPreparedStrategy::RuntimeManaged => {
+                infer_runtime_managed(&self.engine, &self.active_strategy, input)?
+            }
             Gr00tPreparedStrategy::Graph { graph, .. } => {
-                let engine = self.engine.borrow();
-                graph.run(input, engine.backend(), config)?
+                self.engine.borrow_mut().run_prepared_graph(graph, input)?
             }
             Gr00tPreparedStrategy::NoGraph {
                 token_groups,
@@ -419,6 +440,7 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
         Ok(Box::new(Gr00tPreparedInference {
             spec: *spec,
             engine: Rc::clone(&self.engine),
+            active_strategy: Rc::clone(&self.active_strategy),
             strategy: Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged)),
         }))
     }
@@ -469,6 +491,7 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
     fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         let config = self.engine.borrow().config().clone();
         let input = Self::build_input(request, &config)?;
+        self.invalidate_prepared()?;
         self.engine.borrow_mut().calibration_amax(&input)
     }
 
@@ -489,15 +512,124 @@ fn musa_prepared_arena_enabled() -> bool {
 
 fn run_engine<E: Gr00tPrecisionExecution>(
     engine: &Rc<RefCell<Gr00tExecutor<E>>>,
+    active_strategy: &Gr00tActiveStrategy,
     request: &VlaRequest<'_>,
 ) -> Result<Action> {
     let config = engine.borrow().config().clone();
     let input = Gr00tModelRunner::<E>::build_input(request, &config)?;
-    let output = engine
-        .borrow_mut()
-        .infer(&input)?
+    let output = infer_runtime_managed(engine, active_strategy, &input)?
         .reshape(vec![config.action_horizon, config.max_action_dim])?;
     Ok(Action::new(output))
+}
+
+fn infer_runtime_managed<E: Gr00tPrecisionExecution>(
+    engine: &Rc<RefCell<Gr00tExecutor<E>>>,
+    active_strategy: &Gr00tActiveStrategy,
+    input: &Gr00tObservation,
+) -> Result<Tensor> {
+    active_strategy.invalidate(|| engine.borrow().backend().synchronize())?;
+    engine.borrow_mut().infer(input)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{Gr00tActiveStrategy, Gr00tPreparedStrategy};
+    use apxinf_core::Error;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn shared_registry_invalidates_retained_handle_after_synchronization() {
+        let registry = Rc::new(Gr00tActiveStrategy::default());
+        let runtime_managed_registry = Rc::clone(&registry);
+        let strategy = Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged));
+        registry.register(&strategy);
+        drop(registry);
+
+        runtime_managed_registry
+            .invalidate(|| {
+                assert!(matches!(
+                    *strategy.borrow(),
+                    Gr00tPreparedStrategy::RuntimeManaged
+                ));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            *strategy.borrow(),
+            Gr00tPreparedStrategy::Invalidated
+        ));
+        assert!(runtime_managed_registry
+            .strategy
+            .borrow()
+            .upgrade()
+            .is_none());
+        runtime_managed_registry
+            .invalidate(|| panic!("already retired plans need no synchronization"))
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_synchronization_preserves_plan_and_registration() {
+        let registry = Gr00tActiveStrategy::default();
+        let strategy = Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged));
+        registry.register(&strategy);
+
+        assert!(registry
+            .invalidate(|| Err(Error::Other("synchronization failed".into())))
+            .is_err());
+        assert!(matches!(
+            *strategy.borrow(),
+            Gr00tPreparedStrategy::RuntimeManaged
+        ));
+        assert!(Rc::ptr_eq(
+            &registry.strategy.borrow().upgrade().unwrap(),
+            &strategy
+        ));
+
+        registry.invalidate(|| Ok(())).unwrap();
+        assert!(matches!(
+            *strategy.borrow(),
+            Gr00tPreparedStrategy::Invalidated
+        ));
+    }
+
+    #[test]
+    fn replacement_is_tracked_without_reviving_retired_plan() {
+        let registry = Gr00tActiveStrategy::default();
+        let old_strategy = Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged));
+        registry.register(&old_strategy);
+        registry.invalidate(|| Ok(())).unwrap();
+
+        let replacement = Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged));
+        registry.register(&replacement);
+        assert!(matches!(
+            *old_strategy.borrow(),
+            Gr00tPreparedStrategy::Invalidated
+        ));
+        assert!(matches!(
+            *replacement.borrow(),
+            Gr00tPreparedStrategy::RuntimeManaged
+        ));
+        registry.invalidate(|| Ok(())).unwrap();
+        assert!(matches!(
+            *replacement.borrow(),
+            Gr00tPreparedStrategy::Invalidated
+        ));
+    }
+
+    #[test]
+    fn registry_does_not_keep_dropped_handles_alive() {
+        let registry = Gr00tActiveStrategy::default();
+        let strategy = Rc::new(RefCell::new(Gr00tPreparedStrategy::RuntimeManaged));
+        registry.register(&strategy);
+        drop(strategy);
+
+        registry
+            .invalidate(|| panic!("dropped plans need no synchronization"))
+            .unwrap();
+    }
 }
 
 fn to_bf16(tensor: &Tensor, name: &str) -> Result<Tensor> {

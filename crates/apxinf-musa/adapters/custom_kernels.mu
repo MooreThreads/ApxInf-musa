@@ -256,7 +256,7 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16(
     const void* input, const void* weight, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   const auto* in = static_cast<const __mt_bfloat16*>(input);
@@ -1063,7 +1063,7 @@ extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
   if (query == nullptr || query_weight == nullptr || query_output == nullptr ||
       key == nullptr || key_weight == nullptr || key_output == nullptr ||
       rotation_table == nullptr || tokens <= 0 || query_heads <= 0 ||
-      key_heads <= 0 || head_dim != 128 || eps < 0.0f ||
+      key_heads <= 0 || head_dim != 128 || !(eps > 0.0f) ||
       block_threads != 128) {
     return musaErrorInvalidValue;
   }

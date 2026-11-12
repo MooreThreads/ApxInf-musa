@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from compare_outputs import GATES, compare_array, load_archive
+from formats import load_fixture
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration", type=Path)
     parser.add_argument("--tactics", type=Path)
     parser.add_argument("--autotune", action="store_true")
-    parser.add_argument("--reference", type=Path, help="normalized-action NPZ or benchmark JSON")
+    parser.add_argument("--reference", type=Path, help="normalized-action NPY/NPZ or benchmark JSON")
     parser.add_argument("--output", type=Path,
                         default=Path("devlocal/gr00t-n1d7/results/gr00t-musa-wheel.json"))
     args = parser.parse_args()
@@ -35,35 +36,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup must be non-negative and --iterations must be positive")
     if args.autotune and args.tactics is None:
         parser.error("--autotune requires --tactics")
+    if args.output.suffix != ".json":
+        parser.error("--output must end in .json")
     return args
-
-
-def load_fixture(root: Path) -> tuple[dict, dict[str, np.ndarray]]:
-    manifest = json.loads((root / "manifest.json").read_text())
-    if manifest["schema"] != "apxinf.gr00t-n1.7.preprocessed-fixture.v1":
-        raise ValueError("unsupported fixture schema")
-    arrays = {}
-    for name, dtype in (
-        ("pixel_values", "bfloat16"), ("image_grid_thw", "uint32"),
-        ("token_ids", "uint32"), ("attention_mask", "uint8"),
-        ("state", "bfloat16"), ("noise", "bfloat16"),
-    ):
-        entry = manifest["tensors"][name]
-        if entry["dtype"] != dtype:
-            raise ValueError(f"{name} must have dtype {dtype}")
-        storage = {"bfloat16": "<u2", "uint32": "<u4", "uint8": "u1"}[dtype]
-        values = np.fromfile(root / entry["file"], dtype=storage).reshape(entry["shape"])
-        if dtype == "bfloat16":
-            values = (values.astype(np.uint32) << 16).view(np.float32)
-        arrays[name] = np.ascontiguousarray(values)
-    return manifest, arrays
 
 
 def main() -> None:
     args = parse_args()
+    manifest, arrays = load_fixture(args.fixture)
+    reference = load_archive(args.reference) if args.reference else None
+    if reference is not None and "noise" in reference and not np.array_equal(arrays["noise"], reference["noise"]):
+        raise ValueError("fixture and reference noise differ")
     import apxinf_py
 
-    manifest, arrays = load_fixture(args.fixture)
     started = time.perf_counter()
     model = apxinf_py.ModelRunner.load(
         "gr00t", str(args.checkpoint), device=f"musa:{args.device}",
@@ -132,13 +117,10 @@ def main() -> None:
     }
     passed = deterministic
     if args.reference:
-        reference = load_archive(args.reference)
         metrics = compare_array(first_output, reference["normalized_actions"])
         gate = GATES[args.precision]
         parity_passed = (metrics["cosine"] >= gate["minimum_cosine"]
                          and metrics["relative_l2"] <= gate["maximum_relative_l2"])
-        if "noise" in reference and not np.array_equal(arrays["noise"], reference["noise"]):
-            raise ValueError("fixture and reference noise differ")
         report["parity"] = {"reference": str(args.reference), **metrics, "passed": parity_passed}
         passed = passed and parity_passed
     args.output.parent.mkdir(parents=True, exist_ok=True)

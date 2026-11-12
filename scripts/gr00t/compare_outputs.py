@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from formats import load_archive
+
 
 GATES = {
     "bf16": {"minimum_cosine": 0.999, "maximum_relative_l2": 0.05},
@@ -25,34 +27,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=tuple(GATES), default="bf16")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
-
-
-def load_archive(path: Path) -> dict[str, np.ndarray]:
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"output archive does not exist: {path}")
-    if path.suffix == ".json":
-        document = json.loads(path.read_text())
-        try:
-            values = np.asarray(document["output"]["values"], dtype=np.float32)
-            shape = tuple(int(value) for value in document["output"]["shape"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"{path} is missing Rust benchmark output values") from error
-        if values.size != int(np.prod(shape)):
-            raise ValueError(
-                f"{path} output values have {values.size} elements, expected {shape}"
-            )
-        return {"normalized_actions": values.reshape(shape)}
-    with np.load(path) as archive:
-        required = ("normalized_actions",)
-        missing = [key for key in required if key not in archive]
-        if missing:
-            raise ValueError(f"{path} is missing arrays: {', '.join(missing)}")
-        return {
-            key: np.asarray(archive[key])
-            for key in ("normalized_actions", "actions", "noise")
-            if key in archive
-        }
 
 
 def compare_array(actual: np.ndarray, reference: np.ndarray) -> dict[str, Any]:
