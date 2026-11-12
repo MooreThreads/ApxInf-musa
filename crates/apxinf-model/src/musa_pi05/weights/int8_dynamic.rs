@@ -486,6 +486,167 @@ mod linear {
             Ok(output)
         }
 
+        /// Consume the preceding linear's bias/GELU output on the INT8 route.
+        ///
+        /// The vision MLP's FC1 bias and GELU run fused with the row
+        /// quantization, keeping the BF16 intermediate out of the arena. A
+        /// projection that fell back to BF16 has no quantizer to fuse into,
+        /// so it materializes the activation and takes the ordinary GEMM.
+        pub fn gemm_bias_gelu(
+            &self,
+            ctx: &Context,
+            input: &Tensor,
+            bias: Option<&Tensor>,
+            gemm_policy: &ops::GemmPolicy,
+        ) -> Result<Tensor> {
+            if self.bf16_fallback.is_some() {
+                let activated = crate::musa_pi05::backend::bias_activation_bf16(
+                    ctx,
+                    input,
+                    bias,
+                    ops::PointwiseActivation::Gelu,
+                )?;
+                return self.gemm_with_policies(ctx, &activated, gemm_policy);
+            }
+            let rows = input.shape().dims()[0];
+            let mut output =
+                ctx.allocate_output(Shape::new(vec![rows, self.output_dim]), DType::BF16)?;
+            ops::w8a8::gemm_bias_gelu(ctx, input, bias, self.as_kernel_view(), &mut output)?;
+            Ok(output)
+        }
+
+        /// Whether this projection takes the fused norm+quantize producers.
+        pub fn is_quantized(&self) -> bool {
+            self.bf16_fallback.is_none()
+        }
+
+        /// Adaptive RMSNorm fused with this projection's row quantization.
+        ///
+        /// Only meaningful on the quantized route; callers with a BF16
+        /// fallback projection keep the materialized norm.
+        pub fn prepare_adaptive_rms(
+            &self,
+            ctx: &Context,
+            input: &Tensor,
+            style: &Tensor,
+            eps: f32,
+        ) -> Result<crate::musa_pi05::backend::NormalizedW8A8Input> {
+            Ok(crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(
+                crate::musa_pi05::backend::gemm::adaptive_rms_quantize_w8a8_activation(
+                    ctx,
+                    input,
+                    style,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?,
+            ))
+        }
+
+        /// Gated residual RMSNorm fused with this projection's row quantization.
+        pub fn prepare_gated_residual_rms(
+            &self,
+            ctx: &Context,
+            projection: &Tensor,
+            residual: &Tensor,
+            gate_style: &Tensor,
+            norm_style: &Tensor,
+            eps: f32,
+        ) -> Result<(Tensor, crate::musa_pi05::backend::NormalizedW8A8Input)> {
+            let (hidden, quantized) =
+                crate::musa_pi05::backend::gemm::adaptive_gate_residual_rms_quantize_w8a8_activation(
+                    ctx,
+                    projection,
+                    residual,
+                    gate_style,
+                    norm_style,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?;
+            Ok((
+                hidden,
+                crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(quantized),
+            ))
+        }
+
+        /// GEMM over a prepared input, quantized or materialized.
+        pub fn gemm_normalized(
+            &self,
+            ctx: &Context,
+            input: &crate::musa_pi05::backend::NormalizedW8A8Input,
+            gemm_policy: &ops::GemmPolicy,
+        ) -> Result<Tensor> {
+            use crate::musa_pi05::backend::NormalizedW8A8Input;
+            match input {
+                NormalizedW8A8Input::Bf16(input) => self.gemm_with_policies(ctx, input, gemm_policy),
+                NormalizedW8A8Input::Quantized(activation) => {
+                    if self.bf16_fallback.is_some() {
+                        return Err(Error::Other(
+                            "quantized norm input cannot feed a BF16 projection".into(),
+                        ));
+                    }
+                    ops::w8a8::gemm_quantized_alloc(ctx, activation, self.as_kernel_view())
+                }
+            }
+        }
+
+        /// Affine norm fused with this projection's row quantization.
+        ///
+        /// A norm bias selects LayerNorm; without it this is RMSNorm. Only
+        /// meaningful on the quantized route; callers with a BF16 fallback
+        /// projection keep the materialized norm.
+        pub fn prepare_norm(
+            &self,
+            ctx: &Context,
+            input: &Tensor,
+            weight: &Tensor,
+            norm_bias: Option<&Tensor>,
+            eps: f32,
+        ) -> Result<crate::musa_pi05::backend::NormalizedW8A8Input> {
+            let (_hidden, normalized) =
+                crate::musa_pi05::backend::gemm::norm_quantize_w8a8_activation(
+                    ctx,
+                    input,
+                    None,
+                    weight,
+                    norm_bias,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?;
+            Ok(crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(
+                normalized,
+            ))
+        }
+
+        /// Residual + affine norm fused with this projection's row quantization.
+        pub fn prepare_residual_norm(
+            &self,
+            ctx: &Context,
+            projection: &Tensor,
+            residual: &Tensor,
+            residual_bias: Option<&Tensor>,
+            weight: &Tensor,
+            norm_bias: Option<&Tensor>,
+            eps: f32,
+        ) -> Result<(Tensor, crate::musa_pi05::backend::NormalizedW8A8Input)> {
+            let (hidden, normalized) =
+                crate::musa_pi05::backend::gemm::norm_quantize_w8a8_activation(
+                    ctx,
+                    projection,
+                    Some((residual, residual_bias)),
+                    weight,
+                    norm_bias,
+                    eps,
+                    self.equalization_inv_c.as_ref(),
+                )?;
+            let hidden = hidden.ok_or_else(|| {
+                Error::Other("residual norm producer must return the hidden stream".into())
+            })?;
+            Ok((
+                hidden,
+                crate::musa_pi05::backend::NormalizedW8A8Input::Quantized(normalized),
+            ))
+        }
+
         pub fn as_kernel_view(&self) -> W8A8WeightView<'_> {
             W8A8WeightView::new(
                 &self.weight_output_major,

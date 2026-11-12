@@ -1,11 +1,10 @@
 # MUSA backend
 
-`crates/apxinf-musa` runs ApxInf on Moore Threads MUSA devices. It is a port of
-the CUDA path rather than a reimplementation: the module layout, the operator
-signatures, the tensor contracts and the workspace discipline are the CUDA
-crate's, and the differences are MUSA's own names (`musaMalloc` for
-`cudaMalloc`, `--offload-arch=mp_22` for `-arch=sm_xx`, `musart`/`mublas` for
-`cudart`/`cublas`).
+`crates/apxinf-musa` runs ApxInf on Moore Threads MUSA devices. Its runtime was
+ported from the former `apxinf-cuda` backend, preserving its allocation,
+tensor and workspace contracts while using MUSA's own APIs (`musaMalloc`,
+`musart` and `mublas`). The current CUDA runtime is `apxinf-cuda-new`; the two
+backends evolve independently.
 
 PI0.5 and GR00T reach it through `crates/apxinf-model/src/musa_pi05/` and
 `crates/apxinf-model/src/musa_gr00t/`, backend-native ports that **copy** what
@@ -57,6 +56,11 @@ caller that names the backend it means still reaches the family. The name is
 admission only — it does not bind the device, which is what decides which
 backend runs.
 
+`ModelRunner.load(..., execution=...)` accepts `eager`, `prefer-graph` and
+`require-graph` for MUSA PI0.5. Omitting it keeps `prefer-graph`. The separate
+`weight_layout_budget_bytes` option is implemented by CUDA PI0.5 BF16/FP8;
+it does not control MUSA allocations.
+
 `crates/apxinf-musa` builds without a toolkit: with `MUSA_PATH` unset or
 pointing nowhere, the build compiles the no-device configuration, warns, and
 exposes `MUSA_AVAILABLE = false`, which is how a caller can tell. That is
@@ -98,20 +102,22 @@ stops being invisible.
 
 ## Relationship to the CUDA backends
 
-There are two CUDA trees upstream and they are different designs, so "the same
-as CUDA" does not name one thing. `apxinf-cuda` keeps a `kernels/` facade over
-flat `adapters/*.cu`; `apxinf-cuda-new` has no facade and splits every operator
-into contract and launch halves. This backend is a hybrid on purpose:
+The legacy `apxinf-cuda` tree was removed when all CUDA families migrated to
+`apxinf-cuda-new`. Its source at
+[`01232a9a`](https://github.com/infinigence/ApxInf/tree/01232a9a8220977a76094907eaed6da2ef1ba0db/crates/apxinf-cuda)
+is the historical origin of MUSA's runtime, not a second live dependency.
+The current relationship is:
 
-- **Surface follows cuda-new.** The typed `ops/` contract, `ExecutionSession`
-  and `graph::capture` are shaped after `apxinf-cuda-new`, because PI0.5's model
-  code is written against them.
+- **Surface serves the MUSA port.** The typed `ops/` contract, `ExecutionSession`
+  and `graph::capture` were shaped after `apxinf-cuda-new`. They cover the
+  independent `musa_pi05` BF16/INT8 paths; CUDA-only additions such as
+  `RepackedWeight` do not automatically become MUSA requirements.
 - **Interior follows legacy CUDA.** `kernels/`, `ffi/`, `buffer`/`context`/
   `stream`/`device_caps` and the flat `adapters/*.mu` are ported from
   `apxinf-cuda`, which is the tree this backend was taken from.
-- **Kernels are a subset, rewritten where the hardware forced it.** 35 device
-  kernels against upstream's 221; the 16 that keep the same name are the ones
-  PI0.5 uses. Their bodies differ where M1000 made the upstream shape wrong:
+- **Kernels are a subset, rewritten where the hardware forced it.** 39 device
+  kernels against the original CUDA tree's 221; the 16 that keep the same name
+  are the ones PI0.5 uses. Their bodies differ where M1000 made the upstream shape wrong:
   row-grid launches (64-bit integer division is a software routine here), a
   precomputed RoPE frequency table, register-cached W8A8 quantization, FP16
   scales with a 512-entry zero pad for the `s8mma` tiles, and `copysign`
@@ -121,12 +127,21 @@ into contract and launch halves. This backend is a hybrid on purpose:
   rewritten kernel reviewable against its origin; it is not something to trim
   into line with upstream.
 
-What is *not* different: the `kernels/custom` file set maps one-for-one onto
-`apxinf-cuda`'s, `custom_kernels.mu` uses the same anonymous-namespace plus
-single-C-ABI translation-unit pattern, and every ported `extern "C"` signature
+Relative to that historical source, the `kernels/custom` files correspond
+one-for-one to files in `apxinf-cuda`'s set, except `graph.cuh` (a MUSA capture
+anchor) and `norm_quantization.cuh` (the fused normalization-plus-quantization
+producers), which have no CUDA counterpart; `custom_kernels.mu` uses the same
+anonymous-namespace plus single-C-ABI translation-unit pattern, and every ported
+`extern "C"` signature
 has the same parameter order and meaning. Where a signature does differ —
 `quantize_rows_bf16_int8` grew the per-channel equalization vector — the adapter
 README says so.
+
+`scripts/check_ops_contract_surface.py` checks the operators imported by the
+MUSA model port, including its INT8 path. `crates/apxinf-musa/tests/backend_parity.rs`
+checks literal environment reads in the current CUDA Rust/native sources and
+MUSA backend/model sources. Its table documents the current differences;
+removed legacy CUDA allocation switches are not MUSA counterparts.
 
 ## PI0.5 on MUSA
 
@@ -147,6 +162,9 @@ that do not change a value:
   live as long as the graph does, unlike a temporary built before the region.
 - Decode GEMMs run on the MP22 assembly tiles, and the encode path takes the
   registered variant for its shapes. Both are prepared at load.
+- Immutable weights are registered once at load (`prepare_assembly_weights`),
+  held for the context's lifetime, and must not be mutated afterwards. There is
+  no per-call candidate cache, so there is no weight-version token to key one.
 - The prefix cache reserves the action rows, so language layers write K/V
   straight into it.
 
@@ -165,6 +183,27 @@ capability. What the port adds to the device path:
   projection, reproducing the materialized chain's intermediate BF16 rounding in
   registers. The fused output is byte-identical; a device test checks it across
   150..16392 columns and falls back for views the kernel cannot take.
+- The language layers fuse their normalization into the same row quantizer:
+  qkv's input RMSNorm (`prepare_norm`) and the post-attention bias + residual +
+  RMSNorm (`prepare_residual_norm`) hand the packed INT8 rows straight to the
+  GEMM. The vision layers do the same for LayerNorm -- including the post-norm
+  that feeds the multimodal projector -- and for FC1's bias + GELU,
+  and the action expert's adaptive RMSNorm and gated residual RMSNorm +
+  quantization share the contract. A producer is used only when the consuming
+  projection is quantized and the width/alignment matches; anything else keeps
+  the materialized BF16 chain. Device-only tests compare every fused producer
+  with the split chain byte-for-byte (`w8a8_norm_tests.rs`,
+  `w8a8_affine_norm_tests.rs`); they are `#[ignore]`d and no CI job runs a
+  MUSA device, so run them manually with
+  `cargo test -p apxinf-musa --lib -- --ignored kernels::gemm::w8a8
+  --test-threads=1`. `APXINF_MUSA_BF16_RMS=scalar` forces only the language
+  qkv input RMSNorm's fallback onto the scalar two-pass kernel for accuracy
+  runs; the other norm producers have no scalar form.
+- The down projection's `(522, 2048, 16384)` shape may take the `256x128`
+  **M-fast** tile. Its assembly image is derived from `qint8_256x128.asm` by
+  `aot/export_qint8_mfast.py`, with the source hash pinned in the script and
+  the asm README; the tile is routed only for that measured shape, and other
+  `m` values keep the shape band's traversal order.
 - The action traversal marks itself as quantized decode, and its short-row GEMMs
   take NN/NT images rendered from the BF16 GEMM template; gate/up's KN weight
   copy is packed once at load, so no transpose runs per call.
@@ -193,6 +232,25 @@ Orin bundle (3 warm-up, 15 samples, equalization set, frozen checkpoint copy):
 | `int8_dynamic` | graph | 363.2 ms | 0.99936157 |
 | `int8_dynamic_no_encode` | eager | 502.2 ms | 0.99963635 |
 | `int8_dynamic_no_encode` | graph | 502.9 ms | 0.99963635 |
+
+The table above is the port's original measurement. The fused branch was
+compared against `musa-dev` with an ABBA sequence on the same machine
+(`int8_dynamic`, graph capture, warm-up 3 / samples 15, equalization set):
+
+| run | branch | L1 p50 |
+|---|---|---:|
+| base-a1 | `musa-dev` | 317.21 ms |
+| base-a2 | `musa-dev` | 318.67 ms |
+| pr-b1 | fused branch | 312.05 ms |
+| pr-b2 | fused branch | 312.23 ms |
+
+The medians are 317.94 ms (base) and 312.14 ms (fused), a 5.80 ms / 1.83%
+reduction. The exported actions were bitwise identical in every round, and all
+four runs scored cosine 0.99936157 / max_abs 0.0504164 against the Orin bundle
+(gate 0.999 PASS). Device validation: `cargo test -p apxinf-musa --lib --
+--ignored kernels::gemm::w8a8 --test-threads=1` passes 14/14 (device-only; see
+the INT8 note above), including the 2*cols style and scalar-RMS regressions;
+`cargo test -p apxinf-model --features musa --lib musa_pi05::` passes 36.
 
 The integration branch on the same machine measures 513.4 / 510.1 ms for `bf16`, 406.4 /
 363.2 for `int8_dynamic` and 545.1 / 502.9 for `int8_dynamic_no_encode` (eager /
@@ -374,6 +432,42 @@ Records are bound to the kernel build id, the MP generation, the device name and
 the vendor library fingerprints. A database that does not match is ignored with
 a printed reason rather than silently used: a stale one measures another build,
 and copying one between machines is the usual way that happens.
+
+No MUSA database is checked into this repository today. M1000's shapes are
+already covered closely enough that autotuning produces no measurable gain, so
+the directory above is an artifact of a local tuning run rather than a shipped
+file. A checkout without `configs/tuning/musa` is normal: every shape uses the
+safe default, and `cargo test -p apxinf-musa --lib` validates a database only
+when one is present. The same test covers an S5000 asset if one is added later.
+
+Tuning itself is a load-time setting: `--tactics` and `--autotune` live in
+`LoadOptions` and are installed once before prepare or capture. They are not
+part of the per-call operator policy.
+
+## Operator policies
+
+`GemmPolicy` and `AttentionPolicy` are enforced at the operator entry point,
+not carried and ignored:
+
+- `accumulation_dtype` must be F32 — the adapter's `MUBLAS_COMPUTE_32F`
+  contract. Anything else is refused.
+- `workspace_limit` bounds the bytes the operator allocates for itself: none for
+  a plain GEMM or attention, `rows × gate_cols × 2` for `gemm_geglu`. Vendor
+  libraries allocate their own internal workspaces outside this accounting.
+- `allow_fallback = false` requires a tactic record measured at the exact shape.
+  A bucket extrapolation or the muBLAS default is refused; autotuning may
+  measure the shape and write the record. On attention it requires the packed
+  decode route for a decode-shaped call, per build: the assembly build's packed
+  decode kernel, or the MUTLASS build's packed tile 128 (9..=16 query rows).
+  The general D256 assembly, and the MUTLASS unpacked tile 192 for 17..=256
+  rows, are slower substitutes and are refused; from 257 rows the unpacked tile
+  is MATE's own choice, and a prefix pass uses the general route by
+  construction. The assembly GEMM route is a platform optimisation and does not
+  count as a fallback.
+- `deterministic = true` is refused: there is no bitwise-determinism contract
+  across the available providers.
+- `graph_safe` is accepted either way: MUSA's routes are capture-safe
+  unconditionally, so `false` is a weaker request that is satisfied too.
 
 ## Measuring a change
 

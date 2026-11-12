@@ -13,33 +13,45 @@ files are the renderer's output, checked in.
 
 ## Provenance
 
-Taken verbatim from MATE's `mate/flash_attention/asm/` as it stands in an
-internal working tree, MATE 0.2.5. **That directory is not tracked there.**
-The commit the working tree was on when the files were taken, `825890dd`
-(*fa: add support for dense k/v, non-casual gqa8*, 2026-09-22), does not contain
-it, and the three images were rendered on 2026-09-28/29 — after it.
-So a commit hash is not a handle on these bytes; the SHA256 table below is, and
-it is also what the upstream `asm/README.md` publishes. Nothing newer exists:
-the directory is absent from every ref of that repository, and MATE's mubin asm
-route refuses head dimension 256 outright, so there is no released variant to
-upgrade to.
+The images in this directory are renderer output, checked in as bytes. Their
+provenance has two stages.
+
+The baseline images (`2d4b5818…`, `0a5285a6…`, `8d136054…`) were taken verbatim
+from MATE's `mate/flash_attention/asm/` as it stood in an internal working tree,
+MATE 0.2.5. **That directory is not tracked there.** The commit the working tree
+was on when the files were taken, `825890dd` (*fa: add support for dense k/v,
+non-casual gqa8*, 2026-09-22), does not contain it. The general and split-KV
+baseline hashes match what upstream records in its 2026-09-23 and 2026-09-28
+sections; the baseline decode hash is the post-prefetch render described below.
+The baseline renders used muDNN's `ComputeAsmKern` at `6be23bf2` with
+`asm_render` at `aa1fdfa5`, driven by MATE's (untracked)
+`scripts/render_fa_d256_mp22.py`. The decode baseline differs from the upstream
+table's `567ffa04…` because the 2026-09-28 "Decode V prefetch" scheduling
+change superseded it without updating that table; that note explains the
+upstream table, not this directory.
+
+The current images (`bb424e28…`, `e2fac710…`, `0cada532…`) were re-rendered on
+2026-11-11 from the restructured templates with muDNN's `ComputeAsmKern` at
+`335e5038` (`arch=QY2`, `kv_splits=4`), and assembled with
+`llvm-mc --arch=mtgpu -mcpu=mp_22` and `lld -shared`. Registers drop from 176
+to 160, so each SM can hold 768 threads instead of 640.
+
+Neither the restructured `fa_d256_mp22.s` nor `ComputeAsmKern` `335e5038` is
+tracked in this repository. The only `fa_d256_mp22.s` in the MATE working tree
+is the pre-restructure revision that produced the baseline images, not the
+current ones. Re-rendering therefore currently requires an internal checkout,
+and the SHA256 table below is the handle on the checked-in bytes. It is **not**
+the table published by the upstream `asm/README.md`, which still lists
+`2d4b5818…`, `567ffa04…` and `8d136054…`.
 
 | file | SHA256 | rendered from |
 |---|---|---|
-| `fa_d256_mp22.asm` | `2d4b5818bc0e9d6f84a322fd3883056fb89f9c13abc0431bae873dacdd51395a` | `fa_d256_mp22.s`, `packed_decode=False split_kv=False` |
-| `fa_d256_mp22_decode.asm` | `0a5285a6624075b9681d34f77686619d83f7dfb8fb7330f5c4fb3ae47064498c` | same, `packed_decode=True split_kv=False` |
-| `fa_d256_mp22_splitkv.asm` | `8d13605463cd9dd624ae1dfeb32a45e1b84419a99bc178bbc1291cd8cd24b17a` | same, `packed_decode=True split_kv=True` |
+| `fa_d256_mp22.asm` | `bb424e28f7dddfd15958aa1e06d30f7cd3d0e9a1fff4fdda430eaa04306c573d` | restructured `fa_d256_mp22.s` (not in this tree), `packed_decode=False split_kv=False` |
+| `fa_d256_mp22_decode.asm` | `e2fac71069de2b0c842f1daf9f7d5d1ca623ea6313e6fca83fb005aef55ee776` | same, `packed_decode=True split_kv=False` |
+| `fa_d256_mp22_splitkv.asm` | `0cada532b38e8e59539941c229c2e5c2986aeac29062c2dc28d08f879d8ae2ad` | same, `packed_decode=True split_kv=True` |
 
-The upstream renderer is muDNN's `ComputeAsmKern` at `6be23bf2` with
-`asm_render` at `aa1fdfa5`, driven by `scripts/render_fa_d256_mp22.py` in the
-same checkout.
 Re-rendering is only needed to change the kernel, and it is not part of this
 build.
-
-The upstream `asm/README.md` still carries a `567ffa04…` hash for the decode
-variant. That was accurate when it was written; a later scheduling change
-("Decode V prefetch", 2026-09-28) superseded it without updating the table. The
-hashes above are of the files actually in this directory.
 
 ## Contract
 
@@ -206,7 +218,8 @@ registration fallback and changed-input graph replay against eager/vendor.
 
 # INT8 (W8A8) GEMM tiles, vendored assembly
 
-Six muDNN QY2 `s8mma` convolution tiles configured as a 1x1 GEMM: the whole of
+Six muDNN QY2 `s8mma` convolution tiles configured as a 1x1 GEMM, plus an
+M-fast variant of the 256x128 tile: the whole of
 `gemm::w8a8` on an MP22 target. `adapters/qint8_gemm_adapter.mu` loads and
 launches them and owns the contract (67-argument convolution ABI in the
 H=W=1 degenerate case, `A[m,k]` INT8, `B[n,k]` INT8 output-major, per-row and
@@ -240,10 +253,14 @@ which is what pins the patch's blast radius to the epilogue.
 | `qint8_256x64.asm` | 256 | 256 × 64 × 64 | 20608 | `bfee7d90b39ca6777b4e59f809eb7ad8b074433520b224f2600c2344bc3cee4e` |
 | `qint8_32x128.asm` | 128 | 32 × 128 × 64 | 10368 | `deb90df04050744c582a8690be24ea899f08da128988e818a17a0f0e3e7375c4` |
 | `qint8_32x64.asm` | 128 | 32 × 64 × 64 | 6272 | `10949d198711683db638df1d464154499d0c7ef7e904ad4cabcaf8547f474310` |
+| `qint8_256x128_mfast.asm` | 256 | 256 × 128 × 64 | 24704 | `d11cb49119bd8e0664b5be1357e5ae17b7f44b09b2a0f42a2c41cae2521bec7b` |
 
 Re-rendering is: render the tile with `OUTPUT_DTYPE=bfloat16`, then apply the
 two bf16-output patch passes to the rendered source. It is only needed to change
-a tile, and it is not part of this build.
+a tile, and it is not part of this build. The M-fast variant is not rendered
+directly: `aot/export_qint8_mfast.py` derives it from `qint8_256x128.asm` by
+swapping the M/N block-index moves and renaming the symbol. The script pins its
+source hash, and the generated file must not be edited by hand.
 
 ## INT8 decode NN/NT GEMM
 

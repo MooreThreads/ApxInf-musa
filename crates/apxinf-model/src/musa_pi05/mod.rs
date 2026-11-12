@@ -22,6 +22,7 @@ mod model_runner;
 mod weights;
 
 pub use backend::ImageLayout as Pi05ImageLayout;
+pub use backend::NormalizedW8A8Input;
 pub use config::{GemmaVariantConfig, ModelVariantChoice, Pi05Config};
 pub(crate) use load::load;
 pub use math::{discretize_state, euler_flow_step, pi05_prompt, sinusoidal_time_embedding};

@@ -202,7 +202,9 @@ const MUBIN_VARIANTS: &[(&str, &str)] = &[
 /// convolution templates configured as a 1x1 GEMM, so they consume `A[m,k]`
 /// (INT8), `B[n,k]` (INT8, **output-major**) and per-row and per-column FP16
 /// scales, and write `D[m,n]` in **BF16** -- the contract's output, no
-/// widening pass. **The order is load-bearing**:
+/// widening pass. The final image is the 256x128 tile with M-fast block
+/// traversal, reproduced by `aot/export_qint8_mfast.py`.
+/// **The order is load-bearing**:
 /// `adapters/qint8_gemm_adapter.mu`'s `kTiles` and
 /// `src/kernels/gemm/qint8_tiles.rs`'s `QINT8_TILES` are indexed by the same
 /// position.
@@ -213,6 +215,7 @@ const QINT8_ASM_VARIANTS: &[(&str, &str)] = &[
     ("qint8_256x64", "kApxinfMusaQint8Gemm256x64Image"),
     ("qint8_32x128", "kApxinfMusaQint8Gemm32x128Image"),
     ("qint8_32x64", "kApxinfMusaQint8Gemm32x64Image"),
+    ("qint8_256x128_mfast", "kApxinfMusaQint8Gemm256x128MfastImage"),
 ];
 
 // Separate from the convolution tile ABI: these use the BF16 GEMM ABI with

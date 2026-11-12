@@ -10,7 +10,7 @@
 //! conversion. The alternative — `apxinf_core::bf16` — would work for building
 //! a CPU tensor, but the device path here goes through raw bytes either way.
 
-use apxinf_core::{DType, Shape, Tensor};
+use apxinf_core::{DType, Result, Shape, Tensor};
 
 use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
@@ -90,4 +90,35 @@ pub fn gate_for(output: &[f32]) -> f32 {
         .iter()
         .fold(0.0f32, |acc, v| acc.max(v.abs()))
         * GATE_FRACTION
+}
+
+/// Run `operation` against an explicit arena, the way a captured traversal
+/// does. The session resets the workspace before the closure and installs it
+/// for the duration of the call.
+pub fn with_workspace<T>(
+    workspace: crate::workspace::GraphWorkspace,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    crate::workspace::ExecutionSession::new(workspace).run(operation)
+}
+
+/// Capture a graph and keep the value the traversal produced.
+///
+/// `graph::capture` records a `Result<()>` traversal; the operator tests need
+/// the produced output alongside the graph to compare replays against.
+pub fn capture_with_output<T>(
+    context: std::sync::Arc<MusaContext>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(crate::graph::CapturedGraph, T)> {
+    let output = std::cell::RefCell::new(None);
+    let graph = crate::graph::capture(context, || {
+        *output.borrow_mut() = Some(operation()?);
+        Ok(())
+    })?;
+    Ok((
+        graph,
+        output
+            .into_inner()
+            .expect("a successful capture always produced a value"),
+    ))
 }

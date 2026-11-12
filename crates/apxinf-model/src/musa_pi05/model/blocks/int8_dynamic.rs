@@ -1,6 +1,6 @@
 //! Dynamic-activation INT8 PI0.5 transformer-layer computation.
 
-use crate::musa_pi05::backend::{ops, Context, DeviceBuffer};
+use crate::musa_pi05::backend::{ops, Context, DeviceBuffer, NormalizedW8A8Input};
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use super::{
@@ -24,10 +24,19 @@ pub struct Int8DynamicLanguageLayerOutput {
 
 pub struct Int8DynamicActionLayerOutput {
     pub hidden: Tensor,
-    pub next_normalized: Tensor,
+    pub next_normalized: NormalizedW8A8Input,
 }
 
 pub(in crate::musa_pi05) type Int8DynamicL3Policies = super::L3Policies;
+
+/// Whether the row-level calibration diagnostic is enabled.
+///
+/// Read once: this is a process-level collection mode, and caching it keeps the
+/// product path from taking the environment lock once per layer.
+fn int8_stats_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("APXINF_PI05_INT8_STATS").is_some())
+}
 
 /// Diagnostic: how many INT8 levels a row's typical element gets.
 ///
@@ -45,7 +54,7 @@ pub(in crate::musa_pi05) type Int8DynamicL3Policies = super::L3Policies;
 fn report_row_levels(name: &str, activation: &Tensor) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    if std::env::var_os("APXINF_PI05_INT8_STATS").is_none() {
+    if !int8_stats_requested() {
         return;
     }
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
@@ -108,6 +117,31 @@ fn report_row_levels(name: &str, activation: &Tensor) {
     );
 }
 
+fn normalized_input(
+    fuse: bool,
+    fused: impl FnOnce() -> Result<NormalizedW8A8Input>,
+    materialized: impl FnOnce() -> Result<Tensor>,
+) -> Result<NormalizedW8A8Input> {
+    if fuse {
+        fused()
+    } else {
+        Ok(NormalizedW8A8Input::Bf16(materialized()?))
+    }
+}
+
+fn residual_normalized(
+    fuse: bool,
+    fused: impl FnOnce() -> Result<(Tensor, NormalizedW8A8Input)>,
+    materialized: impl FnOnce() -> Result<(Tensor, Tensor)>,
+) -> Result<(Tensor, NormalizedW8A8Input)> {
+    if fuse {
+        fused()
+    } else {
+        let (hidden, normalized) = materialized()?;
+        Ok((hidden, NormalizedW8A8Input::Bf16(normalized)))
+    }
+}
+
 fn l3_rms_bf16(
     ctx: &Context,
     input: &Tensor,
@@ -128,13 +162,7 @@ fn l3_bias_activation_bf16(
     bias: Option<&Tensor>,
     activation: ops::PointwiseActivation,
 ) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    let mut args =
-        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
-    args.bias = bias;
-    args.activation = activation;
-    ops::pointwise(ctx, args)?;
-    Ok(output)
+    crate::musa_pi05::backend::bias_activation_bf16(ctx, input, bias, activation)
 }
 
 fn l3_geglu_bf16(ctx: &Context, input: &Tensor) -> Result<Tensor> {
@@ -476,11 +504,25 @@ fn language_layer_int8_dynamic_with_policies(
     rope_theta: f32,
     policies: &Int8DynamicL3Policies,
 ) -> Result<Int8DynamicLanguageLayerOutput> {
-    let normalized = l3_rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
-    report_row_levels("lang.qkv_in", &normalized);
+    // Calibration rebuilds need the materialized pre-projection rows; the fused
+    // producer keeps them on device and exposes no host-side equivalent. STATS
+    // runs therefore take the same BF16 chain the baseline recorded from.
+    let collect_stats = int8_stats_requested();
+    let first_normalized = normalized_input(
+        weights.qkv.is_quantized() && !collect_stats,
+        || {
+            weights
+                .qkv
+                .prepare_norm(ctx, input, &weights.input_norm_scale, None, rms_eps)
+        },
+        || l3_rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps),
+    )?;
+    if let NormalizedW8A8Input::Bf16(ref tensor) = first_normalized {
+        report_row_levels("lang.qkv_in", tensor);
+    }
     let qkv = weights
         .qkv
-        .gemm_with_policies(ctx, &normalized, &policies.gemm)?;
+        .gemm_normalized(ctx, &first_normalized, &policies.gemm)?;
     let qkv = l3_split_qkv_rope_bf16(
         ctx,
         &qkv,
@@ -505,23 +547,40 @@ fn language_layer_int8_dynamic_with_policies(
     let projected = weights
         .output
         .gemm_with_policies(ctx, &attention, &policies.gemm)?;
-    let fused = l3_bias_residual_rms_bf16(
-        ctx,
-        &projected,
-        weights.output.bias.as_ref(),
-        input,
-        &weights.post_attention_norm_scale,
-        rms_eps,
+    let (residual, normalized) = residual_normalized(
+        weights.gate_up.is_quantized() && !collect_stats,
+        || {
+            weights.gate_up.prepare_residual_norm(
+                ctx,
+                &projected,
+                input,
+                weights.output.bias.as_ref(),
+                &weights.post_attention_norm_scale,
+                None,
+                rms_eps,
+            )
+        },
+        || {
+            let fused = l3_bias_residual_rms_bf16(
+                ctx,
+                &projected,
+                weights.output.bias.as_ref(),
+                input,
+                &weights.post_attention_norm_scale,
+                rms_eps,
+            )?;
+            Ok((fused.hidden, fused.normalized))
+        },
     )?;
-    report_row_levels("lang.gate_up_in", &fused.normalized);
-    let gate_up = weights.gate_up.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
+    if let NormalizedW8A8Input::Bf16(ref tensor) = normalized {
+        report_row_levels("lang.gate_up_in", tensor);
+    }
+    let gate_up = weights
+        .gate_up
+        .gemm_normalized(ctx, &normalized, &policies.gemm)?;
     // Diagnostics keep the materialized activation they inspect; the product
     // path hands the packed gate/up straight to the fused quantizer.
-    let projected = if std::env::var_os("APXINF_PI05_INT8_STATS").is_some() {
+    let projected = if collect_stats {
         let activated = l3_geglu_bf16(ctx, &gate_up)?;
         report_row_levels("lang.down_in", &activated);
         weights
@@ -534,7 +593,7 @@ fn language_layer_int8_dynamic_with_policies(
         ctx,
         &projected,
         weights.down.bias.as_ref(),
-        &fused.hidden,
+        &residual,
     )?;
     Ok(Int8DynamicLanguageLayerOutput {
         hidden,
@@ -573,7 +632,7 @@ fn action_layer_int8_dynamic_with_policies(
     config: GemmaVariantConfig,
     weights: &Int8DynamicDeviceActionLayer,
     input: &Tensor,
-    attention_normalized: Option<&Tensor>,
+    attention_normalized: Option<&NormalizedW8A8Input>,
     attention_modulation: &Tensor,
     mlp_modulation: &Tensor,
     next_norm_modulation: &Tensor,
@@ -583,19 +642,25 @@ fn action_layer_int8_dynamic_with_policies(
     rms_eps: f32,
     rope_theta: f32,
     policies: &Int8DynamicL3Policies,
+    next_projection: &Int8DynamicLinearWeights,
 ) -> Result<Int8DynamicActionLayerOutput> {
+    let first_normalized;
     let normalized = match attention_normalized {
-        Some(value) => value.clone(),
-        None => l3_adaptive_rms_bf16(
-            ctx,
-            input,
-            attention_modulation,
-            rms_eps,
-        )?,
+        Some(value) => value,
+        None => {
+            first_normalized = normalized_input(
+                weights.qkv.is_quantized(),
+                || {
+                    weights
+                        .qkv
+                        .prepare_adaptive_rms(ctx, input, attention_modulation, rms_eps)
+                },
+                || l3_adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps),
+            )?;
+            &first_normalized
+        }
     };
-    let qkv = weights
-        .qkv
-        .gemm_with_policies(ctx, &normalized, &policies.gemm)?;
+    let qkv = weights.qkv.gemm_normalized(ctx, normalized, &policies.gemm)?;
     let q = l3_split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
@@ -626,33 +691,63 @@ fn action_layer_int8_dynamic_with_policies(
     let projected = weights
         .output
         .gemm_with_policies(ctx, &attention, &policies.gemm)?;
-    let fused = l3_adaptive_gate_residual_rms_bf16(
-        ctx,
-        &projected,
-        input,
-        attention_modulation,
-        mlp_modulation,
-        rms_eps,
+    let (post_attention_hidden, mlp_normalized) = residual_normalized(
+        weights.gate_up.is_quantized(),
+        || {
+            weights.gate_up.prepare_gated_residual_rms(
+                ctx,
+                &projected,
+                input,
+                attention_modulation,
+                mlp_modulation,
+                rms_eps,
+            )
+        },
+        || {
+            let fused = l3_adaptive_gate_residual_rms_bf16(
+                ctx,
+                &projected,
+                input,
+                attention_modulation,
+                mlp_modulation,
+                rms_eps,
+            )?;
+            Ok((fused.hidden, fused.normalized))
+        },
     )?;
-    let gate_up = weights.gate_up.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
+    let gate_up = weights
+        .gate_up
+        .gemm_normalized(ctx, &mlp_normalized, &policies.gemm)?;
     let projected = weights
         .down
         .gemm_geglu(ctx, &gate_up, &policies.gemm)?;
-    let fused = l3_adaptive_gate_residual_rms_bf16(
-        ctx,
-        &projected,
-        &fused.hidden,
-        mlp_modulation,
-        next_norm_modulation,
-        rms_eps,
+    let (hidden, next_normalized) = residual_normalized(
+        next_projection.is_quantized(),
+        || {
+            next_projection.prepare_gated_residual_rms(
+                ctx,
+                &projected,
+                &post_attention_hidden,
+                mlp_modulation,
+                next_norm_modulation,
+                rms_eps,
+            )
+        },
+        || {
+            let fused = l3_adaptive_gate_residual_rms_bf16(
+                ctx,
+                &projected,
+                &post_attention_hidden,
+                mlp_modulation,
+                next_norm_modulation,
+                rms_eps,
+            )?;
+            Ok((fused.hidden, fused.normalized))
+        },
     )?;
     Ok(Int8DynamicActionLayerOutput {
-        hidden: fused.hidden,
-        next_normalized: fused.normalized,
+        hidden,
+        next_normalized,
     })
 }
 
@@ -662,7 +757,7 @@ pub fn action_layer_int8_dynamic(
     config: GemmaVariantConfig,
     weights: &Int8DynamicDeviceActionLayer,
     input: &Tensor,
-    attention_normalized: Option<&Tensor>,
+    attention_normalized: Option<&NormalizedW8A8Input>,
     attention_modulation: &Tensor,
     mlp_modulation: &Tensor,
     next_norm_modulation: &Tensor,
@@ -671,6 +766,7 @@ pub fn action_layer_int8_dynamic(
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
+    next_projection: &Int8DynamicLinearWeights,
 ) -> Result<Int8DynamicActionLayerOutput> {
     action_layer_int8_dynamic_with_policies(
         ctx,
@@ -687,6 +783,7 @@ pub fn action_layer_int8_dynamic(
         rms_eps,
         rope_theta,
         &Int8DynamicL3Policies::default(),
+        next_projection,
     )
 }
 
@@ -736,16 +833,30 @@ fn vision_layer_int8_dynamic_with_policies(
     layer_norm_eps: f32,
     policies: &Int8DynamicL3Policies,
 ) -> Result<Tensor> {
-    let normalized = l3_layer_bf16(
-        ctx,
-        input,
-        &weights.norm1.weight,
-        &weights.norm1.bias,
-        layer_norm_eps,
+    let first_normalized = normalized_input(
+        weights.qkv.is_quantized(),
+        || {
+            weights.qkv.prepare_norm(
+                ctx,
+                input,
+                &weights.norm1.weight,
+                Some(&weights.norm1.bias),
+                layer_norm_eps,
+            )
+        },
+        || {
+            l3_layer_bf16(
+                ctx,
+                input,
+                &weights.norm1.weight,
+                &weights.norm1.bias,
+                layer_norm_eps,
+            )
+        },
     )?;
     let qkv = weights
         .qkv
-        .gemm_with_policies(ctx, &normalized, &policies.gemm)?;
+        .gemm_normalized(ctx, &first_normalized, &policies.gemm)?;
     let qkv = l3_split_qkv_bias_bf16(
         ctx,
         &qkv,
@@ -765,34 +876,46 @@ fn vision_layer_int8_dynamic_with_policies(
     let projection = weights
         .output
         .gemm_with_policies(ctx, &attention, &policies.gemm)?;
-    let fused = l3_bias_residual_layer_bf16(
-        ctx,
-        &projection,
-        weights.output.bias.as_ref(),
-        input,
-        &weights.norm2.weight,
-        &weights.norm2.bias,
-        layer_norm_eps,
+    let (residual, normalized) = residual_normalized(
+        weights.fc1.is_quantized(),
+        || {
+            weights.fc1.prepare_residual_norm(
+                ctx,
+                &projection,
+                input,
+                weights.output.bias.as_ref(),
+                &weights.norm2.weight,
+                Some(&weights.norm2.bias),
+                layer_norm_eps,
+            )
+        },
+        || {
+            let fused = l3_bias_residual_layer_bf16(
+                ctx,
+                &projection,
+                weights.output.bias.as_ref(),
+                input,
+                &weights.norm2.weight,
+                &weights.norm2.bias,
+                layer_norm_eps,
+            )?;
+            Ok((fused.hidden, fused.normalized))
+        },
     )?;
-    let activation = weights.fc1.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
-    let activation = l3_bias_activation_bf16(
+    let activation = weights
+        .fc1
+        .gemm_normalized(ctx, &normalized, &policies.gemm)?;
+    let projection = weights.fc2.gemm_bias_gelu(
         ctx,
         &activation,
         weights.fc1.bias.as_ref(),
-        ops::PointwiseActivation::Gelu,
+        &policies.gemm,
     )?;
-    let projection = weights
-        .fc2
-        .gemm_with_policies(ctx, &activation, &policies.gemm)?;
     l3_bias_residual_bf16(
         ctx,
         &projection,
         weights.fc2.bias.as_ref(),
-        &fused.hidden,
+        &residual,
     )
 }
 
@@ -898,21 +1021,37 @@ pub(in crate::musa_pi05::model) mod backbone {
                     &self.policies,
                 )?;
             }
-            let hidden = l3_layer_bf16(
-                self.ctx(),
-                &hidden,
-                &self.weights.vision_post_norm.weight,
-                &self.weights.vision_post_norm.bias,
-                self.config.layer_norm_eps,
+            // The projector is quantized, so its input LayerNorm folds into the
+            // row quantizer: one kernel replaces the norm plus a standalone
+            // quantize pass, and the `[tokens, 1152]` BF16 intermediate never
+            // reaches the arena. A projection without an INT8 route keeps the
+            // materialized chain.
+            let normalized = normalized_input(
+                self.weights.multimodal_projector.is_quantized(),
+                || {
+                    self.weights.multimodal_projector.prepare_norm(
+                        self.ctx(),
+                        &hidden,
+                        &self.weights.vision_post_norm.weight,
+                        Some(&self.weights.vision_post_norm.bias),
+                        self.config.layer_norm_eps,
+                    )
+                },
+                || {
+                    l3_layer_bf16(
+                        self.ctx(),
+                        &hidden,
+                        &self.weights.vision_post_norm.weight,
+                        &self.weights.vision_post_norm.bias,
+                        self.config.layer_norm_eps,
+                    )
+                },
             )?;
-            let projected = self
-                .weights
-                .multimodal_projector
-                .gemm_with_policies(
-                    self.ctx(),
-                    &hidden,
-                    &self.policies.gemm,
-                )?;
+            let projected = self.weights.multimodal_projector.gemm_normalized(
+                self.ctx(),
+                &normalized,
+                &self.policies.gemm,
+            )?;
             l3_bias_activation_bf16(
                 self.ctx(),
                 &projected,
@@ -1086,6 +1225,12 @@ pub(in crate::musa_pi05::model) mod backbone {
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
+                let next_projection = self
+                    .weights
+                    .action_layers
+                    .get(index + 1)
+                    .map(|layer| &layer.qkv)
+                    .unwrap_or(&self.weights.action_out);
                 let next_norm_modulation = if index + 1 < self.config.action_expert.depth {
                     &modulation.attention[index + 1]
                 } else {
@@ -1106,6 +1251,7 @@ pub(in crate::musa_pi05::model) mod backbone {
                     self.config.rms_norm_eps,
                     self.config.rope_theta,
                     &self.policies,
+                    next_projection,
                 )?;
                 hidden = output.hidden;
                 attention_normalized = Some(output.next_normalized);
@@ -1113,7 +1259,7 @@ pub(in crate::musa_pi05::model) mod backbone {
             let hidden = attention_normalized.ok_or_else(|| {
                 Error::Other("PI0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = self.weights.action_out.gemm_with_policies(
+            let velocity = self.weights.action_out.gemm_normalized(
                 self.ctx(),
                 &hidden,
                 &self.policies.gemm,
