@@ -13,33 +13,45 @@ files are the renderer's output, checked in.
 
 ## Provenance
 
-Taken verbatim from MATE's `mate/flash_attention/asm/` as it stands in an
-internal working tree, MATE 0.2.5. **That directory is not tracked there.**
-The commit the working tree was on when the files were taken, `825890dd`
-(*fa: add support for dense k/v, non-casual gqa8*, 2026-09-22), does not contain
-it, and the three images were rendered on 2026-09-28/29 — after it.
-So a commit hash is not a handle on these bytes; the SHA256 table below is, and
-it is also what the upstream `asm/README.md` publishes. Nothing newer exists:
-the directory is absent from every ref of that repository, and MATE's mubin asm
-route refuses head dimension 256 outright, so there is no released variant to
-upgrade to.
+The images in this directory are renderer output, checked in as bytes. Their
+provenance has two stages.
+
+The baseline images (`2d4b5818…`, `0a5285a6…`, `8d136054…`) were taken verbatim
+from MATE's `mate/flash_attention/asm/` as it stood in an internal working tree,
+MATE 0.2.5. **That directory is not tracked there.** The commit the working tree
+was on when the files were taken, `825890dd` (*fa: add support for dense k/v,
+non-casual gqa8*, 2026-09-22), does not contain it. The general and split-KV
+baseline hashes match what upstream records in its 2026-09-23 and 2026-09-28
+sections; the baseline decode hash is the post-prefetch render described below.
+The baseline renders used muDNN's `ComputeAsmKern` at `6be23bf2` with
+`asm_render` at `aa1fdfa5`, driven by MATE's (untracked)
+`scripts/render_fa_d256_mp22.py`. The decode baseline differs from the upstream
+table's `567ffa04…` because the 2026-09-28 "Decode V prefetch" scheduling
+change superseded it without updating that table; that note explains the
+upstream table, not this directory.
+
+The current images (`bb424e28…`, `e2fac710…`, `0cada532…`) were re-rendered on
+2026-11-11 from the restructured templates with muDNN's `ComputeAsmKern` at
+`335e5038` (`arch=QY2`, `kv_splits=4`), and assembled with
+`llvm-mc --arch=mtgpu -mcpu=mp_22` and `lld -shared`. Registers drop from 176
+to 160, so each SM can hold 768 threads instead of 640.
+
+Neither the restructured `fa_d256_mp22.s` nor `ComputeAsmKern` `335e5038` is
+tracked in this repository. The only `fa_d256_mp22.s` in the MATE working tree
+is the pre-restructure revision that produced the baseline images, not the
+current ones. Re-rendering therefore currently requires an internal checkout,
+and the SHA256 table below is the handle on the checked-in bytes. It is **not**
+the table published by the upstream `asm/README.md`, which still lists
+`2d4b5818…`, `567ffa04…` and `8d136054…`.
 
 | file | SHA256 | rendered from |
 |---|---|---|
-| `fa_d256_mp22.asm` | `2d4b5818bc0e9d6f84a322fd3883056fb89f9c13abc0431bae873dacdd51395a` | `fa_d256_mp22.s`, `packed_decode=False split_kv=False` |
-| `fa_d256_mp22_decode.asm` | `0a5285a6624075b9681d34f77686619d83f7dfb8fb7330f5c4fb3ae47064498c` | same, `packed_decode=True split_kv=False` |
-| `fa_d256_mp22_splitkv.asm` | `8d13605463cd9dd624ae1dfeb32a45e1b84419a99bc178bbc1291cd8cd24b17a` | same, `packed_decode=True split_kv=True` |
+| `fa_d256_mp22.asm` | `bb424e28f7dddfd15958aa1e06d30f7cd3d0e9a1fff4fdda430eaa04306c573d` | restructured `fa_d256_mp22.s` (not in this tree), `packed_decode=False split_kv=False` |
+| `fa_d256_mp22_decode.asm` | `e2fac71069de2b0c842f1daf9f7d5d1ca623ea6313e6fca83fb005aef55ee776` | same, `packed_decode=True split_kv=False` |
+| `fa_d256_mp22_splitkv.asm` | `0cada532b38e8e59539941c229c2e5c2986aeac29062c2dc28d08f879d8ae2ad` | same, `packed_decode=True split_kv=True` |
 
-The upstream renderer is muDNN's `ComputeAsmKern` at `6be23bf2` with
-`asm_render` at `aa1fdfa5`, driven by `scripts/render_fa_d256_mp22.py` in the
-same checkout.
 Re-rendering is only needed to change the kernel, and it is not part of this
 build.
-
-The upstream `asm/README.md` still carries a `567ffa04…` hash for the decode
-variant. That was accurate when it was written; a later scheduling change
-("Decode V prefetch", 2026-09-28) superseded it without updating the table. The
-hashes above are of the files actually in this directory.
 
 ## Contract
 
