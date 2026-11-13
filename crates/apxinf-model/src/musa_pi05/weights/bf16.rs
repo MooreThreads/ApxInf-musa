@@ -57,7 +57,7 @@ mod linear {
         }
     }
 
-    fn to_bf16_host(tensor: &Tensor) -> Result<Tensor> {
+    pub(crate) fn to_bf16_host(tensor: &Tensor) -> Result<Tensor> {
         if tensor.dtype() == DType::F8E4M3 {
             return Err(Error::Other(
                 "cannot convert scale-less E4M3 data to BF16".into(),
@@ -71,7 +71,17 @@ mod linear {
         Tensor::from_bf16(tensor.shape().dims().to_vec(), &values)
     }
 
+    /// Upload a tensor as BF16.
+    ///
+    /// A tensor already in BF16 is copied straight to the device. Converting it
+    /// through F32 first is the identity on every finite value (a NaN payload
+    /// is the only thing that could be canonicalized) but keeps a full F32 copy
+    /// and a second BF16 copy alive at once: ~2.9 GiB of transient for the
+    /// 0.98 GiB token embedding, measured as part of the load peak.
     pub fn bf16_to_device(tensor: &Tensor, context: &Context) -> Result<Tensor> {
+        if tensor.dtype() == DType::BF16 {
+            return backend::to_device(context, tensor);
+        }
         backend::to_device(context, &to_bf16_host(tensor)?)
     }
 
@@ -114,6 +124,45 @@ mod linear {
                 biases.to_f32_vec().unwrap(),
                 vec![1., 2., 3., 4.]
             );
+        }
+
+        /// The fast path in `bf16_to_device` skips a BF16 -> F32 -> BF16
+        /// round trip. This is the numeric claim it rests on: every finite
+        /// BF16 value and both infinities survive that round trip bit for bit.
+        /// A NaN payload may be canonicalized by `from_f32`, so those patterns
+        /// are excluded; the fast path preserves them too, which is stronger,
+        /// not different.
+        #[test]
+        fn bf16_to_bf16_host_is_the_identity() {
+            use apxinf_core::{Device, Shape};
+
+            let mut bytes = Vec::with_capacity(65536 * 2);
+            for value in 0..=u16::MAX {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let tensor = Tensor::from_raw(
+                Shape::new(vec![65536]),
+                DType::BF16,
+                Device::Cpu,
+                bytes.clone(),
+            )
+            .expect("bf16 tensor");
+            let converted = to_bf16_host(&tensor).expect("identity");
+            assert_eq!(converted.dtype(), DType::BF16);
+            let converted_bytes = converted.storage().as_cpu().expect("cpu storage");
+            for value in 0..=u16::MAX {
+                let index = value as usize * 2;
+                let exponent = (value >> 7) & 0xFF;
+                let mantissa = value & 0x7F;
+                if exponent == 0xFF && mantissa != 0 {
+                    continue; // NaN payload canonicalization
+                }
+                assert_eq!(
+                    &converted_bytes[index..index + 2],
+                    &bytes[index..index + 2],
+                    "BF16 bits 0x{value:04x} changed"
+                );
+            }
         }
     }
 }
