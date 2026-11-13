@@ -126,6 +126,11 @@ fn launch(
     cols: usize,
     tactic: TacticDispatch,
 ) -> Result<()> {
+    if super::in_decode_scope()
+        && super::tilelang::launch_bf16(ctx, activation, weight, output, rows, cols, inner)?
+    {
+        return Ok(());
+    }
     let assembly = if super::in_decode_scope() {
         super::assembly::launch(ctx, activation, weight, output, rows, cols, inner)?
     } else if super::assembly::launch_exact(ctx, activation, weight, output, rows, cols, inner)? {

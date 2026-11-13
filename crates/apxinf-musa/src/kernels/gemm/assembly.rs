@@ -9,6 +9,7 @@ use apxinf_core::{Result, Tensor};
 /// NT also retains a transposed buffer. Buffers live with the context.
 #[derive(Default)]
 pub(crate) struct PreparedWeights {
+    pub(super) tilelang: std::collections::HashMap<(usize, usize, usize), apxinf_core::Tensor>,
     entries: std::collections::HashMap<
         (usize, usize, usize),
         (apxinf_core::Tensor, Option<apxinf_core::Tensor>),
