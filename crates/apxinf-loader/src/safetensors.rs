@@ -12,7 +12,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
-use memmap2::Mmap;
 use serde::Deserialize;
 
 use bytemuck;
@@ -203,26 +202,40 @@ fn load_impl(
     path: &Path,
     upcast_bf16: bool,
 ) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
-    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("mmap failed: {e}"))? };
+    use std::os::unix::fs::FileExt;
 
-    if mmap.len() < 8 {
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .len() as usize;
+
+    if file_len < 8 {
         return Err("file too small to be a SafeTensors file".into());
     }
 
-    // Read 8-byte LE header length
-    let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+    // Read the 8-byte LE header length, then the header. The file is read per
+    // tensor instead of mapped: a mapping keeps the whole checkpoint resident
+    // while every tensor is copied to the heap, so the load peaks at roughly
+    // twice the checkpoint size instead of once.
+    let mut length_bytes = [0u8; 8];
+    file.read_exact_at(&mut length_bytes, 0)
+        .map_err(|e| format!("failed to read header length: {e}"))?;
+    let header_len = u64::from_le_bytes(length_bytes) as usize;
 
-    if mmap.len() < 8 + header_len {
+    if file_len < 8 + header_len {
         return Err(format!(
             "file too small: expected at least {} bytes, got {}",
             8 + header_len,
-            mmap.len()
+            file_len
         ));
     }
 
     // Parse JSON header
-    let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact_at(&mut header_bytes, 8)
+        .map_err(|e| format!("failed to read header: {e}"))?;
+    let header_json = std::str::from_utf8(&header_bytes)
         .map_err(|e| format!("invalid UTF-8 in header: {e}"))?;
 
     let raw: HashMap<String, serde_json::Value> =
@@ -258,14 +271,16 @@ fn load_impl(
         let abs_start = data_start + start;
         let abs_end = data_start + end;
 
-        if abs_end > mmap.len() {
+        if abs_end > file_len {
             return Err(format!(
                 "tensor '{name}': data_offsets [{start}, {end}] exceed file size {}",
-                mmap.len()
+                file_len
             ));
         }
 
-        let bytes = mmap[abs_start..abs_end].to_vec();
+        let mut bytes = vec![0u8; abs_end - abs_start];
+        file.read_exact_at(&mut bytes, abs_start as u64)
+            .map_err(|e| format!("failed to read tensor '{name}': {e}"))?;
         let shape = Shape::from(info.shape);
 
         // BF16: upcast to F32 for the legacy path, or keep native for bf16 CUDA.

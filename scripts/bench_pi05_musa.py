@@ -122,6 +122,7 @@ ENV_WATCH = (
     "APXINF_MUSA_BF16_RMS", "APXINF_MUSA_D256_ROUTE",
     "APXINF_MUSA_FA_REPLAY_DIR", "APXINF_MUSA_OUTPUT_FILL",
     "APXINF_MUSA_POISON_ALLOC", "APXINF_MUSA_VENDOR_FMHA_ARCH", "APXINF_MUSA_WORKSPACE_SLACK",
+    "APXINF_MUSA_WORKSPACE_POOL", "APXINF_MUSA_WORKSPACE_REPORT",
     "MUSA_INFLIGHT_SUBMISSION_LIMIT", "MTTX_INJECTION64_PATH",
     # Switches that change what an INT8 run computes or how fast: the
     # equalization table, the load-time exclusion knob, and the two row-level

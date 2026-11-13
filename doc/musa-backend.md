@@ -269,6 +269,18 @@ not speed. The capture's arena is not CUDA's either — a measured INT8 capture
 touches 3.84 GB, so the reservation is the BF16 one rather than the doubled one
 upstream keeps for its INT32 accumulator and verifier.
 
+The arena is pooled and the reservation is a ladder, not a constant.
+`GraphWorkspace` reuses a slice once the last tensor reading it drops
+(cuda-new's generation-tagged lease free list), and `capture_infer_impl` tries
+`required/8` and doubles up to the modeled bound, retrying only on
+`"workspace exhausted"` and capturing on the session that succeeded; the eager
+path runs the same ladder because an eager plan retains its session. On M1000
+(int8_dynamic, 3 views, 10 tokens) the modeled 5.64 GiB becomes a 704.5 MiB
+arena with a 105.0 MiB live peak, and the steady device footprint falls from
+11.1 to 6.0 GiB. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
+allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
+capacity/used/peak/attempts.
+
 FP8 is **not ported**, and the port says so rather than silently degrading: an
 FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 `fp8_static`.

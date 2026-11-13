@@ -179,6 +179,18 @@ const KNOBS: &[Knob] = &[
                kernel overrun",
     },
     Knob {
+        name: "APXINF_MUSA_WORKSPACE_POOL",
+        counterpart: None,
+        note: "=0 restores the monotonic arena allocator; unset or any other value \
+               reuses a slice once the last tensor reading it drops",
+    },
+    Knob {
+        name: "APXINF_MUSA_WORKSPACE_REPORT",
+        counterpart: None,
+        note: "=1 prints the prepared arena's capacity, address high-water, peak live \
+               bytes and ladder attempts; cuda-new has no matching switch",
+    },
+    Knob {
         name: "APXINF_INT8_EQUALIZATION",
         counterpart: None,
         note: "per-channel equalization table applied at INT8 pack time; CUDA's W8A8 \

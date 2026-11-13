@@ -358,30 +358,54 @@ impl Pi05ModelRunner {
         token_ids: DeviceBuffer,
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
-        let session = ExecutionSession::with_capacity(
-            self.model.workspace_requirements(spec.token_count)?.bytes,
-            self.backend.device_id(),
-        )?;
-        let inputs = EagerInputs {
-            patches,
-            raw_images,
-            noise,
-            token_ids,
-            session,
-        };
-        let output = ops::prepare_with_session(&inputs.session, || {
-            eager_traversal(&self.model, spec, &inputs, || {
-                self.model.infer(
-                    &inputs.patches,
-                    &inputs.token_ids,
-                    spec.token_count,
-                    &inputs.noise,
-                )
-            })
-        })?;
-        backend::synchronize(&self.backend)?;
-        drop(output);
-        Ok(inputs)
+        let required = self.model.workspace_requirements(spec.token_count)?.bytes;
+        let capacities = super::prepare::workspace_capacities(required);
+        let mut last_exhaustion = None;
+        for (attempt, &capacity) in capacities.iter().enumerate() {
+            let session = ExecutionSession::with_capacity(capacity, self.backend.device_id())?;
+            // The caller's buffers are driver allocations; clone them so a
+            // failed rung leaves the next attempt whole.
+            let inputs = EagerInputs {
+                patches: patches.clone(),
+                raw_images: raw_images.clone(),
+                noise: noise.clone(),
+                token_ids: token_ids.clone(),
+                session,
+            };
+            let prepared = ops::prepare_with_session(&inputs.session, || {
+                eager_traversal(&self.model, spec, &inputs, || {
+                    self.model.infer(
+                        &inputs.patches,
+                        &inputs.token_ids,
+                        spec.token_count,
+                        &inputs.noise,
+                    )
+                })
+            });
+            let output = match prepared {
+                Ok(output) => output,
+                Err(error) if super::prepare::is_workspace_exhaustion(&error) => {
+                    last_exhaustion = Some(error);
+                    // The failed traversal may still have work in flight; order
+                    // it before releasing the arena it wrote into.
+                    backend::synchronize(&self.backend)?;
+                    drop(inputs);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            backend::synchronize(&self.backend)?;
+            drop(output);
+            super::prepare::report_workspace(&inputs.session, attempt + 1, spec.token_count);
+            return Ok(inputs);
+        }
+        Err(Error::Other(format!(
+            "PI0.5 eager workspace exhausted at {required} bytes after {} attempts: {}",
+            capacities.len(),
+            last_exhaustion
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown error".into())
+        )))
     }
 
     fn build_eager(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
