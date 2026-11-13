@@ -19,6 +19,10 @@ graph lifetime, and the flow schedule.
 | --- | --- |
 | Jetson AGX Thor (SM110) | BF16, calibrated FP8 |
 | Jetson AGX Orin (SM87) | BF16, INT8/W8A8 |
+| MTT M1000 (MP22) | BF16 (preprocessed two-view); FP8/INT8 rejected at load |
+
+Not validated: S5000 (MP31), single-camera input, and sequence lengths other
+than the measured 145-token profile.
 
 `precision="auto"` selects BF16 on both platforms. Unsupported combinations
 fail at load time; they never silently fall back to another precision.
@@ -275,6 +279,16 @@ fallback is acceptable. The timing boundary starts with the preprocessed host
 tensors and ends after action D2H, matching the native CUDA fixed-input
 benchmark.
 
+Library callers default to `prefer-graph`: a capture failure prints a warning
+to stderr and falls back to prepared eager execution. Benchmark entry points
+request `require-graph` explicitly. Setting `APXINF_GR00T_PREPARED_ARENA=0`
+makes the prepared path eager without a warning. The Python policy path uses
+the library default and does not expose an `execution` argument.
+
+Vision attention batching is enabled only for two `[256,256]` grids on MP22;
+single-camera and other grid shapes use the segmented path. No single-camera
+A/B measurement is included.
+
 MUSA fixed-profile plans use a single-active-plan contract per model instance.
 Building a replacement through `infer` or `prepare_for` synchronizes and
 invalidates the previous plan before allocating the replacement arena.
@@ -371,12 +385,12 @@ addition to synchronized inference and action D2H. Official processor work
 and action decoding are excluded. The report records the installed extension
 path, all timing samples, repeatability and optional reference comparisons.
 
-The optimized text paths admit dynamic sequence lengths in
-`128 < sequence_length <= 256`. Shapes outside an exact optimization predicate
-remain on the model-neutral GEMM, attention, normalization, and RoPE fallbacks;
-145 is a measured profile, not a required constant. MUSA-specific assembly
-images are selected inside the backend dispatcher and never by model-layer
-kernel names.
+The kernel predicates cover 129/141/145/255/256 tokens; end-to-end validation
+is limited to the measured 145-token profile. Shapes outside an exact
+optimization predicate remain on the model-neutral GEMM, attention,
+normalization, and RoPE fallbacks; 145 is a measured profile, not a required
+constant. MUSA-specific assembly images are selected inside the backend
+dispatcher and never by model-layer kernel names.
 
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:
@@ -406,7 +420,15 @@ Minimum release gates are:
 - BF16: cosine similarity at least `0.999`, relative L2 at most `0.05`.
 - FP8: cosine similarity at least `0.997`, relative L2 at most `0.10`.
 - INT8: cosine similarity at least `0.995`, relative L2 at most `0.10`.
+- Each precision also requires maximum absolute error at most `0.125`.
+- The reference noise must be supplied and match bit-for-bit
+  (`--reference-noise`, for example the Orin `inputs.npz`);
+  `--allow-missing-noise` is an explicit exemption.
 - Every output must be finite and have the exact expected shape.
+
+The current Orin gold parity on the 145-token fixture is cosine
+`0.9999962154`, relative L2 `0.0027513`, and maximum absolute error
+`0.01953125`.
 
 One-view fixtures are used only for fixed-input numerical accuracy and
 performance; they are never used for LIBERO closed-loop task evaluation. The

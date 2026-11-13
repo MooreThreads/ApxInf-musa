@@ -287,8 +287,9 @@ residual/norm operations, and precomputed text/vision rotary tables are used
 only when their complete shape predicates match; otherwise the existing
 generic device path remains the fallback. The GEMV route is limited to the two
 measured steady-state shapes `(1,1024,132)` and `(1,1536,1024)`. In particular,
-the optimized text interval is
-`128 < sequence_length <= 256`, not an exact 145-token contract.
+the kernel predicates cover 129/141/145/255/256 tokens, while end-to-end
+validation is limited to the 145-token profile. Not validated: S5000 (MP31),
+single-camera input, and other sequence lengths.
 
 Use `scripts/gr00t/bench_apxinf_musa_rust.py` to launch the native Rust benchmark and apply
 the BF16 parity gate. The script does not execute the model in Python. See

@@ -1,7 +1,13 @@
 # GR00T scripts
 
 Run these commands from the repository root. Keep generated results under
-`devlocal/gr00t-port/`; scripts do not automatically run other benchmarks.
+`devlocal/gr00t-n1d7/`; scripts do not automatically run other benchmarks.
+
+The MUSA gates check cosine, relative L2 and `max_abs <= 0.125`, and require
+the reference noise (`--reference-noise`, for example the Orin `inputs.npz`)
+unless `--allow-missing-noise` is explicit. All MUSA paths require warmup >= 1.
+The three GPU lifecycle tests are `#[ignore]`; see
+[doc/gr00t-n1.7.md](../../doc/gr00t-n1.7.md#musa-bf16) for the serial commands.
 
 | Script | Purpose |
 | --- | --- |
@@ -42,6 +48,7 @@ Pass the actual reference explicitly:
 python scripts/gr00t/compare_outputs.py \
   --apxinf path_to/musa_output.json \
   --reference path_to/orin_gold/debug.npz \
+  --reference-noise path_to/orin_gold/inputs.npz \
   --precision bf16 \
   --output path_to/parity.json
 ```
@@ -52,9 +59,9 @@ NPY contains normalized actions directly. JSON requires `output.values` and
 actions to normalized actions, not decoded actions. The checkpoint, backbone,
 processor, input images/prompt/state, embodiment, precision, denoising settings
 and initial noise must match. Verify their provenance separately; this tool
-checks shapes, finite values, numerical gates and noise equality only when
-both archives contain noise. A passing comparison alone does not establish
-matching input provenance.
+checks shapes, finite values, numerical gates and noise equality. Noise is
+required by default; `--allow-missing-noise` is an explicit exemption. A
+passing comparison alone does not establish matching input provenance.
 
 ## Shared numeric formats
 
