@@ -13,12 +13,13 @@ import re
 import subprocess
 import sys
 import hashlib
+from pathlib import Path
 
 sys.dont_write_bytecode = True
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # crates/apxinf-musa
 KERNELS = ROOT / "kernels" / "tilelang"
+PACKAGE = "apxinf_tilelang"
 
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -26,9 +27,8 @@ MUSA_PATH = Path(os.environ.get("MUSA_PATH", "/usr/local/musa-5.1.0"))
 MCC = MUSA_PATH / "bin" / "mcc"
 # 已知 offload arch → __MUSA_ARCH_LIST__ 数值；新架构两处一起加。
 ARCH_NUM = {"mp_22": "220"}
-ROLES = ("part", "reduce")
 # 契约版本：旧 inventory 无 def_hash 字段，首跑自动全量重建。
-GENERATED_BY = "apxinf-tilelang-gen/3"
+GENERATED_BY = "apxinf-tilelang-gen/6"
 
 
 def fnv1a(path: Path) -> str:
@@ -54,6 +54,8 @@ def op_definition_digest(py: Path, op: dict, entries: dict, target: dict) -> str
     """
     payload = b"\x00".join([
         py.read_bytes(),
+        b"".join(path.relative_to(KERNELS).as_posix().encode() + path.read_bytes()
+                 for path in sorted(KERNELS.rglob("*.py"))),
         json.dumps(op, sort_keys=True, ensure_ascii=False).encode(),
         json.dumps(entries, sort_keys=True).encode(),
         Path(__file__).read_bytes(),
@@ -64,8 +66,17 @@ def op_definition_digest(py: Path, op: dict, entries: dict, target: dict) -> str
 
 
 def load_module(py: Path):
-    spec = importlib.util.spec_from_file_location(f"tilelang_kernel_{py.stem}", py)
+    """Load definitions inside a real package, without modifying sys.path."""
+    if PACKAGE not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, KERNELS / "__init__.py", submodule_search_locations=[str(KERNELS)])
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[PACKAGE] = package
+        spec.loader.exec_module(package)
+    name = f"{PACKAGE}.{py.stem}"
+    spec = importlib.util.spec_from_file_location(name, py)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -76,11 +87,17 @@ def tilelang_root() -> Path:
 
 
 def rename_symbols(source: str, entry: str) -> str:
-    """把固定入口符号改成 kTl<N> 唯一入口（Task 1 实验证实的四个替换）。"""
+    """把包装入口与初始化表改成每个阶段独立的静态链接符号。"""
     source = re.sub(r"\bcall\b", entry, source)
     source = re.sub(r"\binit\b", f"{entry}_init", source)
+    source = re.sub(r"\binit_table\b", f"{entry}_init_table", source)
     source = re.sub(r"\bget_last_error\b", f"{entry}_last_error", source)
-    source = re.sub(r"\bkernel_kernel\b", f"{entry}_kernel", source)
+    kernels = sorted(set(re.findall(
+        r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+)\s*\(", source)))
+    if not kernels:
+        raise RuntimeError("generated source has no device kernel declaration")
+    for index, name in enumerate(kernels):
+        source = re.sub(rf"\b{re.escape(name)}\b", f"{entry}_kernel_{index}", source)
     return source
 
 
@@ -130,6 +147,8 @@ def main() -> int:
     mcc = args.mcc if args.mcc is not None else MCC
     ops = []
     for py in sorted(KERNELS.glob("*.py")):
+        if py.name == "__init__.py":
+            continue
         ops.extend((py, dict(op)) for op in load_module(py).OPS
                    if args.arch in op["supported_arches"])
     ops.sort(key=lambda pair: pair[1]["id"])
@@ -152,14 +171,16 @@ def main() -> int:
 
     artifacts = []
     for index, (py, op) in enumerate(ops):
-        entries = {role: f"kTl{index}_{role}" for role in ROLES}
+        roles = tuple(op["stages"])
+        entries = {role: f"kTl{index}_{role}" for role in roles}
 
         # 增量：输入身份不变（定义/参数/入口/生成器）且产物未被篡改才复用旧 .o。
         # 输出指纹（fnv64）只回答「磁盘上的 .o 被动过没有」——编辑 .py 不会
         # 改变它，所以命中必须以输入哈希 def_hash 为准（review 修复）。
+        scratch_bytes = op["scratch_bytes"]
         cached = {}
         def_hash = op_definition_digest(py, op, entries, target_identity)
-        for role in ROLES:
+        for role in roles:
             target = args.out / f"{op['id']}.{role}.o"
             old_op = old.get(op["id"], {})
             if (target.exists()
@@ -167,11 +188,16 @@ def main() -> int:
                     and old_op.get("fnv64", {}).get(role) == fnv1a(target)):
                 cached[role] = {"file": target.name, "digest": old_op["fnv64"][role]}
 
-        if len(cached) != len(ROLES):
+        if len(cached) != len(roles):
             mod = load_module(py)
-            part_obj, reduce_obj = mod.build(op, entries["part"], entries["reduce"])
-            sources = {"part": generated_source(part_obj), "reduce": generated_source(reduce_obj)}
-            for role in ROLES:
+            result = mod.build(op, entries)
+            if result.scratch_bytes != scratch_bytes:
+                raise RuntimeError(f"scratch size mismatch for {op['id']}")
+            if set(result.kernels) != set(roles):
+                raise RuntimeError(f"stage mismatch for {op['id']}")
+            kernels = result.kernels
+            sources = {role: generated_source(kernel) for role, kernel in kernels.items()}
+            for role in roles:
                 if role in cached:
                     continue
                 mu_file = args.out / f"{op['id']}.{role}.mu"
@@ -186,16 +212,16 @@ def main() -> int:
         artifacts.append({
             "id": op["id"], "type": op["type"], "shape": list(op["shape"]),
             "status": op["status"],
-            "scratch_bytes": op["tile"]["splits"] * op["shape"][0] * op["shape"][1] * 4,
+            "scratch_bytes": scratch_bytes,
             "entries": entries,
             "def_hash": def_hash,
-            "files": {role: cached[role]["file"] for role in ROLES},
-            "fnv64": {role: cached[role]["digest"] for role in ROLES},
+            "files": {role: cached[role]["file"] for role in roles},
+            "fnv64": {role: cached[role]["digest"] for role in roles},
         })
 
     seen = set()
     for a in artifacts:
-        key = tuple(a["shape"])
+        key = (a["type"], *a["shape"])
         assert key not in seen, f"duplicate TileLang shape {key}: {a['id']}"
         seen.add(key)
 

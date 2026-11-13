@@ -8,20 +8,23 @@
 
 - 每个算子一个 `.py` 文件，暴露两个名字：
   - `OPS: list[dict]` —— 算子元数据（静态描述）；
-  - `build(op: dict, entry_part: str, entry_reduce: str)` —— 编译入口，返回
-    `(part, reduce)` 两个 tilelang jit 对象。
+  - `build(op: dict, entries: dict[str, str])` —— 编译入口，返回
+    `BuildResult(kernels={stage: jit_object}, scratch_bytes=...)`。
+    `entries` 提供各 stage 的唯一符号；实际改名由 generator 完成。
 - 构建产物位于 `OUT_DIR/tilelang/`，build.rs 显式传入 `--out`；禁止输出到源码目录。
-- `supported_arches` 声明算子的目标架构；当前两个算子仅支持 `mp_22`，其它目标生成空表并使用 native。
+- `supported_arches` 声明算子的目标架构；当前算子仅支持 `mp_22`，其它目标生成空表并使用 native。
 
 ## OPS 字段
 
 | 字段 | 含义 |
 |---|---|
 | `id` | 全局唯一标识（stable，进 inventory.json） |
-| `type` | 算子类型（首期仅 `gemm-splitk-int8`；新类型需扩展 build.rs 的 Rust 侧表结构） |
+| `type` | 算子类型（`gemm-splitk-int8` / `gemm-bf16`；新类型需扩展 Rust dispatch schema） |
 | `shape` | `(m, n, k)`；调度按 `(m, n, k)` 精确匹配 |
 | `tile` | tile 配置（bm/bn/bk/splits），调优结果直接改这里 |
 | `flags` | 传给 tilelang jit 的 `compile_flags`（实测 `-Od3 -O2` 最优） |
+| `stages` | builder 返回的 stage 名称列表（如 `part`、`reduce`、`pack`） |
+| `scratch_bytes` | 运行时 workspace 字节数；generator 校验与 BuildResult 一致 |
 | `status` | `enabled` / `experimental` / `off`——构建期表与运行时策略都用它 |
 
 ## 添加新算子
