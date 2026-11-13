@@ -116,6 +116,12 @@ pub fn load_backbone_config(
 }
 
 fn validate_backbone_config(config: &Gr00tConfig, backbone: &Qwen3VLConfig) -> Result<()> {
+    if !backbone.text.rms_norm_eps.is_finite() || backbone.text.rms_norm_eps <= 0.0 {
+        return Err(Error::Other(format!(
+            "GR00T backbone text.rms_norm_eps must be positive and finite, got {}",
+            backbone.text.rms_norm_eps
+        )));
+    }
     if backbone.text.n_layers < config.select_layer {
         return Err(Error::Other(format!(
             "GR00T selects {} Qwen layers but backbone config contains {}",
@@ -493,5 +499,27 @@ mod tests {
         )]);
         discard_unused_lm_head(&config, &mut tensors).unwrap();
         assert!(tensors.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_positive_backbone_rms_norm_eps() {
+        let config = Gr00tConfig::default();
+        let mut backbone = Qwen3VLConfig::from_json_str(
+            r#"{
+                "text_config": {
+                    "hidden_size": 2,
+                    "vocab_size": 3,
+                    "rope_scaling": {"mrope_section": [1, 1, 1]}
+                }
+            }"#,
+        )
+        .unwrap();
+        for eps in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            backbone.text.rms_norm_eps = eps;
+            let error = validate_backbone_config(&config, &backbone)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("rms_norm_eps"), "{error}");
+        }
     }
 }

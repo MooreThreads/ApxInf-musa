@@ -1,6 +1,6 @@
 //! Normalization operator contracts.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{Result, Tensor};
 
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, tensor_ptr};
@@ -165,6 +165,7 @@ pub fn layer_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "layer_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "layer_norm", "input")?;
     require_vector_bf16(ctx, weight, cols, "layer_norm", "weight")?;
     require_vector_bf16(ctx, bias, cols, "layer_norm", "bias")?;
@@ -258,6 +259,7 @@ pub fn adaptive_rms_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "adaptive_rms_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "adaptive_rms_norm", "input")?;
     require_vector_at_least_bf16(ctx, style, 2 * cols, "adaptive_rms_norm", "style")?;
     require_output_matrix(ctx, output, rows, cols, "adaptive_rms_norm", "normalized")?;
@@ -436,11 +438,7 @@ pub fn adaptive_layer(
         "adaptive LayerNorm",
         "modulation",
     )?;
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(Error::Other(
-            "MUSA adaptive LayerNorm needs positive finite epsilon".into(),
-        ));
-    }
+    require_positive_eps(eps, "adaptive LayerNorm")?;
     let output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
     #[cfg(apxinf_musa_available)]
     {

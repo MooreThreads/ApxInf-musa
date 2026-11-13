@@ -220,7 +220,7 @@ extern "C" musaError_t apxinf_musa_ada_gate_residual_rms_norm_bf16(
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || gate_style == nullptr ||
       norm_style == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -288,7 +288,7 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16_scalar(
     const void* input, const void* weight, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   rms_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
@@ -302,7 +302,7 @@ extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
     const void* input, const void* style, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || style == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -427,7 +427,8 @@ extern "C" musaError_t apxinf_musa_bias_residual_rms_norm_bf16(
     const void* weight, void* hidden, void* normalized, int rows, int cols,
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || weight == nullptr ||
-      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0) {
+      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0 ||
+      !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[522, 2048]` -- the recorded shape -- fits the register-cached kernel
@@ -806,7 +807,7 @@ extern "C" musaError_t apxinf_musa_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || bias == nullptr ||
-      output == nullptr || rows <= 0 || cols <= 0) {
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[512, 1152]` -- the vision tower's width -- is `32 * 4 * 9`, so one warp
@@ -853,7 +854,7 @@ extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
     void* normalized, int rows, int cols, float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
       norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   if (cols == 1024) {
