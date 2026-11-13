@@ -29,6 +29,7 @@ use apxinf_core::{Error, Graph, Result};
 
 use crate::context::MusaContext;
 use crate::ffi;
+use crate::stream::MusaStream;
 use crate::workspace;
 
 /// A captured traversal, with the prepared resources it used kept alive.
@@ -37,6 +38,7 @@ pub struct CapturedGraph {
     graph: *mut c_void,
     context: Arc<MusaContext>,
     _resources: Vec<Rc<dyn Any>>,
+    _capture_stream: Option<MusaStream>,
 }
 
 impl Graph for CapturedGraph {
@@ -189,7 +191,116 @@ pub fn capture(
         graph,
         context,
         _resources: retained,
+        _capture_stream: None,
     })
+}
+
+/// Warm and capture one traversal on a dedicated ordinary stream.
+///
+/// Some large MUSA graphs replay materially faster when they are recorded on
+/// an isolated stream and launched on the context's normal stream. The caller
+/// must still prepare its workspace/shape ledger first; this function repeats
+/// the traversal once on the isolated stream so stream-keyed vendor handles are
+/// created before recording. The existing [`capture`] contract remains
+/// unchanged for models qualified on the context stream.
+pub fn capture_isolated<T>(
+    context: Arc<MusaContext>,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<(CapturedGraph, T)> {
+    if workspace::is_capturing() {
+        return Err(Error::Other(
+            "nested MUSA graph capture is not supported".into(),
+        ));
+    }
+    context.synchronize()?;
+    let device = context.device_id();
+    unsafe { ffi::check_runtime(ffi::musa::musaSetDevice(device as i32)) }.map_err(Error::Other)?;
+    let stream = MusaStream::new()?;
+    let captured = context.stream().with_override(&stream, || {
+        unsafe { ffi::check_runtime(ffi::custom::apxinf_musa_capture_anchor(stream.handle())) }
+            .map_err(Error::Other)?;
+        let warm = operation()?;
+        stream.synchronize()?;
+        drop(warm);
+
+        unsafe { ffi::check_runtime(ffi::custom::apxinf_musa_capture_anchor(stream.handle())) }
+            .map_err(Error::Other)?;
+        unsafe {
+            ffi::check_runtime(ffi::musa::musaStreamBeginCapture(
+                stream.handle(),
+                ffi::musa::capture_mode::THREAD_LOCAL,
+            ))
+        }
+        .map_err(Error::Other)?;
+        workspace::begin_capture_retention();
+
+        let operation_result = catch_unwind(AssertUnwindSafe(&mut operation));
+        let mut graph = std::ptr::null_mut();
+        let closed = ffi::check_runtime(unsafe {
+            ffi::musa::musaStreamEndCapture(stream.handle(), &mut graph)
+        });
+        let retained = workspace::end_capture_retention();
+
+        let output = match operation_result {
+            Ok(result) => result,
+            Err(payload) => {
+                if !graph.is_null() {
+                    unsafe {
+                        let _ = ffi::musa::musaGraphDestroy(graph);
+                    }
+                }
+                resume_unwind(payload)
+            }
+        };
+        let failure = match (&output, &closed) {
+            (Ok(_), Ok(())) => None,
+            (Ok(_), Err(capture)) => Some(format!("MUSA stream capture failed: {capture}")),
+            (Err(operator), Ok(())) => Some(operator.to_string()),
+            (Err(operator), Err(capture)) => Some(format!(
+                "{operator} (and the isolated stream then failed to leave capture: {capture})"
+            )),
+        };
+        if let Some(failure) = failure {
+            if !graph.is_null() {
+                unsafe {
+                    let _ = ffi::musa::musaGraphDestroy(graph);
+                }
+            }
+            return Err(Error::Other(failure));
+        }
+        let output = output.expect("capture failures returned above");
+        let mut executable = std::ptr::null_mut();
+        if let Err(error) = unsafe {
+            ffi::check_runtime(ffi::musa::musaGraphInstantiate(&mut executable, graph, 0))
+        } {
+            unsafe {
+                let _ = ffi::musa::musaGraphDestroy(graph);
+            }
+            return Err(Error::Other(error));
+        }
+        Ok((graph, executable, retained, output))
+    });
+
+    let (graph, executable, retained, output) = match captured {
+        Ok(value) => value,
+        Err(error) => {
+            drop(stream);
+            unsafe {
+                let _ = ffi::musa::musaGetLastError();
+            }
+            return Err(error);
+        }
+    };
+    Ok((
+        CapturedGraph {
+            executable,
+            graph,
+            context,
+            _resources: retained,
+            _capture_stream: Some(stream),
+        },
+        output,
+    ))
 }
 
 #[cfg(all(test, apxinf_musa_available))]

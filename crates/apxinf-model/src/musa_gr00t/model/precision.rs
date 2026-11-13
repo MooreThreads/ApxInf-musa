@@ -1,0 +1,124 @@
+//! Native-BF16 GR00T layer composition.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use apxinf_core::Result;
+
+use super::action_weights::Gr00tLinearWeights;
+use super::backbone::{Qwen3VLConfig, Qwen3VLTextWeights, Qwen3VLVisionWeights};
+use super::backend::RuntimeBackend;
+use super::bf16_weights::Gr00tBf16LinearWeights;
+use super::executor::{Gr00tExecutor, Gr00tPrecisionExecution};
+use super::weights::Gr00tWeights;
+use super::Gr00tConfig;
+
+pub(crate) struct Gr00tBf16Execution;
+
+impl Gr00tPrecisionExecution for Gr00tBf16Execution {
+    type Dense = Gr00tBf16LinearWeights;
+    type FeedForward = Gr00tBf16LinearWeights;
+    type FusedQkv = Gr00tBf16LinearWeights;
+    type Backbone = Gr00tBf16LinearWeights;
+
+    const NAME: &'static str = "bf16";
+    const SUPPORTS_CALIBRATION: bool = true;
+    const USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM: bool = true;
+    const USE_BIAS_RESIDUAL_LAYER_NORM: bool = true;
+    const USE_CACHED_VISION_RESIDUAL_LAYER_NORM: bool = true;
+    const USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM: bool = true;
+    const USE_PRECOMPUTED_BF16_VISION_ROPE: bool = true;
+    const USE_FUSED_QK_RMS_MROPE: bool = true;
+    const USE_BATCHED_VISION_ATTENTION: bool = true;
+    const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> =
+        Some("APXINF_GR00T_BF16_LEGACY_QK_RMS_MROPE");
+
+    fn transfer_dense(
+        &self,
+        weights: Gr00tLinearWeights,
+        name: &str,
+        backend: &RuntimeBackend,
+    ) -> Result<Self::Dense> {
+        Gr00tBf16LinearWeights::from_host(weights, name, backend)
+    }
+
+    fn transfer_feed_forward(
+        &self,
+        weights: Gr00tLinearWeights,
+        name: &str,
+        backend: &RuntimeBackend,
+    ) -> Result<Self::FeedForward> {
+        Gr00tBf16LinearWeights::from_host(weights, name, backend)
+    }
+
+    fn transfer_fused_qkv(
+        &self,
+        weights: Gr00tLinearWeights,
+        name: &str,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Self::FusedQkv>> {
+        Ok(Some(Gr00tBf16LinearWeights::from_host(
+            weights, name, backend,
+        )?))
+    }
+
+    fn transfer_backbone_linears(
+        &self,
+        _text: &Qwen3VLTextWeights,
+        _vision: &Qwen3VLVisionWeights,
+        _backend: &RuntimeBackend,
+    ) -> Result<BTreeMap<String, Self::Backbone>> {
+        Ok(BTreeMap::new())
+    }
+}
+
+pub(crate) type Gr00tBf16Executor = Gr00tExecutor<Gr00tBf16Execution>;
+
+pub(crate) fn build(
+    config: Gr00tConfig,
+    backbone: Qwen3VLConfig,
+    weights: Gr00tWeights,
+    backend: Arc<RuntimeBackend>,
+) -> Result<Gr00tBf16Executor> {
+    Gr00tExecutor::from_backend(config, backbone, weights, Gr00tBf16Execution, backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bf16_enables_batched_vision_attention() {
+        assert!(Gr00tBf16Execution::USE_BATCHED_VISION_ATTENTION);
+    }
+
+    #[test]
+    fn bf16_enables_qk_rms_mrope_fusion() {
+        assert!(Gr00tBf16Execution::USE_FUSED_QK_RMS_MROPE);
+    }
+
+    #[test]
+    fn bf16_enables_precomputed_vision_rope() {
+        assert!(Gr00tBf16Execution::USE_PRECOMPUTED_BF16_VISION_ROPE);
+    }
+
+    #[test]
+    fn bf16_enables_vision_mlp_residual_norm_fusion() {
+        assert!(Gr00tBf16Execution::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM);
+    }
+
+    #[test]
+    fn bf16_explicitly_opts_into_packed8_bias_activation() {
+        assert_eq!(Gr00tBf16Execution::USE_PACKED8_BF16_BIAS_ACTIVATION, false);
+    }
+
+    #[test]
+    fn bf16_enables_bias_residual_adaptive_layer_norm() {
+        assert!(Gr00tBf16Execution::USE_BIAS_RESIDUAL_ADAPTIVE_LAYER_NORM);
+    }
+
+    #[test]
+    fn bf16_enables_bias_residual_layer_norm() {
+        assert!(Gr00tBf16Execution::USE_BIAS_RESIDUAL_LAYER_NORM);
+    }
+}

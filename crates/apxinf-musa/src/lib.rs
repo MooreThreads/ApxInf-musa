@@ -38,7 +38,7 @@ mod workspace;
 pub use buffer::{MusaBuffer, MusaDeviceAddress};
 pub use context::{MusaLibraryVersions, MusaContext};
 pub use device_caps::{MusaArchFamily, MusaDeviceCaps};
-pub use graph::{capture, CapturedGraph};
+pub use graph::{capture, capture_isolated, CapturedGraph};
 pub use stream::MusaStream;
 pub use workspace::{ExecutionSession, GraphWorkspace, OperationShape};
 

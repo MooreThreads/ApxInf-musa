@@ -13,12 +13,19 @@
 //
 // The activation codes are the CUDA kernel ABI's, so a diagnosable name never
 // has to be renumbered across backends: 0 none, 1 GELU (tanh approximation),
-// 2 SiLU.
+// 2 SiLU, 3 ReLU.
+
+enum class Activation : int {
+  None = 0,
+  Gelu = 1,
+  Silu = 2,
+  Relu = 3,
+};
 
 __global__ void bias_activation_bf16_kernel(const __mt_bfloat16* input,
                                             const __mt_bfloat16* bias,
                                             __mt_bfloat16* output, int rows,
-                                            int cols, int activation) {
+                                            int cols, Activation activation) {
   // Rows on `gridDim.y` and column chunks on `gridDim.x`, so the column is an
   // offset from the block's own base and never a remainder. The flat
   // grid-stride form this replaced took `index % cols` per element, and on
@@ -35,10 +42,25 @@ __global__ void bias_activation_bf16_kernel(const __mt_bfloat16* input,
          col += stride) {
       float value = __bfloat162float(input[base + col]);
       if (bias != nullptr) value += __bfloat162float(bias[col]);
-      if (activation == 1) value = gelu_tanh(value);
-      if (activation == 2) value = value / (1.0f + expf(-value));
+      if (activation == Activation::Gelu) value = gelu_tanh(value);
+      if (activation == Activation::Silu) value = value / (1.0f + expf(-value));
+      if (activation == Activation::Relu) value = fmaxf(value, 0.0f);
       output[base + col] = __float2bfloat16(value);
     }
+  }
+}
+
+// Qwen gated MLP epilogue: `silu(gate) * up`, with one BF16 output rounding.
+__global__ void silu_mul_bf16_kernel(const __mt_bfloat16* gate,
+                                     const __mt_bfloat16* up,
+                                     __mt_bfloat16* output, int64_t count) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < count; index += stride) {
+    const float gate_value = __bfloat162float(gate[index]);
+    const float up_value = __bfloat162float(up[index]);
+    const float silu = gate_value / (1.0f + expf(-gate_value));
+    output[index] = __float2bfloat16(silu * up_value);
   }
 }
 
@@ -63,11 +85,13 @@ union __align__(16) ActivationPacked8 {
 //
 // The arithmetic and the single BF16 rounding are unchanged, so this is
 // bit-identical to the scalar form.
-template <int ACTIVATION, bool HAS_BIAS>
+template <Activation ACTIVATION, bool HAS_BIAS>
 __global__ void bias_activation_bf16_vector8_kernel(
     const __mt_bfloat16* input, const __mt_bfloat16* bias,
     __mt_bfloat16* output, int rows, int cols) {
-  static_assert(ACTIVATION >= 0 && ACTIVATION <= 2, "unknown activation code");
+  static_assert(ACTIVATION == Activation::None || ACTIVATION == Activation::Gelu ||
+                    ACTIVATION == Activation::Silu || ACTIVATION == Activation::Relu,
+                "unknown activation code");
   const int width = cols / 8;
   const int stride = blockDim.x * gridDim.x;
   for (int row = blockIdx.y; row < rows; row += gridDim.y) {
@@ -84,12 +108,26 @@ __global__ void bias_activation_bf16_vector8_kernel(
       for (int i = 0; i < 8; ++i) {
         float value = __bfloat162float(input_raw.lanes[i]);
         if (HAS_BIAS) value += __bfloat162float(bias_raw.lanes[i]);
-        if (ACTIVATION == 1) value = gelu_tanh(value);
-        if (ACTIVATION == 2) value = value / (1.0f + expf(-value));
+        if (ACTIVATION == Activation::Gelu) value = gelu_tanh(value);
+        if (ACTIVATION == Activation::Silu) value = value / (1.0f + expf(-value));
+        if (ACTIVATION == Activation::Relu) value = fmaxf(value, 0.0f);
         output_raw.lanes[i] = __float2bfloat16(value);
       }
       *reinterpret_cast<uint4*>(output + base + column) = output_raw.bits;
     }
+  }
+}
+
+// Plain SiLU used where Qwen applies the activation before a separately
+// expressed multiply.  Keep the f32 activation and single BF16 output rounding
+// of both Torch eager and the CUDA backend.
+__global__ void silu_bf16_kernel(const __mt_bfloat16* input,
+                                 __mt_bfloat16* output, int64_t count) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < count; index += stride) {
+    const float value = __bfloat162float(input[index]);
+    output[index] = __float2bfloat16(value / (1.0f + expf(-value)));
   }
 }
 

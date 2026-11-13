@@ -5,8 +5,13 @@ use apxinf_core::{DType, Error, Result, Tensor};
 pub use super::attention::QkvTensors;
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
-use super::contracts::{bf16_tensor, require_optional_vector_bf16, require_output_tensor};
+use super::contracts::{
+    bf16_tensor, require_optional_vector_bf16, require_output_tensor, require_positive_eps,
+    require_vector_bf16,
+};
+use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
+use crate::error::musa_error;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
 #[cfg(apxinf_musa_available)]
@@ -376,6 +381,409 @@ pub fn apply_q_write_kv_f16(
         kv_output_offset,
     );
     Err(not_ported("rope::apply_q_write_kv_f16"))
+}
+
+pub fn apply_mrope(
+    ctx: &MusaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &MusaBuffer,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if input.dtype() != DType::BF16
+        || input.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || dims != [dims.first().copied().unwrap_or(0), n_heads, head_dim]
+        || dims.first().copied().unwrap_or(0) == 0
+        || head_dim % 2 != 0
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(Error::Other("MUSA mRoPE shape or scalar mismatch".into()));
+    }
+    let tokens = dims[0];
+    if pos_ids.device() != ctx.device_id() || pos_ids.len() < tokens * 3 * 4 {
+        return Err(Error::Other(
+            "MUSA mRoPE position buffer is too small".into(),
+        ));
+    }
+    let output = bf16_tensor(ctx, dims)?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("mRoPE", "tokens", tokens)?;
+        let n_heads = checked_i32("mRoPE", "heads", n_heads)?;
+        let head_dim = checked_i32("mRoPE", "head_dim", head_dim)?;
+        let section_t = checked_i32("mRoPE", "section_t", sections[0])?;
+        let section_h = checked_i32("mRoPE", "section_h", sections[1])?;
+        let section_w = checked_i32("mRoPE", "section_w", sections[2])?;
+        // SAFETY: validation established matching BF16 input/output shapes and
+        // a device-resident `[tokens, 3]` uint32 position buffer. All buffers
+        // outlive the asynchronous launch on `ctx.stream()`.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_mrope_bf16(
+                    tensor_ptr(input)?,
+                    pos_ids.ptr() as *const u32,
+                    tensor_ptr(&output)?,
+                    tokens,
+                    n_heads,
+                    head_dim,
+                    section_t,
+                    section_h,
+                    section_w,
+                    theta,
+                    ctx.stream().handle(),
+                ),
+                "mRoPE",
+            )?;
+        }
+        return Ok(output);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(native_unavailable("rope::apply_mrope"))
+}
+
+pub fn apply_vision_2d(
+    ctx: &MusaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &MusaBuffer,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if input.dtype() != DType::BF16
+        || input.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || dims.len() != 3
+        || dims[0] == 0
+        || dims[1..] != [n_heads, head_dim]
+        || head_dim % 4 != 0
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(Error::Other(
+            "MUSA vision 2D RoPE shape or scalar mismatch".into(),
+        ));
+    }
+    let tokens = dims[0];
+    if pos_ids.device() != ctx.device_id() || pos_ids.len() < tokens * 2 * 4 {
+        return Err(Error::Other(
+            "MUSA vision 2D RoPE position buffer is too small".into(),
+        ));
+    }
+    let output = bf16_tensor(ctx, dims)?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("vision 2D RoPE", "tokens", tokens)?;
+        let n_heads = checked_i32("vision 2D RoPE", "heads", n_heads)?;
+        let head_dim = checked_i32("vision 2D RoPE", "head_dim", head_dim)?;
+        // SAFETY: the validation above established a BF16 input/output with
+        // matching `[tokens, heads, head_dim]` shapes and a device-resident
+        // `[tokens, 2]` uint32 position buffer on this context's device. All
+        // tensors outlive the asynchronous launch on `ctx.stream()`.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_vision_2d_rope_bf16(
+                    tensor_ptr(input)?,
+                    pos_ids.ptr() as *const u32,
+                    tensor_ptr(&output)?,
+                    tokens,
+                    n_heads,
+                    head_dim,
+                    theta,
+                    ctx.stream().handle(),
+                ),
+                "vision 2D RoPE",
+            )?;
+        }
+        return Ok(output);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(native_unavailable("rope::apply_vision_2d"))
+}
+
+pub fn prepare_vision_2d_rotation_table(
+    ctx: &MusaContext,
+    tokens: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &MusaBuffer,
+) -> Result<MusaBuffer> {
+    let required_position_bytes = tokens
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("MUSA vision position size overflow".into()))?;
+    if tokens == 0
+        || head_dim == 0
+        || head_dim % 4 != 0
+        || !theta.is_finite()
+        || theta <= 0.0
+        || pos_ids.device() != ctx.device_id()
+        || pos_ids.len() < required_position_bytes
+    {
+        return Err(Error::Other(
+            "MUSA vision rotation table shape, scalar or position buffer mismatch".into(),
+        ));
+    }
+    let bytes = tokens
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("MUSA vision rotation table size overflow".into()))?;
+    let table = MusaBuffer::alloc(bytes, ctx.device_id()).map_err(musa_error)?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("vision rotation table", "tokens", tokens)?;
+        let head_dim = checked_i32("vision rotation table", "head_dim", head_dim)?;
+        // SAFETY: validation establishes a device `[tokens,2]` u32 buffer and
+        // an allocation covering `[tokens,head_dim/2,2]` f32 values.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_build_vision_rotation_table_f32(
+                    pos_ids.address().ptr() as *const u32,
+                    table.address().ptr(),
+                    tokens,
+                    head_dim,
+                    theta,
+                    ctx.stream().handle(),
+                ),
+                "vision rotation table",
+            )?;
+        }
+        return Ok(table);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = table;
+        Err(native_unavailable("rope::prepare_vision_2d_rotation_table"))
+    }
+}
+
+pub fn split_qkv_bias_apply_vision_2d_precomputed(
+    ctx: &MusaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    heads: usize,
+    head_dim: usize,
+    rotation_table: &MusaBuffer,
+) -> Result<QkvTensors> {
+    let tokens = require_packed_qkv(ctx, qkv, Some(bias), heads, heads, head_dim)?;
+    let required_rotation_bytes = tokens
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("MUSA vision rotation table size overflow".into()))?;
+    if rotation_table.device() != ctx.device_id() || rotation_table.len() < required_rotation_bytes
+    {
+        return Err(Error::Other(format!(
+            "MUSA fused vision QKV/RoPE needs {required_rotation_bytes} rotation bytes on MUSA{}, got {} bytes on MUSA{}",
+            ctx.device_id(),
+            rotation_table.len(),
+            rotation_table.device()
+        )));
+    }
+    let q = bf16_tensor(ctx, &[tokens, heads, head_dim])?;
+    let k = bf16_tensor(ctx, &[tokens, heads, head_dim])?;
+    let v = bf16_tensor(ctx, &[tokens, heads, head_dim])?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("fused vision QKV/RoPE", "tokens", tokens)?;
+        let heads = checked_i32("fused vision QKV/RoPE", "heads", heads)?;
+        let head_dim = checked_i32("fused vision QKV/RoPE", "head_dim", head_dim)?;
+        // SAFETY: the packed projection and bias were validated above; q/k/v
+        // are fresh outputs and the f32 table covers every token/pair read.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_qkv_split_bias_vision_rope_precomputed_bf16(
+                    tensor_ptr(qkv)?,
+                    tensor_ptr(bias)?,
+                    tensor_ptr(&q)?,
+                    tensor_ptr(&k)?,
+                    tensor_ptr(&v)?,
+                    rotation_table.address().ptr(),
+                    tokens,
+                    heads,
+                    head_dim,
+                    ctx.stream().handle(),
+                ),
+                "fused vision QKV/RoPE",
+            )?;
+        }
+        return Ok(QkvTensors { q, k, v });
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (q, k, v);
+        Err(native_unavailable(
+            "rope::split_qkv_bias_apply_vision_2d_precomputed",
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_mrope_rotation_table(
+    ctx: &MusaContext,
+    tokens: usize,
+    capacity_tokens: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &MusaBuffer,
+) -> Result<MusaBuffer> {
+    let required_position_bytes = tokens
+        .checked_mul(3)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("MUSA text mRoPE position size overflow".into()))?;
+    if tokens == 0
+        || tokens > capacity_tokens
+        || head_dim == 0
+        || head_dim % 2 != 0
+        || !theta.is_finite()
+        || theta <= 0.0
+        || pos_ids.device() != ctx.device_id()
+        || pos_ids.len() < required_position_bytes
+    {
+        return Err(Error::Other(
+            "MUSA text mRoPE rotation table shape, scalar or position buffer mismatch".into(),
+        ));
+    }
+    let bytes = capacity_tokens
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("MUSA text mRoPE rotation table size overflow".into()))?;
+    let table = MusaBuffer::alloc(bytes, ctx.device_id()).map_err(musa_error)?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("text mRoPE rotation table", "tokens", tokens)?;
+        let head_dim = checked_i32("text mRoPE rotation table", "head_dim", head_dim)?;
+        let section_t = checked_i32("text mRoPE rotation table", "section_t", sections[0])?;
+        let section_h = checked_i32("text mRoPE rotation table", "section_h", sections[1])?;
+        let section_w = checked_i32("text mRoPE rotation table", "section_w", sections[2])?;
+        // SAFETY: validation establishes a device `[tokens, 3]` u32 buffer and
+        // a table with capacity for every active token/pair.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_build_mrope_rotation_table_f32(
+                    pos_ids.address().ptr() as *const u32,
+                    table.address().ptr(),
+                    tokens,
+                    head_dim,
+                    section_t,
+                    section_h,
+                    section_w,
+                    theta,
+                    ctx.stream().handle(),
+                ),
+                "text mRoPE rotation table",
+            )?;
+        }
+        return Ok(table);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (table, sections);
+        Err(native_unavailable("rope::prepare_mrope_rotation_table"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_apply_mrope_qk_precomputed(
+    ctx: &MusaContext,
+    query: &Tensor,
+    query_weight: &Tensor,
+    key: &Tensor,
+    key_weight: &Tensor,
+    seq_len: usize,
+    query_heads: usize,
+    key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    rotation_table: &MusaBuffer,
+    block_threads: u32,
+) -> Result<(Tensor, Tensor)> {
+    require_positive_eps(eps, "fused Q/K RMSNorm+mRoPE")?;
+    let query_dims = query.shape().dims();
+    let key_dims = key.shape().dims();
+    let query_rows = seq_len
+        .checked_mul(query_heads)
+        .ok_or_else(|| Error::Other("MUSA fused Q/K mRoPE query size overflow".into()))?;
+    let key_rows = seq_len
+        .checked_mul(key_heads)
+        .ok_or_else(|| Error::Other("MUSA fused Q/K mRoPE key size overflow".into()))?;
+    if query.dtype() != DType::BF16
+        || key.dtype() != DType::BF16
+        || query.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || key.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || query_dims != [query_rows, head_dim]
+        || key_dims != [key_rows, head_dim]
+        || seq_len == 0
+        || head_dim != 128
+        || block_threads != 128
+    {
+        return Err(Error::Other(
+            "MUSA fused Q/K RMSNorm+mRoPE shape or scalar mismatch".into(),
+        ));
+    }
+    require_vector_bf16(
+        ctx,
+        query_weight,
+        head_dim,
+        "fused Q/K mRoPE",
+        "query weight",
+    )?;
+    require_vector_bf16(ctx, key_weight, head_dim, "fused Q/K mRoPE", "key weight")?;
+    let required_rotation_bytes = seq_len
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("MUSA text mRoPE rotation table size overflow".into()))?;
+    if rotation_table.device() != ctx.device_id() || rotation_table.len() < required_rotation_bytes
+    {
+        return Err(Error::Other(
+            "MUSA fused Q/K RMSNorm+mRoPE rotation table is too small".into(),
+        ));
+    }
+    let query_output = bf16_tensor(ctx, &[seq_len, query_heads, head_dim])?;
+    let key_output = bf16_tensor(ctx, &[seq_len, key_heads, head_dim])?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let tokens = checked_i32("fused Q/K mRoPE", "tokens", seq_len)?;
+        let query_heads = checked_i32("fused Q/K mRoPE", "query_heads", query_heads)?;
+        let key_heads = checked_i32("fused Q/K mRoPE", "key_heads", key_heads)?;
+        let head_dim = checked_i32("fused Q/K mRoPE", "head_dim", head_dim)?;
+        let block_threads =
+            checked_i32("fused Q/K mRoPE", "block_threads", block_threads as usize)?;
+        // SAFETY: all BF16 inputs and outputs, weight vectors and the prepared
+        // FP32 table were validated on this context and outlive the launch.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
+                    tensor_ptr(query)?,
+                    tensor_ptr(query_weight)?,
+                    tensor_ptr(&query_output)?,
+                    tensor_ptr(key)?,
+                    tensor_ptr(key_weight)?,
+                    tensor_ptr(&key_output)?,
+                    rotation_table.address().ptr(),
+                    tokens,
+                    query_heads,
+                    key_heads,
+                    head_dim,
+                    eps,
+                    block_threads,
+                    ctx.stream().handle(),
+                ),
+                "fused Q/K RMSNorm+mRoPE",
+            )?;
+        }
+        return Ok((query_output, key_output));
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (query_output, key_output);
+        Err(native_unavailable(
+            "rope::rms_norm_apply_mrope_qk_precomputed",
+        ))
+    }
 }
 
 #[cfg(all(test, apxinf_musa_available))]

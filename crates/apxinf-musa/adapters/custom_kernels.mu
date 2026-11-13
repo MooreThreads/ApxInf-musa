@@ -128,7 +128,9 @@ extern "C" musaError_t apxinf_musa_bias_activation_bf16(
   if (input == nullptr || output == nullptr || rows <= 0 || cols <= 0) {
     return musaErrorInvalidValue;
   }
-  if (activation != 0 && activation != 1 && activation != 2) {
+  const auto kind = static_cast<Activation>(activation);
+  if (kind != Activation::None && kind != Activation::Gelu &&
+      kind != Activation::Silu && kind != Activation::Relu) {
     // Reported rather than silently treated as "none": an unknown code reaching
     // here means the safe facade and this ABI disagree about the enum, and
     // computing the identity would look like a successful run.
@@ -144,29 +146,35 @@ extern "C" musaError_t apxinf_musa_bias_activation_bf16(
     const auto* wide_in = static_cast<const __mt_bfloat16*>(input);
     const auto* wide_bias = static_cast<const __mt_bfloat16*>(bias);
     auto* wide_out = static_cast<__mt_bfloat16*>(output);
-    // `activation` is one of three validated codes, and the bias is a
-    // compile-time branch, so the two together are six instantiations of a
+    // `activation` is one of four validated codes, and the bias is a
+    // compile-time branch, so the two together are eight instantiations of a
     // kernel whose element loop is otherwise branch-free.
     if (bias == nullptr) {
-      if (activation == 0) {
-        bias_activation_bf16_vector8_kernel<0, false>
+      if (kind == Activation::None) {
+        bias_activation_bf16_vector8_kernel<Activation::None, false>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
-      } else if (activation == 1) {
-        bias_activation_bf16_vector8_kernel<1, false>
+      } else if (kind == Activation::Gelu) {
+        bias_activation_bf16_vector8_kernel<Activation::Gelu, false>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
+      } else if (kind == Activation::Silu) {
+        bias_activation_bf16_vector8_kernel<Activation::Silu, false>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
       } else {
-        bias_activation_bf16_vector8_kernel<2, false>
+        bias_activation_bf16_vector8_kernel<Activation::Relu, false>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
       }
     } else {
-      if (activation == 0) {
-        bias_activation_bf16_vector8_kernel<0, true>
+      if (kind == Activation::None) {
+        bias_activation_bf16_vector8_kernel<Activation::None, true>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
-      } else if (activation == 1) {
-        bias_activation_bf16_vector8_kernel<1, true>
+      } else if (kind == Activation::Gelu) {
+        bias_activation_bf16_vector8_kernel<Activation::Gelu, true>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
+      } else if (kind == Activation::Silu) {
+        bias_activation_bf16_vector8_kernel<Activation::Silu, true>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
       } else {
-        bias_activation_bf16_vector8_kernel<2, true>
+        bias_activation_bf16_vector8_kernel<Activation::Relu, true>
             <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows, cols);
       }
     }
@@ -175,7 +183,31 @@ extern "C" musaError_t apxinf_musa_bias_activation_bf16(
   bias_activation_bf16_kernel<<<row_grid(rows, cols), kThreads, 0, stream>>>(
       static_cast<const __mt_bfloat16*>(input),
       static_cast<const __mt_bfloat16*>(bias),
-      static_cast<__mt_bfloat16*>(output), rows, cols, activation);
+      static_cast<__mt_bfloat16*>(output), rows, cols, kind);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_silu_mul_bf16(
+    const void* gate, const void* up, void* output, int64_t count,
+    musaStream_t stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr || count <= 0) {
+    return musaErrorInvalidValue;
+  }
+  silu_mul_bf16_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(gate),
+      static_cast<const __mt_bfloat16*>(up),
+      static_cast<__mt_bfloat16*>(output), count);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_silu_bf16(
+    const void* input, void* output, int64_t count, musaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0) {
+    return musaErrorInvalidValue;
+  }
+  silu_bf16_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<__mt_bfloat16*>(output), count);
   return musaGetLastError();
 }
 
@@ -188,7 +220,7 @@ extern "C" musaError_t apxinf_musa_ada_gate_residual_rms_norm_bf16(
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || gate_style == nullptr ||
       norm_style == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -225,7 +257,7 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16(
     const void* input, const void* weight, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   const auto* in = static_cast<const __mt_bfloat16*>(input);
@@ -256,7 +288,7 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16_scalar(
     const void* input, const void* weight, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   rms_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
@@ -270,7 +302,7 @@ extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
     const void* input, const void* style, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || style == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -331,12 +363,72 @@ extern "C" musaError_t apxinf_musa_bias_residual_bf16(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_bias_then_residual_bf16(
+    const void* projection, const void* bias, const void* residual,
+    void* output, int rows, int cols, musaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  bias_then_residual_bf16_kernel<<<row_grid(rows, cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(projection),
+      static_cast<const __mt_bfloat16*>(bias),
+      static_cast<const __mt_bfloat16*>(residual),
+      static_cast<__mt_bfloat16*>(output), rows, cols);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t
+apxinf_musa_bias_then_residual_adaptive_layer_norm_bf16(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* modulation, void* hidden,
+    void* normalized, int rows, int cols, float eps, musaStream_t stream) {
+  if (projection == nullptr || projection_bias == nullptr ||
+      residual == nullptr || modulation == nullptr || hidden == nullptr ||
+      normalized == nullptr || rows != 41 || cols != 1536 || !(eps > 0.0f)) {
+    return musaErrorInvalidValue;
+  }
+  bias_then_residual_adaptive_layer_norm_bf16_cached_1536_kernel
+      <<<rows, kThreads, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(projection),
+          static_cast<const __mt_bfloat16*>(projection_bias),
+          static_cast<const __mt_bfloat16*>(residual),
+          static_cast<const __mt_bfloat16*>(modulation),
+          static_cast<__mt_bfloat16*>(hidden),
+          static_cast<__mt_bfloat16*>(normalized), rows, eps);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_bias_then_residual_layer_norm_bf16(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    musaStream_t stream) {
+  if (projection == nullptr || projection_bias == nullptr ||
+      residual == nullptr || norm_weight == nullptr || norm_bias == nullptr ||
+      hidden == nullptr || normalized == nullptr || rows != 41 ||
+      cols != 1536 || !(eps > 0.0f)) {
+    return musaErrorInvalidValue;
+  }
+  bias_then_residual_layer_norm_bf16_cached_1536_kernel
+      <<<rows, kThreads, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(projection),
+          static_cast<const __mt_bfloat16*>(projection_bias),
+          static_cast<const __mt_bfloat16*>(residual),
+          static_cast<const __mt_bfloat16*>(norm_weight),
+          static_cast<const __mt_bfloat16*>(norm_bias),
+          static_cast<__mt_bfloat16*>(hidden),
+          static_cast<__mt_bfloat16*>(normalized), rows, eps);
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_bias_residual_rms_norm_bf16(
     const void* projection, const void* bias, const void* residual,
     const void* weight, void* hidden, void* normalized, int rows, int cols,
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || weight == nullptr ||
-      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0) {
+      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0 ||
+      !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[522, 2048]` -- the recorded shape -- fits the register-cached kernel
@@ -405,6 +497,83 @@ extern "C" musaError_t apxinf_musa_concat_rows_bf16(
       static_cast<const __mt_bfloat16*>(first),
       static_cast<const __mt_bfloat16*>(second),
       static_cast<__mt_bfloat16*>(output), first_count, total_count);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_concat_columns_bf16(
+    const void* first, const void* second, const void* third, void* output,
+    int rows, int first_cols, int second_cols, int third_cols,
+    musaStream_t stream) {
+  if (first == nullptr || output == nullptr || rows <= 0 || first_cols <= 0 ||
+      second_cols < 0 || third_cols < 0 ||
+      (second_cols > 0 && second == nullptr) ||
+      (third_cols > 0 && third == nullptr)) {
+    return musaErrorInvalidValue;
+  }
+  const int total_cols = first_cols + second_cols + third_cols;
+  concat_columns_bf16_kernel<<<row_grid(rows, total_cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(first),
+      static_cast<const __mt_bfloat16*>(second),
+      static_cast<const __mt_bfloat16*>(third),
+      static_cast<__mt_bfloat16*>(output), rows, first_cols, second_cols,
+      third_cols);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_gather_rows_bf16(
+    const void* input, const void* indices, void* output, int rows, int cols,
+    musaStream_t stream) {
+  if (input == nullptr || indices == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  gather_rows_bf16_kernel<<<row_grid(rows, cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const uint32_t*>(indices),
+      static_cast<__mt_bfloat16*>(output), rows, cols);
+  return musaGetLastError();
+}
+extern "C" musaError_t apxinf_musa_add_bf16(
+    const void* a, const void* b, void* output, int64_t count,
+    musaStream_t stream) {
+  if (a == nullptr || b == nullptr || output == nullptr || count <= 0) {
+    return musaErrorInvalidValue;
+  }
+  add_bf16_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(a),
+      static_cast<const __mt_bfloat16*>(b), static_cast<__mt_bfloat16*>(output),
+      count);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_mul_bf16(
+    const void* a, const void* b, void* output, int64_t count,
+    musaStream_t stream) {
+  if (a == nullptr || b == nullptr || output == nullptr || count <= 0) {
+    return musaErrorInvalidValue;
+  }
+  mul_bf16_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(a),
+      static_cast<const __mt_bfloat16*>(b), static_cast<__mt_bfloat16*>(output),
+      count);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_scatter_rows_bf16(
+    const void* destination, const void* source, const void* row_to_source,
+    void* output, int destination_rows, int source_rows, int cols, int add,
+    musaStream_t stream) {
+  if (destination == nullptr || source == nullptr || row_to_source == nullptr ||
+      output == nullptr || destination_rows <= 0 || source_rows <= 0 ||
+      source_rows > destination_rows || cols <= 0 || (add != 0 && add != 1)) {
+    return musaErrorInvalidValue;
+  }
+  scatter_rows_bf16_kernel<<<row_grid(destination_rows, cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(destination),
+      static_cast<const __mt_bfloat16*>(source),
+      static_cast<const uint32_t*>(row_to_source),
+      static_cast<__mt_bfloat16*>(output), destination_rows, source_rows, cols,
+      add);
   return musaGetLastError();
 }
 
@@ -576,6 +745,45 @@ extern "C" musaError_t apxinf_musa_permute_heads_from_f32(
 
 // In-place row softmax. One block per row, `kThreads` per block -- the block
 // size is fixed by the kernel's shared reduction buffer.
+extern "C" musaError_t apxinf_musa_permute_gqa_kv_bf16(
+    const void* in, void* out, int tokens, int kv_heads, int q_heads, int dim,
+    musaStream_t stream) {
+  if (in == nullptr || out == nullptr || tokens <= 0 || kv_heads <= 0 ||
+      q_heads <= 0 || q_heads % kv_heads != 0 || dim <= 0) {
+    return musaErrorInvalidValue;
+  }
+  permute_gqa_kv_kernel<__mt_bfloat16><<<tokens, kPermuteThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(in),
+      static_cast<__mt_bfloat16*>(out), tokens, kv_heads, q_heads, dim);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_permute_gqa_kv_to_f32(
+    const void* in, void* out, int tokens, int kv_heads, int q_heads, int dim,
+    musaStream_t stream) {
+  if (in == nullptr || out == nullptr || tokens <= 0 || kv_heads <= 0 ||
+      q_heads <= 0 || q_heads % kv_heads != 0 || dim <= 0) {
+    return musaErrorInvalidValue;
+  }
+  permute_gqa_kv_kernel<float><<<tokens, kPermuteThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(in), static_cast<float*>(out), tokens,
+      kv_heads, q_heads, dim);
+  return musaGetLastError();
+}
+extern "C" musaError_t apxinf_musa_causal_row_softmax_f32(
+    void* data, int rows, int tokens, musaStream_t stream) {
+  if (data == nullptr || rows <= 0 || tokens <= 0 || rows % tokens != 0) {
+    return musaErrorInvalidValue;
+  }
+  const unsigned int warps_per_block = kThreads / 32;
+  const unsigned int blocks =
+      static_cast<unsigned int>((static_cast<unsigned int>(rows) + warps_per_block - 1) /
+                                warps_per_block);
+  causal_row_softmax_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<float*>(data), rows, tokens);
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_row_softmax_f32(void* data, int rows,
                                                    int cols,
                                                    musaStream_t stream) {
@@ -599,7 +807,7 @@ extern "C" musaError_t apxinf_musa_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || bias == nullptr ||
-      output == nullptr || rows <= 0 || cols <= 0) {
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[512, 1152]` -- the vision tower's width -- is `32 * 4 * 9`, so one warp
@@ -626,14 +834,40 @@ extern "C" musaError_t apxinf_musa_layer_norm_bf16(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_adaptive_layer_norm_bf16(
+    const void* input, const void* modulation, void* output, int rows, int cols,
+    float eps, musaStream_t stream) {
+  if (input == nullptr || modulation == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return musaErrorInvalidValue;
+  }
+  adaptive_layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(modulation),
+      static_cast<__mt_bfloat16*>(output), rows, cols, eps);
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
     const void* projection, const void* projection_bias, const void* residual,
     const void* norm_weight, const void* norm_bias, void* hidden,
     void* normalized, int rows, int cols, float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
       norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
+  }
+  if (cols == 1024) {
+    bias_residual_layer_norm_bf16_cached_1024_kernel
+        <<<rows, kThreads, 0, stream>>>(
+            static_cast<const __mt_bfloat16*>(projection),
+            static_cast<const __mt_bfloat16*>(projection_bias),
+            static_cast<const __mt_bfloat16*>(residual),
+            static_cast<const __mt_bfloat16*>(norm_weight),
+            static_cast<const __mt_bfloat16*>(norm_bias),
+            static_cast<__mt_bfloat16*>(hidden),
+            static_cast<__mt_bfloat16*>(normalized), rows, eps);
+    return musaGetLastError();
   }
   // Same `[512, 1152]` shape as `layer_norm`, with the projection bias the
   // vision tower passes folded into the register-cached sum. The bias is a
@@ -746,6 +980,127 @@ const float* rope_frequency(int half_dim, float theta, musaStream_t stream) {
   return table;
 }
 }  // namespace
+
+extern "C" musaError_t apxinf_musa_vision_2d_rope_bf16(
+    const void* input, const uint32_t* positions, void* output, int tokens,
+    int heads, int head_dim, float theta, musaStream_t stream) {
+  if (input == nullptr || positions == nullptr || output == nullptr ||
+      tokens <= 0 || heads <= 0 || head_dim <= 0 || head_dim % 4 != 0 ||
+      theta <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  const int half_dim = head_dim / 2;
+  const dim3 grid(
+      static_cast<unsigned int>((half_dim + kThreads - 1) / kThreads),
+      static_cast<unsigned int>(heads), static_cast<unsigned int>(tokens));
+  vision_2d_rope_bf16_kernel<<<grid, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input), positions,
+      static_cast<__mt_bfloat16*>(output), tokens, heads, head_dim, theta);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_build_vision_rotation_table_f32(
+    const uint32_t* positions, void* rotation_table, int tokens, int head_dim,
+    float theta, musaStream_t stream) {
+  if (positions == nullptr || rotation_table == nullptr || tokens <= 0 ||
+      head_dim <= 0 || head_dim % 4 != 0 || theta <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  const int64_t total = static_cast<int64_t>(tokens) * (head_dim / 2);
+  build_vision_rotation_table_f32_kernel<<<elementwise_grid(total), kThreads, 0,
+                                           stream>>>(
+      positions, static_cast<float*>(rotation_table), tokens, head_dim, theta);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t
+apxinf_musa_qkv_split_bias_vision_rope_precomputed_bf16(
+    const void* qkv, const void* bias, void* query, void* key, void* value,
+    const void* rotation_table, int tokens, int heads, int head_dim,
+    musaStream_t stream) {
+  if (qkv == nullptr || bias == nullptr || query == nullptr || key == nullptr ||
+      value == nullptr || rotation_table == nullptr || tokens <= 0 ||
+      heads <= 0 || head_dim <= 0 || head_dim % 4 != 0) {
+    return musaErrorInvalidValue;
+  }
+  const int64_t total =
+      static_cast<int64_t>(tokens) * heads * (head_dim / 2);
+  qkv_split_bias_vision_rope_precomputed_bf16_kernel<<<
+      elementwise_grid(total), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(qkv),
+      static_cast<const __mt_bfloat16*>(bias),
+      static_cast<__mt_bfloat16*>(query),
+      static_cast<__mt_bfloat16*>(key),
+      static_cast<__mt_bfloat16*>(value),
+      static_cast<const float*>(rotation_table), tokens, heads, head_dim);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_mrope_bf16(
+    const void* input, const uint32_t* positions, void* output, int tokens,
+    int heads, int head_dim, int section_t, int section_h, int section_w,
+    float theta, musaStream_t stream) {
+  if (input == nullptr || positions == nullptr || output == nullptr ||
+      tokens <= 0 || heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 ||
+      section_t < 0 || section_h < 0 || section_w < 0 || theta <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  (void)section_t;  // temporal is the default axis for the remaining pairs.
+  const int half_dim = head_dim / 2;
+  const dim3 grid(
+      static_cast<unsigned int>((half_dim + kThreads - 1) / kThreads),
+      static_cast<unsigned int>(heads), static_cast<unsigned int>(tokens));
+  mrope_bf16_kernel<<<grid, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input), positions,
+      static_cast<__mt_bfloat16*>(output), tokens, heads, head_dim, section_h,
+      section_w, theta);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_build_mrope_rotation_table_f32(
+    const uint32_t* positions, void* rotation_table, int tokens, int head_dim,
+    int section_t, int section_h, int section_w, float theta,
+    musaStream_t stream) {
+  if (positions == nullptr || rotation_table == nullptr || tokens <= 0 ||
+      head_dim <= 0 || head_dim % 2 != 0 || section_t < 0 || section_h < 0 ||
+      section_w < 0 || theta <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  (void)section_t;
+  const int64_t total = static_cast<int64_t>(tokens) * (head_dim / 2);
+  build_mrope_rotation_table_f32_kernel<<<elementwise_grid(total), kThreads, 0,
+                                          stream>>>(
+      positions, static_cast<float*>(rotation_table), tokens, head_dim,
+      section_h, section_w, theta);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
+    const void* query, const void* query_weight, void* query_output,
+    const void* key, const void* key_weight, void* key_output,
+    const void* rotation_table, int tokens, int query_heads, int key_heads,
+    int head_dim, float eps, int block_threads, musaStream_t stream) {
+  if (query == nullptr || query_weight == nullptr || query_output == nullptr ||
+      key == nullptr || key_weight == nullptr || key_output == nullptr ||
+      rotation_table == nullptr || tokens <= 0 || query_heads <= 0 ||
+      key_heads <= 0 || head_dim != 128 || !(eps > 0.0f) ||
+      block_threads != 128) {
+    return musaErrorInvalidValue;
+  }
+  qk_rms_norm_mrope_precomputed_bf16_kernel<<<
+      dim3(static_cast<unsigned int>(tokens),
+           static_cast<unsigned int>(query_heads + key_heads)),
+      block_threads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(query),
+      static_cast<const __mt_bfloat16*>(query_weight),
+      static_cast<__mt_bfloat16*>(query_output),
+      static_cast<const __mt_bfloat16*>(key),
+      static_cast<const __mt_bfloat16*>(key_weight),
+      static_cast<__mt_bfloat16*>(key_output),
+      static_cast<const float*>(rotation_table), tokens, query_heads,
+      key_heads, head_dim, eps);
+  return musaGetLastError();
+}
 
 extern "C" musaError_t apxinf_musa_qkv_rope_bf16(
     const void* qkv, const void* bias, void* q, void* k, void* v, int tokens,

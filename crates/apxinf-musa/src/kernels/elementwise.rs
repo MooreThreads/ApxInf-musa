@@ -1,6 +1,6 @@
 //! Elementwise and row-manipulation operator contracts.
 
-use apxinf_core::{DType, Error, Result, Tensor};
+use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::activation::ACTIVATION_NONE;
 use super::contracts::{
@@ -9,7 +9,9 @@ use super::contracts::{
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, checked_i64, tensor_ptr};
+use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
+use crate::error::musa_error;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
 use crate::kernels::not_ported;
@@ -269,6 +271,19 @@ fn launch_mul_channels(
     Err(native_unavailable("elementwise::mul_channels_bf16"))
 }
 
+pub fn bias_qkv_in_place_bf16(
+    ctx: &MusaContext,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_bias: &Tensor,
+    key_bias: &Tensor,
+    value_bias: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let _ = (ctx, query, key, value, query_bias, key_bias, value_bias);
+    Err(not_ported("elementwise::bias_qkv_in_place_bf16"))
+}
+
 // ── FP16 elementwise (not ported) ────────────────────────────────────────
 
 /// Add a bias vector to every row in FP16.
@@ -292,6 +307,312 @@ pub fn euler_update_f16(
 ) -> Result<Tensor> {
     let _ = (ctx, state, velocity, dt);
     Err(not_ported("elementwise::euler_update_f16"))
+}
+
+/// Concatenate up to three equally tall BF16 matrices along columns.
+pub fn concat_columns_bf16(ctx: &MusaContext, tensors: &[&Tensor]) -> Result<Tensor> {
+    let first = tensors
+        .first()
+        .ok_or_else(|| Error::Other("MUSA column concatenation requires an input".into()))?;
+    let (rows, _) = require_matrix_bf16(ctx, first, "column concatenation", "input0")?;
+    if tensors.len() > 3 {
+        return Err(Error::Other(format!(
+            "MUSA column concatenation supports at most 3 inputs, got {}",
+            tensors.len()
+        )));
+    }
+    let mut total_cols = 0usize;
+    for (index, tensor) in tensors.iter().enumerate() {
+        let role = ["input0", "input1", "input2"][index];
+        let (tensor_rows, tensor_cols) =
+            require_matrix_bf16(ctx, tensor, "column concatenation", role)?;
+        if tensor_rows != rows {
+            return Err(Error::Other(format!(
+                "MUSA column concatenation row mismatch: {tensor_rows} vs {rows}"
+            )));
+        }
+        total_cols = total_cols
+            .checked_add(tensor_cols)
+            .ok_or_else(|| Error::Other("MUSA column concatenation width overflow".into()))?;
+    }
+    #[cfg(apxinf_musa_available)]
+    checked_i32("column concatenation", "total columns", total_cols)?;
+    let output = matrix_tensor(ctx, rows, total_cols, bf16_output(ctx, rows, total_cols)?);
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        let pointer = |index: usize| -> Result<*mut std::ffi::c_void> {
+            tensors
+                .get(index)
+                .map_or(Ok(std::ptr::null_mut()), |tensor| tensor_ptr(tensor))
+        };
+        let columns = |index: usize| -> Result<i32> {
+            tensors.get(index).map_or(Ok(0), |tensor| {
+                checked_i32("column concatenation", "columns", tensor.shape().dims()[1])
+            })
+        };
+        check_native(
+            ffi::custom::apxinf_musa_concat_columns_bf16(
+                pointer(0)?,
+                pointer(1)?,
+                pointer(2)?,
+                tensor_ptr(&output)?,
+                checked_i32("column concatenation", "rows", rows)?,
+                columns(0)?,
+                columns(1)?,
+                columns(2)?,
+                ctx.stream().handle(),
+            ),
+            "concat_columns_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("elementwise::concat_columns_bf16"));
+    Ok(output)
+}
+
+fn binary_bf16(ctx: &MusaContext, op: &'static str, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    require_dtype_on(ctx, a, DType::BF16, op, "a")?;
+    require_dtype_on(ctx, b, DType::BF16, op, "b")?;
+    if a.shape() != b.shape() {
+        return Err(Error::Other(format!(
+            "MUSA {op} expects matching shapes, got {:?} and {:?}",
+            a.shape().dims(),
+            b.shape().dims()
+        )));
+    }
+    let output = output_tensor(
+        ctx,
+        a.shape().clone(),
+        DType::BF16,
+        crate::workspace::output_buffer(ctx, a.size_in_bytes())?,
+    );
+    #[cfg(apxinf_musa_available)]
+    {
+        let count = checked_i64(op, "count", a.numel())?;
+        // The native kernel is the same f32-accumulate/BF16-round contract as
+        // the bridge, but avoids a Rust->GIL->Python dispatch and DLPack view
+        // construction for every binary op.
+        let status = unsafe {
+            match op {
+                "elementwise.add_bf16" => ffi::custom::apxinf_musa_add_bf16(
+                    tensor_ptr(a)?,
+                    tensor_ptr(b)?,
+                    tensor_ptr(&output)?,
+                    count,
+                    ctx.stream().handle(),
+                ),
+                "elementwise.mul_bf16" => ffi::custom::apxinf_musa_mul_bf16(
+                    tensor_ptr(a)?,
+                    tensor_ptr(b)?,
+                    tensor_ptr(&output)?,
+                    count,
+                    ctx.stream().handle(),
+                ),
+                _ => {
+                    return Err(Error::Other(format!(
+                        "MUSA native binary kernel has no implementation for {op}"
+                    )))
+                }
+            }
+        };
+        check_native(status, op)?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable(op));
+    Ok(output)
+}
+
+pub fn add(ctx: &MusaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    binary_bf16(ctx, "elementwise.add_bf16", a, b)
+}
+
+pub fn mul(ctx: &MusaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    binary_bf16(ctx, "elementwise.mul_bf16", a, b)
+}
+
+/// Bounds-checked row-selection metadata uploaded once to MUSA.
+#[derive(Clone)]
+pub struct PreparedRowIndices {
+    buffer: MusaBuffer,
+    row_to_source: MusaBuffer,
+    matrix_rows: usize,
+    row_count: usize,
+    unique: bool,
+}
+
+impl PreparedRowIndices {
+    fn validate(&self, ctx: &MusaContext, matrix_rows: usize, operation: &str) -> Result<()> {
+        if self.matrix_rows != matrix_rows || self.buffer.device() != ctx.device_id() {
+            return Err(Error::Other(format!(
+                "{operation} indices were prepared for MUSA{} with {} rows, got MUSA{} with {matrix_rows} rows",
+                self.buffer.device(), self.matrix_rows, ctx.device_id()
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn prepare_row_indices(
+    ctx: &MusaContext,
+    rows: &[usize],
+    input_rows: usize,
+) -> Result<PreparedRowIndices> {
+    if rows.is_empty() {
+        return Err(Error::Other(
+            "MUSA row selection requires at least one row".into(),
+        ));
+    }
+    let indices = rows
+        .iter()
+        .map(|&row| {
+            if row >= input_rows {
+                return Err(Error::Other(format!(
+                    "MUSA row index {row} is outside 0..{input_rows}"
+                )));
+            }
+            u32::try_from(row).map_err(|_| Error::Other("MUSA row index exceeds u32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bytes = indices
+        .iter()
+        .flat_map(|index| index.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let buffer = MusaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(musa_error)?;
+    buffer.copy_from_host(&bytes).map_err(musa_error)?;
+    let mut inverse = vec![u32::MAX; input_rows];
+    for (source_row, &destination_row) in rows.iter().enumerate() {
+        inverse[destination_row] = u32::try_from(source_row)
+            .map_err(|_| Error::Other("MUSA source row index exceeds u32".into()))?;
+    }
+    let inverse_bytes = inverse
+        .iter()
+        .flat_map(|index| index.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let row_to_source =
+        MusaBuffer::alloc(inverse_bytes.len(), ctx.device_id()).map_err(musa_error)?;
+    row_to_source
+        .copy_from_host(&inverse_bytes)
+        .map_err(musa_error)?;
+    let unique = rows
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == rows.len();
+    Ok(PreparedRowIndices {
+        buffer,
+        row_to_source,
+        matrix_rows: input_rows,
+        row_count: rows.len(),
+        unique,
+    })
+}
+
+pub fn gather_rows_bf16_prepared(
+    ctx: &MusaContext,
+    input: &Tensor,
+    indices: &PreparedRowIndices,
+) -> Result<Tensor> {
+    let (input_rows, cols) = require_matrix_bf16(ctx, input, "prepared row gather", "input")?;
+    indices.validate(ctx, input_rows, "MUSA prepared row gather")?;
+    let output = matrix_tensor(
+        ctx,
+        indices.row_count,
+        cols,
+        bf16_output(ctx, indices.row_count, cols)?,
+    );
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_gather_rows_bf16(
+                tensor_ptr(input)?,
+                indices.buffer.ptr(),
+                tensor_ptr(&output)?,
+                checked_i32("prepared row gather", "rows", indices.row_count)?,
+                checked_i32("prepared row gather", "columns", cols)?,
+                ctx.stream().handle(),
+            ),
+            "gather_rows_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("elementwise::gather_rows_bf16_prepared"));
+    Ok(output)
+}
+
+pub fn scatter_rows_bf16_prepared(
+    ctx: &MusaContext,
+    destination: &Tensor,
+    indices: &PreparedRowIndices,
+    source: &Tensor,
+    add: bool,
+) -> Result<Tensor> {
+    let (rows, cols) =
+        require_matrix_bf16(ctx, destination, "prepared row scatter", "destination")?;
+    let (source_rows, source_cols) =
+        require_matrix_bf16(ctx, source, "prepared row scatter", "source")?;
+    if source_rows != indices.row_count || source_cols != cols || !indices.unique {
+        return Err(Error::Other(
+            "MUSA prepared row scatter has incompatible or duplicate rows".into(),
+        ));
+    }
+    indices.validate(ctx, rows, "MUSA prepared row scatter")?;
+    let output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_scatter_rows_bf16(
+                tensor_ptr(destination)?,
+                tensor_ptr(source)?,
+                indices.row_to_source.ptr(),
+                tensor_ptr(&output)?,
+                checked_i32("row scatter", "destination rows", rows)?,
+                checked_i32("row scatter", "source rows", source_rows)?,
+                checked_i32("row scatter", "columns", cols)?,
+                i32::from(add),
+                ctx.stream().handle(),
+            ),
+            "scatter_rows_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable(
+        "elementwise::scatter_rows_bf16_prepared",
+    ));
+    Ok(output)
+}
+
+/// Return a zero-copy view over contiguous matrix rows.
+pub fn contiguous_rows(
+    ctx: &MusaContext,
+    input: &Tensor,
+    first_row: usize,
+    row_count: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 || input.device() != Device::Musa(ctx.device_id()) {
+        return Err(Error::Other(
+            "MUSA contiguous row slice expects a matrix on this device".into(),
+        ));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    let end = first_row
+        .checked_add(row_count)
+        .ok_or_else(|| Error::Other("MUSA row slice range overflow".into()))?;
+    if row_count == 0 || end > rows {
+        return Err(Error::Other(format!(
+            "MUSA row slice [{first_row}..{end}] is outside 0..{rows}"
+        )));
+    }
+    let row_bytes = cols
+        .checked_mul(input.dtype().size_in_bytes())
+        .ok_or_else(|| Error::Other("MUSA row slice width overflow".into()))?;
+    MusaBuffer::from_tensor(input)
+        .map_err(musa_error)?
+        .view(first_row * row_bytes, row_count * row_bytes)
+        .map_err(musa_error)?
+        .as_tensor(Shape::new(vec![row_count, cols]), input.dtype())
+        .map_err(musa_error)
 }
 
 #[cfg(all(test, apxinf_musa_available))]

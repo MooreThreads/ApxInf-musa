@@ -435,6 +435,16 @@ impl AutoModel {
             ));
         }
 
+        if matches!(
+            model_name,
+            "gr00t" | "gr00t_n1_7" | "Gr00tN1d7" | "gr00t-musa"
+        ) {
+            #[cfg(feature = "musa")]
+            if matches!(device, Device::Musa(_)) {
+                return crate::musa_gr00t::load(path, device, options);
+            }
+        }
+
         if matches!(model_name, "d3" | "d3-cuda") {
             #[cfg(feature = "cuda")]
             return crate::d3::load::load_with_cuda_new(path, device, options);
@@ -447,9 +457,8 @@ impl AutoModel {
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
             Device::Hip(_) => Some("hip"),
-            // A family that brings a MUSA port registers `<family>-musa`, the
-            // same way a CUDA or HIP family registers its own suffix. None does
-            // yet: PI0.5 resolves through its seam above.
+            // No family registers a `<family>-musa` suffix yet; PI0.5 and
+            // GR00T resolve through the seams above.
             Device::Musa(_) => Some("musa"),
             // Metal owns its own admission below; CPU has no registry suffix.
             Device::Metal(_) | Device::Cpu => None,

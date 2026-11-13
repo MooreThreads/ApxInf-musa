@@ -17,6 +17,40 @@ use crate::kernels::check_native;
 use crate::kernels::native_unavailable;
 use crate::kernels::not_ported;
 
+/// Unscaled BF16 embedding gather with token ranges validated by the caller.
+pub fn lookup(
+    ctx: &MusaContext,
+    table: &Tensor,
+    ids: &MusaBuffer,
+    tokens: usize,
+) -> Result<Tensor> {
+    let (_, width) = require_matrix_bf16(ctx, table, "embedding lookup", "table")?;
+    if tokens == 0 || ids.device() != ctx.device_id() || ids.len() < tokens * 4 {
+        return Err(Error::Other(
+            "MUSA embedding lookup has invalid token ids".into(),
+        ));
+    }
+    let output = matrix_tensor(ctx, tokens, width, bf16_output(ctx, tokens, width)?);
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_embedding_bf16_scaled(
+                tensor_ptr(table)?,
+                ids.ptr(),
+                tensor_ptr(&output)?,
+                checked_i32("embedding lookup", "tokens", tokens)?,
+                checked_i32("embedding lookup", "width", width)?,
+                1.0,
+                ctx.stream().handle(),
+            ),
+            "embedding lookup",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("embedding::lookup"));
+    Ok(output)
+}
+
 /// Gather rows from a BF16 embedding table by device-resident ids.
 ///
 /// `ids` is a raw device buffer of `u32` token ids, not a typed tensor: the
@@ -342,6 +376,41 @@ mod tests {
         let buffer = MusaBuffer::alloc_on(ctx, bytes.len()).expect("allocate ids");
         buffer.copy_from_host(&bytes).expect("upload ids");
         buffer
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn unscaled_lookup_gathers_validated_rows() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (vocab, width) = (16usize, 8usize);
+        let table_values = values(vocab * width, 0x5eed_1234);
+        let table = upload(&ctx, &table_values, Shape::new(vec![vocab, width]));
+        let ids = [3u32, 0, 15, 3];
+        let output = super::lookup(&ctx, &table, &ids_buffer(&ctx, &ids), ids.len())
+            .expect("unscaled embedding lookup");
+        ctx.stream().synchronize().expect("synchronise");
+        let mut expected = Vec::new();
+        for id in ids {
+            for col in 0..width {
+                expected.push(from_bf16_bits(to_bf16_bits(
+                    table_values[id as usize * width + col],
+                )));
+            }
+        }
+        assert_eq!(read_back(&output), expected);
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn unscaled_lookup_rejects_invalid_token_buffer_lengths() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let table = upload(&ctx, &values(32, 0x5eed_1234), Shape::new(vec![4, 8]));
+        let ids = ids_buffer(&ctx, &[0]);
+        for tokens in [0, 2] {
+            let error = super::lookup(&ctx, &table, &ids, tokens)
+                .expect_err("invalid token buffer length");
+            assert!(error.to_string().contains("invalid token ids"));
+        }
     }
 
     #[test]

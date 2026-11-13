@@ -10,7 +10,7 @@ use super::contracts::{
     require_output_tensor,
 };
 #[cfg(apxinf_musa_available)]
-use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
+use super::contracts::{checked_i32, checked_i64, optional_tensor_ptr, tensor_ptr};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
@@ -164,6 +164,23 @@ fn note_general_fallback(tokens: usize, capacity: usize) {
              general D256 assembly. The packed decode kernels are built for \
              {PACKED_DECODE_TOKENS} rows and are 2.3x faster on this shape; see \
              crates/apxinf-musa/kernels/asm/README.md."
+        );
+    });
+}
+
+/// Note, once, that a general flash-attention launch failed and the call is
+/// falling back to the general GEMM path.
+///
+/// The fallback is correct and slower. The first failure is logged so a
+/// profile can attribute the slowdown; the error itself is retained at the
+/// call site and included if the fallback also fails.
+#[cfg(apxinf_musa_available)]
+fn note_flash_fallback(operation: &str, error: &Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[apxinf] MUSA {operation}: general flash attention failed ({error}); \
+             falling back to the GEMM path."
         );
     });
 }
@@ -1108,6 +1125,856 @@ pub fn mqa_f16_e4m3_522(
 ) -> Result<Tensor> {
     let _ = (ctx, q, k, v, output_scale);
     Err(not_ported("attention::mqa_f16_e4m3_522"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bf16SdpaMode {
+    Direct,
+    Split,
+    Legacy,
+}
+
+fn bf16_sdpa_mode() -> Bf16SdpaMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<Bf16SdpaMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("APXINF_MUSA_BF16_SDPA_MODE")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("legacy" | "fallback" | "0" | "false" | "off") => Bf16SdpaMode::Legacy,
+            Some("split") => Bf16SdpaMode::Split,
+            _ => Bf16SdpaMode::Direct,
+        }
+    })
+}
+
+fn general_noncausal_flash_shape(
+    query_tokens: usize,
+    key_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> bool {
+    (query_tokens == 41
+        && heads == 32
+        && head_dim == 48
+        && ((1..=64).contains(&key_tokens) || key_tokens == 128))
+        || (query_tokens, key_tokens, heads, head_dim) == (256, 256, 16, 64)
+        || (query_tokens == key_tokens
+            && (129..=256).contains(&query_tokens)
+            && heads == 32
+            && head_dim == 64)
+}
+
+fn general_causal_gqa_flash_shape(
+    tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> bool {
+    (129..=256).contains(&tokens) && query_heads == 16 && kv_heads == 8 && head_dim == 128
+}
+
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_general_flash_bf16(
+    ctx: &MusaContext,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    head_dim: usize,
+    causal: bool,
+    output: &Tensor,
+) -> Result<()> {
+    // SAFETY: callers validate contiguous BF16 Q/K/V shapes on this context;
+    // `output` matches muDNN's `[B,Tq,Hq,D]` physical layout.
+    let status = unsafe {
+        ffi::custom::apxinf_musa_mudnn_general_flash_bf16(
+            tensor_ptr(query)?,
+            tensor_ptr(key)?,
+            tensor_ptr(value)?,
+            tensor_ptr(output)?,
+            checked_i32("general flash", "batch", batch)?,
+            checked_i32("general flash", "query_heads", query_heads)?,
+            checked_i32("general flash", "kv_heads", kv_heads)?,
+            checked_i32("general flash", "query_tokens", query_tokens)?,
+            checked_i32("general flash", "key_tokens", key_tokens)?,
+            checked_i32("general flash", "head_dim", head_dim)?,
+            causal,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::custom::check_mudnn(status, || {
+        format!(
+            "muDNN general flash B={batch} Hq={query_heads} Hkv={kv_heads} \
+             Tq={query_tokens} Tk={key_tokens} D={head_dim} causal={causal}"
+        )
+    })
+    .map_err(crate::error::musa_error)?;
+    Ok(())
+}
+
+#[cfg(apxinf_musa_available)]
+fn launch_packed_qkv_flash_bf16(
+    ctx: &MusaContext,
+    qkv: &Tensor,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &Tensor,
+) -> Result<()> {
+    // SAFETY: `qkv` is contiguous `[T,3,H,D]` BF16 and remains alive through
+    // the asynchronous launch; the output is contiguous `[T,H,D]` BF16.
+    let status = unsafe {
+        ffi::custom::apxinf_musa_mudnn_packed_qkv_flash_bf16(
+            tensor_ptr(qkv)?,
+            tensor_ptr(output)?,
+            1,
+            checked_i32("packed-QKV flash", "heads", heads)?,
+            checked_i32("packed-QKV flash", "tokens", tokens)?,
+            checked_i32("packed-QKV flash", "head_dim", head_dim)?,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::custom::check_mudnn(status, || {
+        format!("muDNN packed-QKV flash T={tokens} H={heads} D={head_dim}")
+    })
+    .map_err(crate::error::musa_error)?;
+    Ok(())
+}
+
+fn batched_equal_flash_shape(batch: usize, tokens: usize, heads: usize, head_dim: usize) -> bool {
+    batch == 2 && tokens == 256 && heads == 16 && head_dim == 64
+}
+
+pub fn try_noncausal_batched_equal(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batch: usize,
+    tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if crate::MUSA_ARCH != "mp_22"
+        || !batched_equal_flash_shape(batch, tokens, n_heads, head_dim)
+        || bf16_sdpa_mode() == Bf16SdpaMode::Legacy
+    {
+        return Ok(None);
+    }
+    let expected = (batch * tokens, n_heads, head_dim);
+    if require_3d_bf16(ctx, q, "batched noncausal", "q")? != expected
+        || require_3d_bf16(ctx, k, "batched noncausal", "k")? != expected
+        || require_3d_bf16(ctx, v, "batched noncausal", "v")? != expected
+    {
+        return Err(Error::Other("MUSA batched noncausal attention shape mismatch".into()));
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        let output = bf16_tensor(ctx, &[batch * tokens, n_heads * head_dim])?;
+        match launch_general_flash_bf16(
+            ctx, q, k, v, batch, n_heads, n_heads, tokens, tokens, head_dim, false, &output,
+        ) {
+            Ok(()) => Ok(Some(output)),
+            Err(error) => {
+                note_flash_fallback("batched noncausal", &error);
+                Ok(None)
+            }
+        }
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        Ok(None)
+    }
+}
+
+pub fn noncausal(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let (query_tokens, q_heads, q_dim) = require_3d_bf16(ctx, q, "noncausal", "q")?;
+    let (key_tokens, k_heads, k_dim) = require_3d_bf16(ctx, k, "noncausal", "k")?;
+    let v_shape = require_3d_bf16(ctx, v, "noncausal", "v")?;
+    if (q_heads, q_dim) != (n_heads, head_dim)
+        || (k_heads, k_dim) != (n_heads, head_dim)
+        || v_shape != (key_tokens, n_heads, head_dim)
+    {
+        return Err(Error::Other(
+            "MUSA noncausal attention shape mismatch".into(),
+        ));
+    }
+    let hidden = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("MUSA noncausal attention width overflow".into()))?;
+    let output = bf16_tensor(ctx, &[query_tokens, hidden])?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let flash_error = if bf16_sdpa_mode() != Bf16SdpaMode::Legacy
+            && general_noncausal_flash_shape(query_tokens, key_tokens, n_heads, head_dim)
+        {
+            match launch_general_flash_bf16(
+                ctx,
+                q,
+                k,
+                v,
+                1,
+                n_heads,
+                n_heads,
+                query_tokens,
+                key_tokens,
+                head_dim,
+                false,
+                &output,
+            ) {
+                Ok(()) => return Ok(output),
+                Err(error) => {
+                    note_flash_fallback("noncausal", &error);
+                    Some(error)
+                }
+            }
+        } else {
+            None
+        };
+        launch_noncausal_gemm(
+            ctx,
+            q,
+            k,
+            v,
+            &output,
+            query_tokens,
+            key_tokens,
+            n_heads,
+            head_dim,
+        )
+        .map_err(|gemm| match flash_error {
+            Some(flash) => Error::Other(format!(
+                "MUSA noncausal attention: flash failed ({flash}); \
+                 GEMM fallback failed ({gemm})"
+            )),
+            None => gemm,
+        })?;
+        Ok(output)
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = output;
+        Err(native_unavailable("attention::noncausal"))
+    }
+}
+
+/// Native general attention for one query window and one key/value window.
+///
+/// This is the same three-stage layout used by the vision MHA path, but it
+/// deliberately has no vision-only shape restriction and no flash-attention
+/// dispatch. Q/K/V stay BF16 for the vendor BF16-input GEMMs. Scores and
+/// softmax are accumulated in F32, then the probabilities are rounded to BF16
+/// for the values product, matching the CUDA flash-attention data path. The
+/// values product still accumulates into F32, and the final head-major result
+/// is rounded to BF16 while it is permuted back to token-major storage.
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_noncausal_gemm(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &Tensor,
+    query_tokens: usize,
+    key_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_heads = heads;
+    let stream = ctx.stream().handle();
+    let query_tokens_i32 = checked_i32("noncausal", "query tokens", query_tokens)?;
+    let key_tokens_i32 = checked_i32("noncausal", "key/value tokens", key_tokens)?;
+    let heads_i32 = checked_i32("noncausal", "heads", heads)?;
+    let dim_i32 = checked_i32("noncausal", "head_dim", head_dim)?;
+    let query_head_stride = checked_i64(
+        "noncausal",
+        "query head stride",
+        query_tokens
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::Other("MUSA noncausal query stride overflow".into()))?,
+    )?;
+    let key_head_stride = checked_i64(
+        "noncausal",
+        "key head stride",
+        key_tokens
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::Other("MUSA noncausal key stride overflow".into()))?,
+    )?;
+    let score_head_stride = checked_i64(
+        "noncausal",
+        "score head stride",
+        query_tokens
+            .checked_mul(key_tokens)
+            .ok_or_else(|| Error::Other("MUSA noncausal score stride overflow".into()))?,
+    )?;
+
+    let permute = |to_head_major: bool, from: &Tensor, to: &Tensor, tokens: usize| -> Result<()> {
+        let permutation = match (to_head_major, from.dtype(), to.dtype()) {
+            (true, DType::BF16, DType::BF16) => ffi::custom::apxinf_musa_permute_heads_bf16,
+            (true, DType::BF16, DType::F32) => ffi::custom::apxinf_musa_permute_heads_to_f32,
+            (false, DType::F32, DType::BF16) => ffi::custom::apxinf_musa_permute_heads_from_f32,
+            (direction, from_dtype, to_dtype) => {
+                return Err(Error::Other(format!(
+                    "MUSA noncausal permute has no entry for {from_dtype} -> {to_dtype} with \
+                     to_head_major={direction}"
+                )))
+            }
+        };
+        let tokens = checked_i32("noncausal", "permutation tokens", tokens)?;
+        unsafe {
+            check_native(
+                permutation(
+                    tensor_ptr(from)?,
+                    tensor_ptr(to)?,
+                    tokens,
+                    heads_i32,
+                    dim_i32,
+                    tokens,
+                    stream,
+                ),
+                "attention::noncausal permute",
+            )
+        }
+    };
+
+    let q_heads = bf16_tensor(ctx, &[batch_heads, query_tokens, head_dim])?;
+    let k_heads = bf16_tensor(ctx, &[batch_heads, key_tokens, head_dim])?;
+    // Keep V in BF16. The values product now uses the same BF16-input / F32-C
+    // muBLAS entry as the scores product; widening V here would force the
+    // graph-unsafe FP32 batched GEMM back into the normal path.
+    let v_heads = bf16_tensor(ctx, &[batch_heads, key_tokens, head_dim])?;
+    permute(true, q, &q_heads, query_tokens)?;
+    permute(true, k, &k_heads, key_tokens)?;
+    permute(true, v, &v_heads, key_tokens)?;
+
+    let scores = f32_tensor(ctx, &[batch_heads, query_tokens, key_tokens])?;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let batched = |entry: BatchedGemm,
+                   a: &Tensor,
+                   b: &Tensor,
+                   c: &Tensor,
+                   m: i32,
+                   n: i32,
+                   k: i32,
+                   trans_a: i32,
+                   lda: i32,
+                   ldb: i32,
+                   ldc: i32,
+                   stride_a: i64,
+                   stride_b: i64,
+                   stride_c: i64,
+                   alpha: f32,
+                   label: &str|
+     -> Result<()> {
+        unsafe {
+            check_mublas(entry(
+                tensor_ptr(a)?,
+                tensor_ptr(b)?,
+                tensor_ptr(c)?,
+                m,
+                n,
+                k,
+                trans_a,
+                0,
+                lda,
+                ldb,
+                ldc,
+                stride_a,
+                stride_b,
+                stride_c,
+                heads_i32,
+                alpha,
+                stream,
+            ))
+            .map_err(|message| {
+                crate::error::musa_error(format!("attention::noncausal {label}: {message}"))
+            })?
+        }
+        Ok(())
+    };
+
+    // S^T = K @ Q^T. In column-major terms this is
+    // [key_tokens, dim] @ [dim, query_tokens], while the same bytes are the
+    // row-major score tensor [query_tokens, key_tokens].
+    batched(
+        ffi::mublas::apxinf_musa_bf16in_f32out_gemm_batched_colmajor,
+        &k_heads,
+        &q_heads,
+        &scores,
+        key_tokens_i32,
+        query_tokens_i32,
+        dim_i32,
+        1,
+        dim_i32,
+        dim_i32,
+        key_tokens_i32,
+        key_head_stride,
+        query_head_stride,
+        score_head_stride,
+        scale,
+        "scores",
+    )?;
+
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_row_softmax_f32(
+                tensor_ptr(&scores)?,
+                checked_i32(
+                    "noncausal",
+                    "score rows",
+                    batch_heads
+                        .checked_mul(query_tokens)
+                        .ok_or_else(|| Error::Other("MUSA noncausal score rows overflow".into()))?,
+                )?,
+                key_tokens_i32,
+                stream,
+            ),
+            "attention::noncausal softmax",
+        )?
+    }
+
+    // The softmax remains FP32, but CUDA's fused attention converts the
+    // completed probabilities to BF16 before multiplying by BF16 V. Reuse the
+    // existing f32->bf16 permutation kernel as a same-layout cast: treating
+    // each [query_tokens, key_tokens] score matrix as one head makes its
+    // source and destination offsets identical while avoiding a new kernel.
+    let probabilities = bf16_tensor(ctx, &[batch_heads, query_tokens, key_tokens])?;
+    let cast_tokens = batch_heads
+        .checked_mul(query_tokens)
+        .ok_or_else(|| Error::Other("MUSA noncausal probability rows overflow".into()))?;
+    let cast_tokens_i32 = checked_i32("noncausal", "probability rows", cast_tokens)?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_permute_heads_from_f32(
+                tensor_ptr(&scores)?,
+                tensor_ptr(&probabilities)?,
+                cast_tokens_i32,
+                1,
+                key_tokens_i32,
+                query_tokens_i32,
+                stream,
+            ),
+            "attention::noncausal probabilities f32-to-bf16",
+        )?
+    }
+
+    let out_heads = f32_tensor(ctx, &[batch_heads, query_tokens, head_dim])?;
+    batched(
+        ffi::mublas::apxinf_musa_bf16in_f32out_gemm_batched_colmajor,
+        &v_heads,
+        &probabilities,
+        &out_heads,
+        dim_i32,
+        query_tokens_i32,
+        key_tokens_i32,
+        0,
+        dim_i32,
+        key_tokens_i32,
+        dim_i32,
+        key_head_stride,
+        score_head_stride,
+        query_head_stride,
+        1.0,
+        "values-bf16",
+    )?;
+
+    permute(false, &out_heads, output, query_tokens)
+}
+
+pub fn noncausal_strided_qkv(
+    ctx: &MusaContext,
+    qkv: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let dims = qkv.shape().dims();
+    let hidden = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("MUSA strided QKV width overflow".into()))?;
+    if qkv.dtype() != DType::BF16
+        || qkv.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || dims.len() != 2
+        || dims[0] == 0
+        || dims[1] != 3 * hidden
+    {
+        return Err(Error::Other(
+            "MUSA strided QKV attention shape mismatch".into(),
+        ));
+    }
+    let output = bf16_tensor(ctx, &[dims[0], hidden])?;
+    #[cfg(apxinf_musa_available)]
+    {
+        let mode = bf16_sdpa_mode();
+        let mut flash_error = None;
+        let mut qkv_parts = None;
+        if mode != Bf16SdpaMode::Legacy
+            && general_noncausal_flash_shape(dims[0], dims[0], n_heads, head_dim)
+        {
+            if mode == Bf16SdpaMode::Direct {
+                match launch_packed_qkv_flash_bf16(ctx, qkv, dims[0], n_heads, head_dim, &output) {
+                    Ok(()) => return Ok(output),
+                    Err(error) => {
+                        note_flash_fallback("strided packed QKV", &error);
+                        flash_error = Some(error);
+                    }
+                }
+            } else {
+                let parts = split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?;
+                match launch_general_flash_bf16(
+                    ctx,
+                    &parts.q,
+                    &parts.k,
+                    &parts.v,
+                    1,
+                    n_heads,
+                    n_heads,
+                    dims[0],
+                    dims[0],
+                    head_dim,
+                    false,
+                    &output,
+                ) {
+                    Ok(()) => return Ok(output),
+                    Err(error) => {
+                        note_flash_fallback("strided split QKV", &error);
+                        flash_error = Some(error);
+                        qkv_parts = Some(parts);
+                    }
+                }
+            }
+        }
+        // The packed form is a regular self-attention problem. Split
+        // the three contiguous projections with the native QKV kernel, then
+        // use the same GEMM/softmax path as vision attention without its
+        // vision-only head-dimension restriction. Unsupported toolchains fail
+        // explicitly at the facade instead of taking a host fallback.
+        let qkv_parts = match qkv_parts {
+            Some(parts) => parts,
+            None => split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?,
+        };
+        launch_noncausal_gemm(
+            ctx,
+            &qkv_parts.q,
+            &qkv_parts.k,
+            &qkv_parts.v,
+            &output,
+            dims[0],
+            dims[0],
+            n_heads,
+            head_dim,
+        )
+        .map_err(|gemm| match flash_error {
+            Some(flash) => Error::Other(format!(
+                "MUSA strided QKV attention: flash failed ({flash}); \
+                 GEMM fallback failed ({gemm})"
+            )),
+            None => gemm,
+        })?;
+        return Ok(output);
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(native_unavailable("attention::noncausal_strided_qkv"))
+}
+
+/// Expand K/V to `q_heads` as part of their permutation, replacing eager's materialised
+/// `repeat_interleave`. The two contractions remain vendor GEMMs; only the
+/// layout conversions and causal softmax are custom MUSA kernels.
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_causal_gqa_gemm(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &Tensor,
+    tokens: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let stream = ctx.stream().handle();
+    let tokens_i32 = checked_i32("causal GQA", "tokens", tokens)?;
+    let q_heads_i32 = checked_i32("causal GQA", "q_heads", q_heads)?;
+    let kv_heads_i32 = checked_i32("causal GQA", "kv_heads", kv_heads)?;
+    let dim_i32 = checked_i32("causal GQA", "head_dim", head_dim)?;
+
+    let q_major = bf16_tensor(ctx, &[q_heads, tokens, head_dim])?;
+    let k_major = bf16_tensor(ctx, &[q_heads, tokens, head_dim])?;
+    let v_major = f32_tensor(ctx, &[q_heads, tokens, head_dim])?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_permute_heads_bf16(
+                tensor_ptr(q)?,
+                tensor_ptr(&q_major)?,
+                tokens_i32,
+                q_heads_i32,
+                dim_i32,
+                tokens_i32,
+                stream,
+            ),
+            "attention::causal GQA Q permute",
+        )?;
+        check_native(
+            ffi::custom::apxinf_musa_permute_gqa_kv_bf16(
+                tensor_ptr(k)?,
+                tensor_ptr(&k_major)?,
+                tokens_i32,
+                kv_heads_i32,
+                q_heads_i32,
+                dim_i32,
+                stream,
+            ),
+            "attention::causal GQA K expand-permute",
+        )?;
+        check_native(
+            ffi::custom::apxinf_musa_permute_gqa_kv_to_f32(
+                tensor_ptr(v)?,
+                tensor_ptr(&v_major)?,
+                tokens_i32,
+                kv_heads_i32,
+                q_heads_i32,
+                dim_i32,
+                stream,
+            ),
+            "attention::causal GQA V expand-permute",
+        )?;
+    }
+
+    let batched = |entry: BatchedGemm,
+                   a: &Tensor,
+                   b: &Tensor,
+                   c: &Tensor,
+                   m: i32,
+                   n: i32,
+                   k: i32,
+                   trans_a: i32,
+                   lda: i32,
+                   ldb: i32,
+                   ldc: i32,
+                   stride_a: i64,
+                   stride_b: i64,
+                   stride_c: i64,
+                   alpha: f32,
+                   label: &str|
+     -> Result<()> {
+        unsafe {
+            check_mublas(entry(
+                tensor_ptr(a)?,
+                tensor_ptr(b)?,
+                tensor_ptr(c)?,
+                m,
+                n,
+                k,
+                trans_a,
+                0,
+                lda,
+                ldb,
+                ldc,
+                stride_a,
+                stride_b,
+                stride_c,
+                q_heads_i32,
+                alpha,
+                stream,
+            ))
+            .map_err(|message| {
+                crate::error::musa_error(format!("attention::causal GQA {label}: {message}"))
+            })?
+        }
+        Ok(())
+    };
+
+    let scores = f32_tensor(ctx, &[q_heads, tokens, tokens])?;
+    batched(
+        ffi::mublas::apxinf_musa_bf16in_f32out_gemm_batched_colmajor,
+        &k_major,
+        &q_major,
+        &scores,
+        tokens_i32,
+        tokens_i32,
+        dim_i32,
+        1,
+        dim_i32,
+        dim_i32,
+        tokens_i32,
+        (tokens * head_dim) as i64,
+        (tokens * head_dim) as i64,
+        (tokens * tokens) as i64,
+        1.0f32 / (head_dim as f32).sqrt(),
+        "scores",
+    )?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_causal_row_softmax_f32(
+                tensor_ptr(&scores)?,
+                checked_i32("causal GQA", "score rows", q_heads * tokens)?,
+                tokens_i32,
+                stream,
+            ),
+            "attention::causal GQA softmax",
+        )?;
+    }
+
+    let out_major = f32_tensor(ctx, &[q_heads, tokens, head_dim])?;
+    batched(
+        ffi::mublas::apxinf_musa_f32_gemm_batched_colmajor,
+        &v_major,
+        &scores,
+        &out_major,
+        dim_i32,
+        tokens_i32,
+        tokens_i32,
+        0,
+        dim_i32,
+        tokens_i32,
+        dim_i32,
+        (tokens * head_dim) as i64,
+        (tokens * tokens) as i64,
+        (tokens * head_dim) as i64,
+        1.0,
+        "values",
+    )?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_permute_heads_from_f32(
+                tensor_ptr(&out_major)?,
+                tensor_ptr(output)?,
+                tokens_i32,
+                q_heads_i32,
+                dim_i32,
+                tokens_i32,
+                stream,
+            ),
+            "attention::causal GQA output permute",
+        )
+    }
+}
+
+/// Native prefill path. Returns `Some` for every validated BF16 GQA
+/// shape so the caller does not enter its CUDA-provider error path.
+pub fn causal_gqa_prefill_bf16(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<Option<Tensor>> {
+    let (tokens, q_heads, head_dim) = require_3d_bf16(ctx, q, "causal GQA", "q")?;
+    let k_shape = require_3d_bf16(ctx, k, "causal GQA", "k")?;
+    let v_shape = require_3d_bf16(ctx, v, "causal GQA", "v")?;
+    if k_shape != v_shape
+        || k_shape.0 != tokens
+        || k_shape.2 != head_dim
+        || k_shape.1 == 0
+        || q_heads % k_shape.1 != 0
+    {
+        return Err(Error::Other("MUSA causal GQA shape mismatch".into()));
+    }
+    let output = bf16_tensor(ctx, &[tokens, q_heads, head_dim])?;
+    #[cfg(apxinf_musa_available)]
+    {
+        if bf16_sdpa_mode() != Bf16SdpaMode::Legacy
+            && general_causal_gqa_flash_shape(tokens, q_heads, k_shape.1, head_dim)
+        {
+            match launch_general_flash_bf16(
+                ctx, q, k, v, 1, q_heads, k_shape.1, tokens, tokens, head_dim, true, &output,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    note_flash_fallback("causal GQA", &error);
+                    launch_causal_gqa_gemm(ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim)
+                        .map_err(|gemm| {
+                            Error::Other(format!(
+                                "MUSA causal GQA attention: flash failed ({error}); \
+                                 GEMM fallback failed ({gemm})"
+                            ))
+                        })?;
+                }
+            }
+        } else {
+            launch_causal_gqa_gemm(ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim)?;
+        }
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("attention::causal_gqa_prefill_bf16"));
+    Ok(Some(output))
+}
+
+pub fn segmented_noncausal_contiguous_output_bf16(
+    _ctx: &MusaContext,
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _segment_lengths: &[usize],
+    _n_heads: usize,
+    _head_dim: usize,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
+pub fn noncausal_hdim96_bm64(
+    _ctx: &MusaContext,
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _n_heads: usize,
+    _head_dim: usize,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
+pub fn noncausal_strided_qkv_hdim96_bm64(
+    _ctx: &MusaContext,
+    _qkv: &Tensor,
+    _n_heads: usize,
+    _head_dim: usize,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::{batched_equal_flash_shape, general_causal_gqa_flash_shape, general_noncausal_flash_shape};
+
+    #[test]
+    fn batched_flash_routes_only_measured_shape() {
+        assert!(batched_equal_flash_shape(2, 256, 16, 64));
+        assert!(!batched_equal_flash_shape(1, 256, 16, 64));
+        assert!(!batched_equal_flash_shape(3, 256, 16, 64));
+        assert!(!batched_equal_flash_shape(2, 255, 16, 64));
+        assert!(!batched_equal_flash_shape(2, 256, 32, 64));
+        assert!(!batched_equal_flash_shape(2, 256, 16, 48));
+    }
+
+    #[test]
+    fn general_flash_routes_only_measured_shapes() {
+        assert!(general_noncausal_flash_shape(41, 17, 32, 48));
+        assert!(general_noncausal_flash_shape(41, 64, 32, 48));
+        assert!(general_noncausal_flash_shape(41, 128, 32, 48));
+        assert!(!general_noncausal_flash_shape(41, 65, 32, 48));
+        for tokens in [129, 141, 145, 255, 256] {
+            assert!(general_noncausal_flash_shape(tokens, tokens, 32, 64));
+            assert!(general_causal_gqa_flash_shape(tokens, 16, 8, 128));
+        }
+        assert!(!general_noncausal_flash_shape(128, 128, 32, 64));
+        assert!(!general_causal_gqa_flash_shape(128, 16, 8, 128));
+        assert!(!general_causal_gqa_flash_shape(257, 16, 8, 128));
+    }
 }
 
 #[cfg(all(test, apxinf_musa_available))]
