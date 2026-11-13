@@ -280,7 +280,8 @@ Building a replacement through `infer` or `prepare_for` synchronizes and
 invalidates the previous plan before allocating the replacement arena.
 Externally held old handles report `PreparationStatus::Invalidated` and reject
 `run`; retaining a handle does not retain its Graph or 4 GiB arena.
-`clear_prepared` also invalidates externally held fixed-profile plans.
+`clear_prepared` evicts the implicit cached plan only; explicitly held
+fixed-profile plans remain valid and runnable.
 If replacement construction fails after retirement, no active plan remains;
 prepare again or retry inference. Input validation failures before retirement
 leave the existing plan intact. This contract covers prepared Graph and Eager

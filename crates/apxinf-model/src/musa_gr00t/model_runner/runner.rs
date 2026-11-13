@@ -66,10 +66,14 @@ impl Gr00tActiveStrategy {
             return Ok(None);
         };
         synchronize()?;
-        let retired = std::mem::replace(
-            &mut *active.borrow_mut(),
-            Gr00tPreparedStrategy::Invalidated,
-        );
+        let retired = {
+            let mut active = active.try_borrow_mut().map_err(|_| {
+                Error::Other(
+                    "GR00T prepared plan is in use; retry after the current run".into(),
+                )
+            })?;
+            std::mem::replace(&mut *active, Gr00tPreparedStrategy::Invalidated)
+        };
         *self.strategy.borrow_mut() = Weak::new();
         Ok(retired.take_workspace())
     }
@@ -517,7 +521,7 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
     fn clear_prepared(&self) -> Result<()> {
         #[cfg(feature = "musa")]
         {
-            self.invalidate_prepared()?;
+            self.engine.borrow().backend().synchronize()?;
             drop(self.prepared.borrow_mut().take());
             Ok(())
         }

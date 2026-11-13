@@ -359,10 +359,10 @@ impl Gr00tPreparedInputs {
     }
 
     fn update(&self, observation: &Gr00tObservation) -> Result<()> {
-        // Every GR00T prepared run synchronizes before returning its host
-        // action. The copies below are synchronous as well, so another device
-        // barrier here only repeats an ordering guarantee already established
-        // at both ends of the previous/current request.
+        // Invariant: callers must not invoke `update` while a replay that
+        // reads these inputs is in flight. Every prepared run synchronizes
+        // before returning its host action; the copies below are synchronous
+        // as well, so the next update starts from a quiescent stream.
         transfers::copy_cpu_to_device(&observation.pixel_values, &self.pixel_values)?;
         transfers::copy_cpu_to_device(&observation.state, &self.state)?;
         transfers::copy_cpu_to_device(&observation.noise, &self.noise)?;
@@ -396,6 +396,9 @@ impl Gr00tCapturedGraph {
         self.inputs.update(observation)?;
         let mut tokens = previous_cache.map(|(tokens, _)| tokens).unwrap_or_default();
         tokens.clone_from(&observation.token_ids);
+        // The cached DeviceBuffer is a shallow clone of this plan's token
+        // buffer. It must not outlive the plan, and no eager path may reuse
+        // that buffer while the plan is live.
         *token_cache = Some((tokens, self.inputs.token_ids.clone()));
         self.graph.replay()?;
         backend.synchronize()?;
