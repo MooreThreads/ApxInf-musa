@@ -300,6 +300,24 @@ pub(crate) struct Gr00tCapturedGraph {
     inputs: Gr00tPreparedInputs,
 }
 
+impl Gr00tCapturedGraph {
+    /// Destroy the captured graph before handing its arena to a replacement
+    /// plan. Captured nodes retain raw addresses into the arena, so the graph
+    /// must be gone before the next capture reuses the same storage.
+    pub(crate) fn into_workspace(self) -> kernels::GraphWorkspace {
+        let Gr00tCapturedGraph {
+            graph,
+            _workspace,
+            output,
+            inputs,
+        } = self;
+        drop(graph);
+        drop(output);
+        drop(inputs);
+        _workspace
+    }
+}
+
 struct Gr00tBackboneOutput {
     non_image: Tensor,
     image: Tensor,
@@ -951,6 +969,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
     pub(crate) fn capture_prepared_graph(
         &mut self,
         observation: &Gr00tObservation,
+        reused: Option<kernels::GraphWorkspace>,
     ) -> Result<(Gr00tGraphKey, Gr00tCapturedGraph)> {
         let key = self.prepared_key(observation)?;
         if self.backend.context().tuning().mode() == TuningMode::AutoTune {
@@ -962,7 +981,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         let inputs = Gr00tPreparedInputs::new(observation, &self.backend)?;
         self.prepare_fixed_inputs(observation, Some(inputs.token_ids.clone()))?;
         let device_observation = inputs.observation(observation);
-        let workspace = self.allocate_prepared_workspace()?;
+        let workspace = match reused {
+            Some(workspace) => workspace,
+            None => self.allocate_prepared_workspace()?,
+        };
         // The current MUSA graph API records exactly one traversal. Prime all
         // provider handles and the session's shape ledger on this same stream
         // before capture; the older isolated-stream API performed this warmup
