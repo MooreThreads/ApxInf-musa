@@ -243,7 +243,9 @@ class FormatTests(unittest.TestCase):
         reference = self.root / "reference.npz"
         np.savez(reference, normalized_actions=np.ones((40, 132)), noise=np.ones((40, 132)))
         args = SimpleNamespace(fixture=self.root, reference=reference, warmup=1, iterations=1,
-                               output=self.root / "output.json")
+                               output=self.root / "output.json",
+                               reference_noise=None, allow_missing_noise=False,
+                               expect_model="nvidia/GR00T-N1.7-LIBERO")
         for module in (rust, wheel):
             with patch.object(module, "parse_args", return_value=args):
                 with self.assertRaisesRegex(ValueError, "noise differ"):
@@ -257,7 +259,9 @@ class FormatTests(unittest.TestCase):
                  noise=np.full((1, 40, 132), 0.5, dtype=np.float32))
         np.savez(reference, normalized_actions=np.full((1, 40, 132), 0x3F80, dtype=np.uint16),
                  noise=np.full((40, 132), 0x3F00, dtype=np.uint16))
-        args = SimpleNamespace(apxinf=actual, reference=reference, output=output, precision="bf16")
+        args = SimpleNamespace(apxinf=actual, reference=reference, output=output, precision="bf16",
+                               reference_noise=None, allow_missing_noise=False,
+                               expect_model="nvidia/GR00T-N1.7-LIBERO")
         with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(compare_outputs.main(), 0)
         report = json.loads(output.read_text())
@@ -269,6 +273,94 @@ class FormatTests(unittest.TestCase):
         with patch.object(compare_outputs, "parse_args", return_value=args):
             with self.assertRaisesRegex(SystemExit, "noise differ"):
                 compare_outputs.main()
+
+    def test_json_archive_reads_noise_and_metadata(self):
+        document = {
+            "model": "nvidia/GR00T-N1.7-LIBERO",
+            "schema": "apxinf.gr00t-n1.7.benchmark.v2",
+            "output": {"shape": [40, 132], "values": np.zeros((40, 132), dtype=np.float32).tolist()},
+            "noise": {"shape": [1, 40, 132], "values": np.zeros((1, 40, 132), dtype=np.float32).tolist()},
+        }
+        path = self.root / "archive.json"
+        path.write_text(json.dumps(document))
+        archive = formats.load_archive(
+            path,
+            expect_model=document["model"],
+            expect_schema_prefix="apxinf.gr00t-n1.7.benchmark.",
+        )
+        self.assertEqual(archive["noise"].shape, (1, 40, 132))
+        self.assertEqual(
+            formats.load_metadata(path),
+            {"model": document["model"], "schema": document["schema"]},
+        )
+        with self.assertRaisesRegex(ValueError, "model"):
+            formats.load_archive(path, expect_model="other")
+        with self.assertRaisesRegex(ValueError, "schema"):
+            formats.load_archive(path, expect_schema_prefix="other")
+
+    def test_json_archive_rejects_bad_noise(self):
+        for noise in (
+            {"shape": [1, 40], "values": [0.0] * 40},
+            {"shape": [1, 40, 132], "values": [float("nan")] + [0.0] * 5279},
+            {"shape": [1, 40, 132], "values": [0.0] * 5279},
+        ):
+            with self.subTest(noise=noise):
+                document = {
+                    "output": {"shape": [40, 132], "values": [0.0] * 5280},
+                    "noise": noise,
+                }
+                path = self.root / "archive.json"
+                path.write_text(json.dumps(document))
+                with self.assertRaises(ValueError):
+                    formats.load_archive(path)
+
+    def test_comparison_cli_enforces_max_abs_and_noise_policy(self):
+        actual = self.root / "actual.json"
+        reference = self.root / "reference.json"
+        output = self.root / "parity.json"
+        base = np.ones((40, 132), dtype=np.float32)
+        noise = np.zeros((1, 40, 132), dtype=np.float32)
+
+        def write(path, values, model, schema=None, with_noise=True):
+            document = {
+                "model": model,
+                "output": {"shape": [40, 132], "values": values.tolist()},
+            }
+            if schema is not None:
+                document["schema"] = schema
+            if with_noise:
+                document["noise"] = {"shape": [1, 40, 132], "values": noise.tolist()}
+            path.write_text(json.dumps(document))
+
+        write(actual, base, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2")
+        write(reference, base, "nvidia/GR00T-N1.7-LIBERO")
+        args = SimpleNamespace(
+            apxinf=actual,
+            reference=reference,
+            output=output,
+            precision="bf16",
+            reference_noise=None,
+            allow_missing_noise=False,
+            expect_model="nvidia/GR00T-N1.7-LIBERO",
+        )
+        with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(compare_outputs.main(), 0)
+
+        drifted = base.copy()
+        drifted[0, 0] += 0.126
+        write(actual, drifted, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2")
+        with patch.object(compare_outputs, "parse_args", return_value=args):
+            with self.assertRaisesRegex(SystemExit, "max_abs"):
+                compare_outputs.main()
+
+        write(actual, base, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2", with_noise=False)
+        write(reference, base, "nvidia/GR00T-N1.7-LIBERO", with_noise=False)
+        with patch.object(compare_outputs, "parse_args", return_value=args):
+            with self.assertRaisesRegex(SystemExit, "noise is required"):
+                compare_outputs.main()
+        args.allow_missing_noise = True
+        with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(compare_outputs.main(), 0)
 
 
 if __name__ == "__main__":

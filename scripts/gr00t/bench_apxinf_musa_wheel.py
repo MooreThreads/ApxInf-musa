@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from compare_outputs import GATES, compare_array, load_archive
-from formats import load_fixture
+from compare_outputs import GATES, compare_array, load_archive, noise_sha256
+from formats import load_fixture, load_metadata, load_noise
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,11 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tactics", type=Path)
     parser.add_argument("--autotune", action="store_true")
     parser.add_argument("--reference", type=Path, help="normalized-action NPY/NPZ or benchmark JSON")
+    parser.add_argument("--reference-noise", type=Path)
+    parser.add_argument("--allow-missing-noise", action="store_true")
+    parser.add_argument("--expect-model", default="nvidia/GR00T-N1.7-LIBERO")
     parser.add_argument("--output", type=Path,
                         default=Path("devlocal/gr00t-n1d7/results/gr00t-musa-wheel.json"))
     args = parser.parse_args()
-    if args.warmup < 0 or args.iterations <= 0:
-        parser.error("--warmup must be non-negative and --iterations must be positive")
+    if args.warmup < 1 or args.iterations <= 0:
+        parser.error("--warmup must be at least 1 and --iterations must be positive")
     if args.autotune and args.tactics is None:
         parser.error("--autotune requires --tactics")
     if args.output.suffix != ".json":
@@ -44,9 +47,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     manifest, arrays = load_fixture(args.fixture)
-    reference = load_archive(args.reference) if args.reference else None
-    if reference is not None and "noise" in reference and not np.array_equal(arrays["noise"], reference["noise"]):
+    reference = (
+        load_archive(args.reference, expect_model=args.expect_model)
+        if args.reference is not None
+        else None
+    )
+    reference_metadata = load_metadata(args.reference) if args.reference is not None else {}
+    reference_noise = reference.get("noise") if reference is not None else None
+    if args.reference_noise is not None:
+        external = load_noise(args.reference_noise)
+        if reference_noise is not None and not np.array_equal(reference_noise, external):
+            raise ValueError("reference noise differs from --reference-noise")
+        reference_noise = external
+    if reference_noise is not None and not np.array_equal(arrays["noise"], reference_noise):
         raise ValueError("fixture and reference noise differ")
+    if (
+        args.reference is not None
+        and reference_noise is None
+        and not args.allow_missing_noise
+    ):
+        raise ValueError(
+            "reference has no noise; pass --reference-noise or --allow-missing-noise"
+        )
     import apxinf_py
 
     started = time.perf_counter()
@@ -105,6 +127,11 @@ def main() -> None:
         },
         "samples_detail": samples, "deterministic": deterministic,
         "repeat_normalized_max_abs": repeat_max_abs,
+        "model": "gr00t",
+        "noise": {
+            "shape": list(arrays["noise"].shape),
+            "values": arrays["noise"].reshape(-1).tolist(),
+        },
         "input": {
             "pixel_values": list(arrays["pixel_values"].shape),
             "image_grid_thw": arrays["image_grid_thw"].tolist(),
@@ -119,10 +146,46 @@ def main() -> None:
     if args.reference:
         metrics = compare_array(first_output, reference["normalized_actions"])
         gate = GATES[args.precision]
-        parity_passed = (metrics["cosine"] >= gate["minimum_cosine"]
-                         and metrics["relative_l2"] <= gate["maximum_relative_l2"])
-        report["parity"] = {"reference": str(args.reference), **metrics, "passed": parity_passed}
-        passed = passed and parity_passed
+        noise_checked = reference_noise is not None
+        noise_exact_match = (
+            bool(np.array_equal(arrays["noise"], reference_noise))
+            if noise_checked
+            else None
+        )
+        failures = []
+        if metrics["cosine"] < gate["minimum_cosine"]:
+            failures.append(f"cosine={metrics['cosine']:.9f} < {gate['minimum_cosine']}")
+        if metrics["relative_l2"] > gate["maximum_relative_l2"]:
+            failures.append(
+                f"relative_l2={metrics['relative_l2']:.9f} > {gate['maximum_relative_l2']}"
+            )
+        if metrics["max_abs"] > gate["maximum_abs"]:
+            failures.append(
+                f"max_abs={metrics['max_abs']:.9f} > {gate['maximum_abs']}"
+            )
+        if noise_checked and not noise_exact_match:
+            failures.append("ApxInf and reference noise differ")
+        if not noise_checked and not args.allow_missing_noise:
+            failures.append(
+                "noise is required; pass --reference-noise or --allow-missing-noise"
+            )
+        parity = {
+            "reference": str(args.reference),
+            "reference_model": reference_metadata.get("model"),
+            "noise_checked": noise_checked,
+            "noise_exact_match": noise_exact_match,
+            "noise_sha256": {
+                "apxinf": noise_sha256(arrays["noise"]),
+                "reference": noise_sha256(reference_noise)
+                if reference_noise is not None
+                else None,
+            },
+            **metrics,
+            "passed": not failures,
+            "failures": failures,
+        }
+        report["parity"] = parity
+        passed = passed and not failures
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"latency_ms": report["latency_ms"], "execution": execution,
