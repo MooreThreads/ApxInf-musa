@@ -1,8 +1,10 @@
 //! The host-side source a streaming weight builder consumes.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use apxinf_core::{Error, Result, Tensor};
+use apxinf_loader::safetensors::CheckpointReader;
 
 /// One checkpoint, consumed by tensor name.
 ///
@@ -43,32 +45,42 @@ impl WeightSource for HashMap<String, Tensor> {
     }
 }
 
-/// A checkpoint map whose `model.` prefix has already been normalized away.
-pub(crate) struct MapSource {
-    tensors: HashMap<String, Tensor>,
+/// A checkpoint read one tensor at a time from disk.
+///
+/// The reader holds headers only until a tensor is taken, and `model.`-prefixed
+/// exports are looked up with the same prefix rule the map path applies.
+pub(crate) struct CheckpointSource {
+    reader: CheckpointReader,
+    strip_model_prefix: bool,
 }
 
-impl MapSource {
-    pub(crate) fn new(tensors: HashMap<String, Tensor>) -> Self {
-        let mut tensors = tensors;
-        super::host::normalize_lerobot_prefix(&mut tensors);
-        Self { tensors }
+impl CheckpointSource {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let reader = CheckpointReader::open(path)
+            .map_err(|error| Error::Other(format!("load PI0.5 SafeTensors: {error}")))?;
+        let strip_model_prefix = super::host::needs_model_prefix_strip(reader.keys());
+        Ok(Self {
+            reader,
+            strip_model_prefix,
+        })
     }
 
-    /// Keys the loader did not consume; the real checkpoint leaves the unused
-    /// action-expert `lm_head` (and any losing tied alias) behind.
-    #[allow(dead_code)]
-    pub(crate) fn remaining_keys(&self) -> impl Iterator<Item = &str> {
-        self.tensors.keys().map(String::as_str)
+    fn key<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.strip_model_prefix {
+            std::borrow::Cow::Owned(format!("model.{name}"))
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        }
     }
 }
 
-impl WeightSource for MapSource {
+impl WeightSource for CheckpointSource {
     fn take_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
-        Ok(self.tensors.remove(name))
+        let key = self.key(name).into_owned();
+        self.reader.take(&key).map_err(Error::Other)
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.reader.contains(&self.key(name))
     }
 }

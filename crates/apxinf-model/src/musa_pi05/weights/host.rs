@@ -655,14 +655,27 @@ pub(in crate::musa_pi05) fn take_action_glue(
     })
 }
 
-pub(super) fn normalize_lerobot_prefix(tensors: &mut HashMap<String, Tensor>) {
+/// Whether a checkpoint's keys are wrapped in a `model.` namespace.
+///
+/// The map path rewrites the keys; the streaming reader cannot, so it asks the
+/// same question from the header keys and prefixes every lookup instead.
+pub(super) fn needs_model_prefix_strip<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     let canonical_prefix = format!("{ROOT}.");
     let wrapped_prefix = format!("model.{ROOT}.");
-    if tensors
-        .keys()
-        .any(|name| name.starts_with(&canonical_prefix))
-        || !tensors.keys().any(|name| name.starts_with(&wrapped_prefix))
-    {
+    let mut canonical = false;
+    let mut wrapped = false;
+    for key in keys {
+        if key.starts_with(&canonical_prefix) {
+            canonical = true;
+        } else if key.starts_with(&wrapped_prefix) {
+            wrapped = true;
+        }
+    }
+    !canonical && wrapped
+}
+
+pub(super) fn normalize_lerobot_prefix(tensors: &mut HashMap<String, Tensor>) {
+    if !needs_model_prefix_strip(tensors.keys().map(String::as_str)) {
         return;
     }
     *tensors = std::mem::take(tensors)

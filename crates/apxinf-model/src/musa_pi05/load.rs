@@ -9,7 +9,7 @@ use super::model::{
     build_bf16_model_with_policies, build_int8_dynamic_model_with_policies,
     upload_time_embeddings_bf16, upload_time_embeddings_int8_dynamic, L3Policies, ModelVariant,
 };
-use super::weights::{Bf16Weights, Int8DynamicWeights, Int8Scope, MapSource, Pi05Weights};
+use super::weights::{Bf16Weights, Int8DynamicWeights, Int8Scope, Pi05Weights};
 use super::backend::Context;
 use super::{backend, ModelVariantChoice, Pi05Config, Pi05ModelRunner};
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
@@ -100,15 +100,10 @@ pub(crate) fn load_model_runner(
                     weights
                 }
                 None => {
-                    // Stream the checkpoint layer by layer: the host map is
-                    // consumed as the device copy is built, so the folded F32
-                    // copies never accumulate.
-                    let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
-                        .map_err(|error| {
-                            Error::Other(format!("load PI0.5 SafeTensors: {error}"))
-                        })?;
-                    let mut source = MapSource::new(tensors);
-                    Int8DynamicWeights::from_source(&config, &mut source, &*backend, scope)?
+                    // Read the checkpoint tensor by tensor; the host map is
+                    // never materialised, so neither the whole BF16 checkpoint
+                    // nor the folded F32 copies accumulate.
+                    Int8DynamicWeights::from_checkpoint(&config, path, &*backend, scope)?
                 }
             };
             let weights = Arc::new(weights);

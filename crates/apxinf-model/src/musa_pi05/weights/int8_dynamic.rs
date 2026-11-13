@@ -1122,6 +1122,20 @@ impl Int8DynamicWeights {
             )?,
         })
     }
+
+    /// Open `path` as a per-tensor reader and stream it through the same loop.
+    ///
+    /// Nothing but one tensor (or one layer's staging) is held on the host at a
+    /// time; the device bytes are the ones `from_source` produces.
+    pub(crate) fn from_checkpoint(
+        config: &Pi05Config,
+        path: &std::path::Path,
+        backend: &Context,
+        scope: Int8Scope,
+    ) -> Result<Self> {
+        let mut source = super::source::CheckpointSource::open(path)?;
+        Self::from_source(config, &mut source, backend, scope)
+    }
 }
 
 impl Int8DynamicDeviceLayerNorm {

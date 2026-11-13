@@ -283,15 +283,18 @@ capacity/used/peak/attempts.
 
 ### Streaming int8 loads
 
-A real-checkpoint `int8_dynamic` load streams the checkpoint into the device
-weights instead of materializing the whole host model first.
-`Int8DynamicWeights::from_source` takes one layer at a time through
-`WeightSource`, folds it in F32, quantizes and uploads it, then drops the host
-copy before the next layer; `Pi05Weights` and the BF16 path are unchanged.
-`bf16_to_device` copies a tensor already in BF16 straight to the device rather
-than round-tripping through F32. On M1000 with `pi05_libero_pytorch`, the
-measured host peak falls from 14.1 GiB to 7.5 GiB while the device weights and
-the L0 actions stay bit-identical; the largest remaining transient is the
+A real-checkpoint `int8_dynamic` load never materializes the whole host model.
+`CheckpointReader` opens SafeTensors shard headers only and reads one tensor's
+bytes on demand; `Int8DynamicWeights::from_checkpoint` feeds those tensors
+through `WeightSource` one layer at a time, folds them in F32, quantizes and
+uploads them, then drops the host copy before the next layer. The reader shares
+header parsing and the sharded index's wrong-shard, duplicate, missing and
+unsafe-path checks with the whole-file loader. `bf16_to_device` copies a tensor
+already in BF16 straight to the device rather than round-tripping through F32;
+`Pi05Weights` and the BF16 path are unchanged. On M1000 with
+`pi05_libero_pytorch` (two camera views), the measured host peak falls from
+14.1 GiB to 2.1 GiB while the device weights and the L0 actions stay
+bit-identical; the largest remaining transients are the token embedding and the
 language gate/up group's F32 staging. Loading stays synchronous per group, so
 capture and replay are unchanged.
 
