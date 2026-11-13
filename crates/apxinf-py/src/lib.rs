@@ -1911,7 +1911,9 @@ impl ModelRunner {
 
     #[getter]
     fn patches_per_view(&self) -> usize {
-        self.patch_rows() / self.num_views()
+        self.patch_rows()
+            .checked_div(self.num_views())
+            .unwrap_or(0)
     }
 
     #[getter]
