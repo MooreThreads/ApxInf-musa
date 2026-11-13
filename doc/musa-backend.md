@@ -281,6 +281,20 @@ arena with a 105.0 MiB live peak, and the steady device footprint falls from
 allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
 capacity/used/peak/attempts.
 
+### Streaming int8 loads
+
+A real-checkpoint `int8_dynamic` load streams the checkpoint into the device
+weights instead of materializing the whole host model first.
+`Int8DynamicWeights::from_source` takes one layer at a time through
+`WeightSource`, folds it in F32, quantizes and uploads it, then drops the host
+copy before the next layer; `Pi05Weights` and the BF16 path are unchanged.
+`bf16_to_device` copies a tensor already in BF16 straight to the device rather
+than round-tripping through F32. On M1000 with `pi05_libero_pytorch`, the
+measured host peak falls from 14.1 GiB to 7.5 GiB while the device weights and
+the L0 actions stay bit-identical; the largest remaining transient is the
+language gate/up group's F32 staging. Loading stays synchronous per group, so
+capture and replay are unchanged.
+
 FP8 is **not ported**, and the port says so rather than silently degrading: an
 FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 `fp8_static`.

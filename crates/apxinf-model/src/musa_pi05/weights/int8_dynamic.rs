@@ -883,10 +883,19 @@ pub use linear::*;
 use apxinf_core::{Result, Tensor};
 
 use crate::musa_pi05::backend::Context;
+use crate::musa_pi05::Pi05Config;
 use crate::musa_pi05::{
     bf16_to_device, ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights,
     Pi05Weights, VisionBlockWeights,
 };
+
+use super::host::{
+    take_action_final_norm, take_action_glue, take_action_layer,
+    take_language_final_norm_scale, take_language_layer, take_multimodal_projector,
+    take_patch_embedding, take_position_embedding, take_token_embedding, take_vision_block,
+    take_vision_post_layer_norm, validate_action_layer, validate_language_layer, ROOT,
+};
+use super::source::WeightSource;
 
 pub struct Int8DynamicDeviceLayerNorm {
     pub weight: Tensor,
@@ -1007,6 +1016,109 @@ impl Int8DynamicWeights {
                 backend,
                 "glue",
                 scope,
+            )?,
+        })
+    }
+
+    /// Stream a checkpoint through the same fold/quantize/upload path as
+    /// [`Self::from_host`], taking each layer from `source` immediately before
+    /// building its device copy and dropping the host copy afterwards.
+    ///
+    /// The arithmetic is `from_host`'s: the same extraction, F32 fold, concat,
+    /// equalization, tile padding and per-output-channel quantization, in the
+    /// same order. Only tensor lifetimes change, so the device bytes are
+    /// identical while the retained host peak is one layer's staging instead of
+    /// the whole model.
+    pub(crate) fn from_source<S: WeightSource>(
+        config: &Pi05Config,
+        source: &mut S,
+        backend: &Context,
+        scope: Int8Scope,
+    ) -> Result<Self> {
+        config.validate()?;
+        let vision_prefix = format!("{ROOT}.paligemma.model.vision_tower.vision_model");
+        let language_prefix = format!("{ROOT}.paligemma.model.language_model");
+        let action_prefix = format!("{ROOT}.gemma_expert.model");
+
+        let patch_embedding = Int8DynamicLinearWeights::from_host(
+            &take_patch_embedding(source, config, &vision_prefix)?,
+            backend,
+            "glue",
+            scope,
+        )?;
+        let position_embedding =
+            bf16_to_device(&take_position_embedding(source, &vision_prefix)?, backend)?;
+
+        let mut vision_layers = Vec::with_capacity(config.vision_depth);
+        for layer in 0..config.vision_depth {
+            let host = take_vision_block(source, &vision_prefix, layer)?;
+            vision_layers.push(Int8DynamicDeviceVisionBlock::from_host(
+                &host, backend, scope,
+            )?);
+        }
+
+        let vision_post_norm = Int8DynamicDeviceLayerNorm::from_host(
+            &take_vision_post_layer_norm(source, &vision_prefix)?,
+            backend,
+        )?;
+        let multimodal_projector = Int8DynamicLinearWeights::from_host(
+            &take_multimodal_projector(source)?,
+            backend,
+            "glue",
+            scope,
+        )?;
+        let token_embedding = bf16_to_device(&take_token_embedding(source)?, backend)?;
+
+        let mut language_layers = Vec::with_capacity(config.language.depth);
+        for layer in 0..config.language.depth {
+            let host = take_language_layer(source, &language_prefix, layer)?;
+            validate_language_layer(&config.language, layer, &host)?;
+            language_layers.push(Int8DynamicDeviceLanguageLayer::from_host(
+                &host, backend, scope,
+            )?);
+        }
+        let language_final_norm_scale = bf16_to_device(
+            &take_language_final_norm_scale(source, &language_prefix)?,
+            backend,
+        )?;
+
+        let mut action_layers = Vec::with_capacity(config.action_expert.depth);
+        for layer in 0..config.action_expert.depth {
+            let host = take_action_layer(source, &action_prefix, layer)?;
+            validate_action_layer(&config.action_expert, layer, &host)?;
+            action_layers.push(Int8DynamicDeviceActionLayer::from_host(
+                &host, backend, scope,
+            )?);
+        }
+        let action_final_modulation = modulation_to_device(
+            &take_action_final_norm(source, &action_prefix)?,
+            backend,
+            scope,
+        )?;
+        let glue = take_action_glue(source)?;
+
+        Ok(Self {
+            patch_embedding,
+            position_embedding,
+            vision_layers,
+            vision_post_norm,
+            multimodal_projector,
+            token_embedding,
+            language_layers,
+            language_final_norm_scale,
+            action_layers,
+            action_final_modulation,
+            action_in: Int8DynamicLinearWeights::from_host(
+                &glue.action_in, backend, "glue", scope,
+            )?,
+            action_out: Int8DynamicLinearWeights::from_host(
+                &glue.action_out, backend, "glue", scope,
+            )?,
+            time_mlp_in: Int8DynamicLinearWeights::from_host(
+                &glue.time_mlp_in, backend, "glue", scope,
+            )?,
+            time_mlp_out: Int8DynamicLinearWeights::from_host(
+                &glue.time_mlp_out, backend, "glue", scope,
             )?,
         })
     }

@@ -9,7 +9,7 @@ use super::model::{
     build_bf16_model_with_policies, build_int8_dynamic_model_with_policies,
     upload_time_embeddings_bf16, upload_time_embeddings_int8_dynamic, L3Policies, ModelVariant,
 };
-use super::weights::{Bf16Weights, Int8DynamicWeights, Int8Scope, Pi05Weights};
+use super::weights::{Bf16Weights, Int8DynamicWeights, Int8Scope, MapSource, Pi05Weights};
 use super::backend::Context;
 use super::{backend, ModelVariantChoice, Pi05Config, Pi05ModelRunner};
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
@@ -83,10 +83,6 @@ pub(crate) fn load_model_runner(
     let model_variant = model_variant.ensure_supported(0)?;
     eprintln!("[apxinf] PI0.5 model_variant={}", model_variant.as_str());
 
-    let host_weights = match options.synthetic {
-        Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
-        None => Pi05Weights::from_safetensors(&config, path)?,
-    };
     let policies = L3Policies::default();
     install_tactics(&backend, options)?;
     let model = match model_variant {
@@ -95,12 +91,27 @@ pub(crate) fn load_model_runner(
                 ModelVariantChoice::Int8DynamicNoEncode => Int8Scope::WithoutEncode,
                 _ => Int8Scope::All,
             };
-            let weights = Arc::new(Int8DynamicWeights::from_host(
-                &host_weights, &*backend, scope,
-            )?);
-            // Packing is the only reader of the host copy; the device weights
-            // and their FP16 scale renderings are independent of it.
-            drop(host_weights);
+            let weights = match options.synthetic {
+                Some(synthetic) => {
+                    let host_weights = Pi05Weights::synthetic(&config, synthetic.seed)?;
+                    let weights =
+                        Int8DynamicWeights::from_host(&host_weights, &*backend, scope)?;
+                    drop(host_weights);
+                    weights
+                }
+                None => {
+                    // Stream the checkpoint layer by layer: the host map is
+                    // consumed as the device copy is built, so the folded F32
+                    // copies never accumulate.
+                    let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
+                        .map_err(|error| {
+                            Error::Other(format!("load PI0.5 SafeTensors: {error}"))
+                        })?;
+                    let mut source = MapSource::new(tensors);
+                    Int8DynamicWeights::from_source(&config, &mut source, &*backend, scope)?
+                }
+            };
+            let weights = Arc::new(weights);
             let time_embeddings = upload_time_embeddings_int8_dynamic(&config, &*backend)?;
             ModelVariant::Int8Dynamic {
                 model: build_int8_dynamic_model_with_policies(
@@ -114,6 +125,10 @@ pub(crate) fn load_model_runner(
             }
         }
         _ => {
+            let host_weights = match options.synthetic {
+                Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
+                None => Pi05Weights::from_safetensors(&config, path)?,
+            };
             let weights = Arc::new(Bf16Weights::from_host(&host_weights, &*backend)?);
             // Bound peak memory: the decode layouts are materialised from here, and
             // there is no reason for them to meet a live FP32 copy of the checkpoint.
