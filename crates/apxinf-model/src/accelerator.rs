@@ -44,7 +44,7 @@ pub(crate) fn create_backend_with_recipe_options(
         // full because the import above is gone exactly when every other
         // backend feature is on, and one of these two arms always compiles.
         #[cfg(feature = "musa")]
-        Device::Musa(_) => Err(apxinf_core::Error::UnsupportedDevice(device)),
+        Device::Musa(id) => Ok(Arc::new(apxinf_musa::MusaBackend::new(id)?)),
         #[cfg(not(feature = "musa"))]
         Device::Musa(_) => Err(apxinf_core::Error::Other(
             "MUSA support not compiled in".into(),

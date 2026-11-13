@@ -109,3 +109,7 @@ required-features = ["cuda"]
 [[example]]
 name = "clef_decision_index"
 required-features = ["mlx"]
+
+[[example]]
+name = "qwen3vl_musa_check"
+required-features = ["musa"]
