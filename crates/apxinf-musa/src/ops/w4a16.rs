@@ -31,9 +31,11 @@ pub fn linear(ctx: &MusaContext, a: &Tensor, w: W4A16WeightView<'_>, out: &mut T
         let aa=MusaBuffer::from_tensor(a).map_err(Error::Other)?;
         let ss=MusaBuffer::from_tensor(w.scales).map_err(Error::Other)?;
         let cc=MusaBuffer::from_tensor(out).map_err(Error::Other)?;
-        let native_pair_shape = (dims[0] == 522 && matches!((w.n,w.k),(32768,2048)|(2048,16384)))
-            || (dims[0] == 512 && matches!((w.n,w.k),
-                (3456,1152)|(1152,1152)|(4304,1152)|(1152,4304)));
+        // The native decoder currently implements only the two language MLP
+        // shapes below. Vision shapes must stay on the fused W4 fallback until
+        // matching decode kernels are implemented and validated.
+        let native_pair_shape = dims[0] == 522
+            && matches!((w.n,w.k),(32768,2048)|(2048,16384));
         if group==16 && native_pair_shape && crate::workspace::w4_native_enabled() {
             let scratch=crate::workspace::w4_session_buffer(ctx,w.n,w.k)?;
             crate::workspace::note_shape(crate::workspace::OperationShape::Gemm {m:dims[0],n:w.n,k:w.k})?;
