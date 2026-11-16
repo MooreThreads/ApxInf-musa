@@ -204,7 +204,6 @@ struct ReaderShard {
 }
 
 /// A tensor's header entry, resolved to an absolute range in its shard.
-#[derive(Clone)]
 struct ReaderEntry {
     shard: usize,
     abs_start: usize,
@@ -220,6 +219,9 @@ struct ReaderEntry {
 /// never materialises the whole checkpoint. This is the streaming counterpart
 /// of [`load_native_path`], and it preserves the same sharded-index validation,
 /// duplicate/missing checks, unsafe-path rejection and metadata union.
+///
+/// `take` uses `std::os::unix::fs::FileExt::read_exact_at`, so streaming
+/// requires a Unix target.
 pub struct CheckpointReader {
     shards: Vec<ReaderShard>,
     entries: HashMap<String, ReaderEntry>,
@@ -241,12 +243,12 @@ impl CheckpointReader {
             let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
             for shard_name in shards {
                 let shard_path = parent.join(&shard_name);
-                let (file, entries, metadata) = open_shard(&shard_path)?;
+                let (file, header) = parse_shard_header(&shard_path)?;
                 let shard_index = reader.shards.len();
                 reader.shards.push(ReaderShard { file });
                 reader.files.push(shard_path);
-                reader.metadata.extend(metadata);
-                for (name, dtype, shape, abs_start, len) in entries {
+                reader.metadata.extend(header.metadata);
+                for (name, range) in header.entries {
                     let Some(expected) = index.weight_map.get(&name) else {
                         continue;
                     };
@@ -261,10 +263,10 @@ impl CheckpointReader {
                             name.clone(),
                             ReaderEntry {
                                 shard: shard_index,
-                                abs_start,
-                                len,
-                                dtype,
-                                shape,
+                                abs_start: range.abs_start,
+                                len: range.len,
+                                dtype: range.dtype,
+                                shape: range.shape,
                             },
                         )
                         .is_some()
@@ -287,19 +289,19 @@ impl CheckpointReader {
                 ));
             }
         } else {
-            let (file, entries, metadata) = open_shard(&resolved)?;
+            let (file, header) = parse_shard_header(&resolved)?;
             reader.shards.push(ReaderShard { file });
             reader.files.push(resolved.clone());
-            reader.metadata.extend(metadata);
-            for (name, dtype, shape, abs_start, len) in entries {
+            reader.metadata.extend(header.metadata);
+            for (name, range) in header.entries {
                 reader.entries.insert(
                     name,
                     ReaderEntry {
                         shard: 0,
-                        abs_start,
-                        len,
-                        dtype,
-                        shape,
+                        abs_start: range.abs_start,
+                        len: range.len,
+                        dtype: range.dtype,
+                        shape: range.shape,
                     },
                 );
             }
@@ -342,37 +344,37 @@ impl CheckpointReader {
         Ok(Some(tensor))
     }
 
-    pub fn take_any(&mut self, names: &[String]) -> Result<Tensor, String> {
-        for name in names {
-            if let Some(tensor) = self.take(name)? {
-                return Ok(tensor);
-            }
-        }
-        Err(format!(
-            "missing tensor (accepted aliases: {})",
-            names.join(", ")
-        ))
-    }
 }
 
-type ParsedHeader = (
-    File,
-    Vec<(String, DType, Vec<usize>, usize, usize)>,
-    HashMap<String, String>,
-);
+/// One tensor's validated absolute range in its shard.
+struct TensorRange {
+    dtype: DType,
+    shape: Vec<usize>,
+    abs_start: usize,
+    len: usize,
+}
+
+/// One shard's parsed header: tensor ranges and the `__metadata__` entries.
+struct ShardHeader {
+    entries: Vec<(String, TensorRange)>,
+    metadata: HashMap<String, String>,
+}
 
 /// Open one shard, parse its header and validate every entry's file range.
 ///
-/// The messages here are the ones `load_impl` produces for the same failures,
-/// so a reader error and a whole-file load error read the same.
-fn open_shard(path: &Path) -> Result<ParsedHeader, String> {
+/// `CheckpointReader::open` and `load_impl` both call this, so a streaming
+/// reader and a whole-file load produce the same error for the same malformed
+/// header. The returned file is read with absolute offsets by the caller.
+fn parse_shard_header(path: &Path) -> Result<(File, ShardHeader), String> {
     use std::os::unix::fs::FileExt;
 
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-        .len() as usize;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len(),
+    )
+    .map_err(|_| "SafeTensors file is larger than this platform's address space".to_string())?;
     if file_len < 8 {
         return Err("file too small to be a SafeTensors file".into());
     }
@@ -380,14 +382,20 @@ fn open_shard(path: &Path) -> Result<ParsedHeader, String> {
     let mut length_bytes = [0u8; 8];
     file.read_exact_at(&mut length_bytes, 0)
         .map_err(|e| format!("failed to read header length: {e}"))?;
-    let header_len = u64::from_le_bytes(length_bytes) as usize;
-    if file_len < 8 + header_len {
+    let header_len = u64::from_le_bytes(length_bytes);
+    let data_start_u64 = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| format!("header length {header_len} overflows the file offset range"))?;
+    if (file_len as u64) < data_start_u64 {
         return Err(format!(
             "file too small: expected at least {} bytes, got {}",
-            8 + header_len,
-            file_len
+            data_start_u64, file_len
         ));
     }
+    let data_start = usize::try_from(data_start_u64)
+        .map_err(|_| format!("header length {header_len} is too large for this platform"))?;
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| format!("header length {header_len} is too large for this platform"))?;
 
     let mut header_bytes = vec![0u8; header_len];
     file.read_exact_at(&mut header_bytes, 8)
@@ -406,7 +414,6 @@ fn open_shard(path: &Path) -> Result<ParsedHeader, String> {
         }
     }
 
-    let data_start = 8 + header_len;
     let mut entries = Vec::new();
     for (name, value) in &raw {
         if name == "__metadata__" {
@@ -417,17 +424,33 @@ fn open_shard(path: &Path) -> Result<ParsedHeader, String> {
         let dtype = parse_dtype(&info.dtype)
             .ok_or_else(|| format!("unsupported dtype '{}' for tensor '{name}'", info.dtype))?;
         let [start, end] = info.data_offsets;
-        let abs_start = data_start + start;
-        let abs_end = data_start + end;
-        if abs_end > file_len {
+        if start > end {
             return Err(format!(
-                "tensor '{name}': data_offsets [{start}, {end}] exceed file size {}",
-                file_len
+                "tensor '{name}': data_offsets [{start}, {end}] start exceeds end"
             ));
         }
-        entries.push((name.clone(), dtype, info.shape, abs_start, abs_end - abs_start));
+        let abs_start = data_start.checked_add(start).ok_or_else(|| {
+            format!("tensor '{name}': data_offsets [{start}, {end}] overflow the file offset range")
+        })?;
+        let abs_end = data_start.checked_add(end).ok_or_else(|| {
+            format!("tensor '{name}': data_offsets [{start}, {end}] overflow the file offset range")
+        })?;
+        if abs_end > file_len {
+            return Err(format!(
+                "tensor '{name}': data_offsets [{start}, {end}] exceed file size {file_len}"
+            ));
+        }
+        entries.push((
+            name.clone(),
+            TensorRange {
+                dtype,
+                shape: info.shape,
+                abs_start,
+                len: abs_end - abs_start,
+            },
+        ));
     }
-    Ok((file, entries, metadata))
+    Ok((file, ShardHeader { entries, metadata }))
 }
 
 fn load_impl(
@@ -436,98 +459,31 @@ fn load_impl(
 ) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
     use std::os::unix::fs::FileExt;
 
-    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-        .len() as usize;
-
-    if file_len < 8 {
-        return Err("file too small to be a SafeTensors file".into());
-    }
-
-    // Read the 8-byte LE header length, then the header. The file is read per
-    // tensor instead of mapped: a mapping keeps the whole checkpoint resident
-    // while every tensor is copied to the heap, so the load peaks at roughly
-    // twice the checkpoint size instead of once.
-    let mut length_bytes = [0u8; 8];
-    file.read_exact_at(&mut length_bytes, 0)
-        .map_err(|e| format!("failed to read header length: {e}"))?;
-    let header_len = u64::from_le_bytes(length_bytes) as usize;
-
-    if file_len < 8 + header_len {
-        return Err(format!(
-            "file too small: expected at least {} bytes, got {}",
-            8 + header_len,
-            file_len
-        ));
-    }
-
-    // Parse JSON header
-    let mut header_bytes = vec![0u8; header_len];
-    file.read_exact_at(&mut header_bytes, 8)
-        .map_err(|e| format!("failed to read header: {e}"))?;
-    let header_json = std::str::from_utf8(&header_bytes)
-        .map_err(|e| format!("invalid UTF-8 in header: {e}"))?;
-
-    let raw: HashMap<String, serde_json::Value> =
-        serde_json::from_str(header_json).map_err(|e| format!("JSON parse error: {e}"))?;
-
-    // Extract metadata (optional __metadata__ key)
-    let mut metadata = HashMap::new();
-    if let Some(serde_json::Value::Object(meta)) = raw.get("__metadata__") {
-        for (k, v) in meta {
-            if let Some(s) = v.as_str() {
-                metadata.insert(k.clone(), s.to_string());
-            }
-        }
-    }
-
-    // Data section starts after the 8-byte length + header
-    let data_start = 8 + header_len;
-
+    // Read each tensor instead of mapping the file: a mapping keeps the whole
+    // checkpoint resident while every tensor is copied to the heap, so the load
+    // peaks at roughly twice the checkpoint size instead of once.
+    let (file, ShardHeader { entries, metadata }) = parse_shard_header(path)?;
     let mut tensors = HashMap::new();
 
-    for (name, value) in &raw {
-        if name == "__metadata__" {
-            continue;
-        }
-
-        let info: TensorInfo = serde_json::from_value(value.clone())
-            .map_err(|e| format!("failed to parse tensor '{name}': {e}"))?;
-
-        let dtype = parse_dtype(&info.dtype)
-            .ok_or_else(|| format!("unsupported dtype '{}' for tensor '{name}'", info.dtype))?;
-
-        let [start, end] = info.data_offsets;
-        let abs_start = data_start + start;
-        let abs_end = data_start + end;
-
-        if abs_end > file_len {
-            return Err(format!(
-                "tensor '{name}': data_offsets [{start}, {end}] exceed file size {}",
-                file_len
-            ));
-        }
-
-        let mut bytes = vec![0u8; abs_end - abs_start];
-        file.read_exact_at(&mut bytes, abs_start as u64)
+    for (name, range) in entries {
+        let mut bytes = vec![0u8; range.len];
+        file.read_exact_at(&mut bytes, range.abs_start as u64)
             .map_err(|e| format!("failed to read tensor '{name}': {e}"))?;
-        let shape = Shape::from(info.shape);
+        let shape = Shape::from(range.shape);
 
         // BF16: upcast to F32 for the legacy path, or keep native for bf16 CUDA.
-        let tensor = if dtype == DType::BF16 && upcast_bf16 {
+        let tensor = if range.dtype == DType::BF16 && upcast_bf16 {
             let bf16_bytes: &[u8] = &bytes;
             let bf16_data: &[half::bf16] = bytemuck::cast_slice(bf16_bytes);
             let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
             Tensor::from_f32(shape.dims().to_vec(), &f32_data)
                 .map_err(|e| format!("tensor '{name}' bf16->f32 conversion error: {e}"))?
         } else {
-            Tensor::from_raw(shape, dtype, Device::Cpu, bytes)
+            Tensor::from_raw(shape, range.dtype, Device::Cpu, bytes)
                 .map_err(|e| format!("tensor '{name}' construction error: {e}"))?
         };
 
-        tensors.insert(name.clone(), tensor);
+        tensors.insert(name, tensor);
     }
 
     Ok((tensors, metadata))
@@ -653,6 +609,15 @@ mod tests {
         for (_, _, _, data) in tensors {
             out.extend_from_slice(data);
         }
+        out
+    }
+
+    /// Build a file whose header is written verbatim, so a test can produce
+    /// offsets that the normal fixture would never emit.
+    fn make_safetensors_with_raw_header(header_json: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = (header_json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header_json.as_bytes());
+        out.extend_from_slice(data);
         out
     }
 
@@ -1011,5 +976,57 @@ mod tests {
             .err()
             .expect("an unsafe shard path must be rejected");
         assert!(error.contains("unsafe shard path"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_reversed_data_offsets() {
+        let bytes = make_safetensors_with_raw_header(
+            r#"{"x": {"dtype": "F32", "shape": [1], "data_offsets": [4, 0]}}"#,
+            &[0u8; 4],
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(load_error.contains("data_offsets [4, 0]"), "{load_error}");
+        assert!(load_error.contains("start exceeds end"), "{load_error}");
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("a reversed range must be rejected");
+        assert_eq!(reader_error, load_error);
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_data_offsets_that_overflow() {
+        let header = format!(
+            r#"{{"x": {{"dtype": "F32", "shape": [1], "data_offsets": [1, {}]}}}}"#,
+            usize::MAX
+        );
+        let bytes = make_safetensors_with_raw_header(&header, &[0u8; 4]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(
+            load_error.contains("overflow the file offset range"),
+            "{load_error}"
+        );
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("an overflowing range must be rejected");
+        assert_eq!(reader_error, load_error);
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_an_overflowing_header_length() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&u64::MAX.to_le_bytes()).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(load_error.contains("header length"), "{load_error}");
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("an overflowing header length must be rejected");
+        assert_eq!(reader_error, load_error);
     }
 }
