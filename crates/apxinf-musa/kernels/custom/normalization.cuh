@@ -130,6 +130,39 @@ __global__ void rms_norm_bf16_vector_kernel(const __mt_bfloat16* input,
     *reinterpret_cast<LoadT*>(output + base + column) = out_raw;
   }
 }
+// Adaptive LayerNorm: modulation is [scale, shift], shared by all rows.
+// Keep the reduction in FP32 and round only the final affine result, matching
+// the recorded reference contract.
+__global__ void adaptive_layer_norm_bf16_kernel(
+    const __mt_bfloat16* input, const __mt_bfloat16* modulation,
+    __mt_bfloat16* output, int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    sum += __bfloat162float(input[base + col]);
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered = __bfloat162float(input[base + col]) - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = base + col;
+    const float normalized =
+        (__bfloat162float(input[index]) - mean) * inverse_std;
+    const float scale = __bfloat162float(modulation[col]);
+    const float shift = __bfloat162float(modulation[cols + col]);
+    output[index] = __float2bfloat16(normalized * (1.0f + scale) + shift);
+  }
+}
+
 
 // adaLN RMSNorm: scale and shift from the first two segments of `style`.
 //

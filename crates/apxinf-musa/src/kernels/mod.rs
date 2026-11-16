@@ -23,6 +23,7 @@ pub mod fused;
 pub mod gemm;
 pub mod norm;
 pub mod preprocess;
+pub mod quantization;
 pub mod rope;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};

@@ -1,10 +1,10 @@
 //! Activation operator contracts.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
     bf16_output, matrix_tensor, require_matrix_bf16, require_optional_vector_bf16,
-    require_output_matrix,
+    require_output_matrix, output_tensor, require_dtype_on,
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
@@ -25,6 +25,7 @@ use crate::kernels::not_ported;
 pub(super) const ACTIVATION_NONE: i32 = 0;
 pub(super) const ACTIVATION_GELU: i32 = 1;
 pub(super) const ACTIVATION_SILU: i32 = 2;
+pub(super) const ACTIVATION_RELU: i32 = 3;
 
 /// Bias plus the activation selected by `activation`.
 ///
@@ -158,6 +159,75 @@ pub fn bias_silu_bf16_into(
     bias_activation_into(ctx, input, value, output, ACTIVATION_SILU)
 }
 
+/// Bias plus ReLU.
+pub fn bias_relu_bf16(ctx: &MusaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
+    bias_activation(ctx, input, value, ACTIVATION_RELU)
+}
+
+/// Native device-resident SiLU gate for Qwen's gated MLP.
+pub fn silu_mul_bf16(ctx: &MusaContext, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    require_dtype_on(ctx, gate, DType::BF16, "silu multiply", "gate")?;
+    require_dtype_on(ctx, up, DType::BF16, "silu multiply", "up")?;
+    if gate.shape() != up.shape() || gate.numel() == 0 {
+        return Err(Error::Other(
+            "MUSA SiLU multiply requires equal non-empty input shapes".into(),
+        ));
+    }
+    let output = output_tensor(
+        ctx,
+        gate.shape().clone(),
+        DType::BF16,
+        crate::workspace::output_buffer(ctx, gate.size_in_bytes())?,
+    );
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_silu_mul_bf16(
+                tensor_ptr(gate)?,
+                tensor_ptr(up)?,
+                tensor_ptr(&output)?,
+                i64::try_from(gate.numel()).map_err(|_| {
+                    Error::Other("MUSA SiLU multiply element count overflow".into())
+                })?,
+                ctx.stream().handle(),
+            ),
+            "silu_mul_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("activation::silu_mul_bf16"));
+    Ok(output)
+}
+
+pub fn silu_bf16(ctx: &MusaContext, input: &Tensor) -> Result<Tensor> {
+    require_dtype_on(ctx, input, DType::BF16, "silu", "input")?;
+    if input.numel() == 0 {
+        return Err(Error::Other("MUSA SiLU requires a non-empty input".into()));
+    }
+    let output = output_tensor(
+        ctx,
+        input.shape().clone(),
+        DType::BF16,
+        crate::workspace::output_buffer(ctx, input.size_in_bytes())?,
+    );
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_silu_bf16(
+                tensor_ptr(input)?,
+                tensor_ptr(&output)?,
+                i64::try_from(input.numel())
+                    .map_err(|_| Error::Other("MUSA SiLU element count overflow".into()))?,
+                ctx.stream().handle(),
+            ),
+            "silu_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("activation::silu_bf16"));
+    Ok(output)
+}
+
 /// Gated GELU: splits `[rows, 2 * half]` into gate and up halves.
 ///
 /// Native: `kernels/custom/activation.cuh`'s grid-stride kernel, through
@@ -236,6 +306,32 @@ fn launch_geglu(
 
 // ── FP16 and FP8-output activation (not ported) ──────────────────────────
 
+pub fn bias_gelu_bf16_packed8(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _bias: &Tensor,
+) -> Result<Tensor> {
+    Err(not_ported("activation::bias_gelu_bf16_packed8"))
+}
+
+pub fn bias_gelu_quant_bf16_e4m3(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _bias: &Tensor,
+    _scale: f32,
+) -> Result<Tensor> {
+    Err(not_ported("activation::bias_gelu_quant_bf16_e4m3"))
+}
+
+pub fn silu_mul_quant_bf16_e4m3(
+    _ctx: &MusaContext,
+    _gate: &Tensor,
+    _up: &Tensor,
+    _scale: f32,
+) -> Result<Tensor> {
+    Err(not_ported("activation::silu_mul_quant_bf16_e4m3"))
+}
+
 /// Bias plus SiLU in FP16.
 pub fn bias_silu_f16(
     _ctx: &MusaContext,
@@ -282,7 +378,7 @@ mod tests {
     use apxinf_core::Shape;
 
     use crate::context::MusaContext;
-    use crate::kernels::activation::{bias_gelu_bf16, bias_silu_bf16, geglu_bf16};
+    use crate::kernels::activation::{bias_gelu_bf16, bias_relu_bf16, bias_silu_bf16, geglu_bf16};
     use crate::kernels::elementwise::bias_bf16;
     use crate::kernels::test_support::{from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values};
 
@@ -302,6 +398,7 @@ mod tests {
                         0.5 * x * (1.0 + (alpha * (x + 0.044715 * x * x * x)).tanh())
                     }
                     2 => x / (1.0 + (-x).exp()),
+                    3 => x.max(0.0),
                     _ => x,
                 }
             })
@@ -318,7 +415,9 @@ mod tests {
         let out = match kind {
             0 => bias_bf16(ctx, &input, Some(&bias)),
             1 => bias_gelu_bf16(ctx, &input, Some(&bias)),
-            _ => bias_silu_bf16(ctx, &input, Some(&bias)),
+            2 => bias_silu_bf16(ctx, &input, Some(&bias)),
+            3 => bias_relu_bf16(ctx, &input, Some(&bias)),
+            _ => panic!("unknown activation code {kind}"),
         }
         .expect("native activation");
         ctx.stream().synchronize().expect("synchronise");
@@ -361,7 +460,7 @@ mod tests {
     #[ignore = "needs a MUSA device"]
     fn bias_activation_matches_a_reference_for_every_kind() {
         let ctx = MusaContext::new(0).expect("MUSA device 0");
-        for kind in [0, 1, 2] {
+        for kind in [0, 1, 2, 3] {
             check(&ctx, 3, 5, kind);
         }
         // A row count above one and a column count that is not a multiple of
@@ -369,8 +468,36 @@ mod tests {
         check(&ctx, 257, 300, 1);
         // A width that is a multiple of eight takes the vectorized branch,
         // which is the one the vision MLP's `[512, 4304]` GELU runs on.
-        for kind in [0, 1, 2] {
+        for kind in [0, 1, 2, 3] {
             check(&ctx, 3, 320, kind);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn bias_activation_without_bias_matches_every_kind() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        for cols in [5, 320] {
+            let input_values = values(3 * cols, 0x5eed_1234);
+            let input = upload(&ctx, &input_values, Shape::new(vec![3, cols]));
+            let rounded: Vec<f32> = input_values
+                .iter()
+                .map(|value| from_bf16_bits(to_bf16_bits(*value)))
+                .collect();
+            for kind in [0, 1, 2, 3] {
+                let output = super::bias_activation(&ctx, &input, None, kind)
+                    .expect("native activation without bias");
+                ctx.stream().synchronize().expect("synchronise");
+                let actual = read_back(&output);
+                let expected = reference(kind, &rounded, None);
+                let tolerance = gate_for(&actual);
+                for (actual, expected) in actual.iter().zip(expected.iter()) {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "kind {kind}, cols {cols}: {actual} vs {expected}"
+                    );
+                }
+            }
         }
     }
 

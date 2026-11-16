@@ -63,6 +63,110 @@ __global__ void concat_rows_bf16_vector_kernel(const __mt_bfloat16* first,
   }
 }
 
+// Concatenate up to three equally tall matrices along columns.  Output rows
+// are contiguous, so one row-grid pass selects the source by column without
+// materialising any temporary tensor or issuing one 2-D copy per input.
+__global__ void concat_columns_bf16_kernel(
+    const __mt_bfloat16* first, const __mt_bfloat16* second,
+    const __mt_bfloat16* third, __mt_bfloat16* output, int rows,
+    int first_cols, int second_cols, int third_cols) {
+  const int total_cols = first_cols + second_cols + third_cols;
+  const int stride = blockDim.x * gridDim.x;
+  for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+    const int64_t output_base = static_cast<int64_t>(row) * total_cols;
+    const int64_t first_base = static_cast<int64_t>(row) * first_cols;
+    const int64_t second_base = static_cast<int64_t>(row) * second_cols;
+    const int64_t third_base = static_cast<int64_t>(row) * third_cols;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < total_cols;
+         col += stride) {
+      if (col < first_cols) {
+        output[output_base + col] = first[first_base + col];
+      } else if (col < first_cols + second_cols) {
+        const int source_col = col - first_cols;
+        output[output_base + col] = second[second_base + source_col];
+      } else {
+        const int source_col = col - first_cols - second_cols;
+        output[output_base + col] = third[third_base + source_col];
+      }
+    }
+  }
+}
+
+// Gather complete rows through a prepared u32 index buffer.  Keeping rows on
+// grid.y avoids the CUDA reference's per-element division and remainder.
+__global__ void gather_rows_bf16_kernel(const __mt_bfloat16* input,
+                                        const uint32_t* indices,
+                                        __mt_bfloat16* output, int rows,
+                                        int cols) {
+  const int stride = blockDim.x * gridDim.x;
+  for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+    const int64_t input_base = static_cast<int64_t>(indices[row]) * cols;
+    const int64_t output_base = static_cast<int64_t>(row) * cols;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < cols;
+         col += stride) {
+      output[output_base + col] = input[input_base + col];
+    }
+  }
+}
+// Elementwise BF16 binary arithmetic.  The Rust facade validates equal shape
+// and dtype before launch; this kernel only needs a flat element count.  Keep
+// the arithmetic explicit in f32 and round once, matching the torch bridge's
+// BF16 result contract and the CUDA add/mul kernels.
+__global__ void add_bf16_kernel(const __mt_bfloat16* a,
+                                const __mt_bfloat16* b,
+                                __mt_bfloat16* output, int64_t count) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    output[index] = __float2bfloat16(__bfloat162float(a[index]) +
+                                     __bfloat162float(b[index]));
+  }
+}
+
+__global__ void mul_bf16_kernel(const __mt_bfloat16* a,
+                                const __mt_bfloat16* b,
+                                __mt_bfloat16* output, int64_t count) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    output[index] = __float2bfloat16(__bfloat162float(a[index]) *
+                                     __bfloat162float(b[index]));
+  }
+}
+
+// Scatter unique source rows in one output pass. `row_to_source` is prepared
+// once with one entry per destination row and UINT32_MAX for unselected rows,
+// avoiding both a full D2D copy and a second pass over selected rows. For
+// `add`, both BF16 values are widened, added once and rounded once.
+__global__ void scatter_rows_bf16_kernel(const __mt_bfloat16* destination,
+                                         const __mt_bfloat16* source,
+                                         const uint32_t* row_to_source,
+                                         __mt_bfloat16* output,
+                                         int destination_rows,
+                                         int source_rows, int cols,
+                                         int add) {
+  const int stride = blockDim.x * gridDim.x;
+  for (int destination_row = blockIdx.y; destination_row < destination_rows;
+       destination_row += gridDim.y) {
+    const uint32_t source_row = row_to_source[destination_row];
+    const int64_t destination_base = static_cast<int64_t>(destination_row) * cols;
+    const bool selected = source_row < static_cast<uint32_t>(source_rows);
+    const int64_t source_base = static_cast<int64_t>(source_row) * cols;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < cols;
+         col += stride) {
+      if (!selected) {
+        output[destination_base + col] = destination[destination_base + col];
+      } else if (add) {
+        output[destination_base + col] = __float2bfloat16(
+            __bfloat162float(destination[destination_base + col]) +
+            __bfloat162float(source[source_base + col]));
+      } else {
+        output[destination_base + col] = source[source_base + col];
+      }
+    }
+  }
+}
+
 // One explicit Euler step of the flow sampler: `state + dt * velocity`.
 //
 // The multiply-add is written out rather than left to contract into an FMA:
