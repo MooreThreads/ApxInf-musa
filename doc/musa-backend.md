@@ -281,6 +281,10 @@ arena with a 105.0 MiB live peak, and the steady device footprint falls from
 allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
 capacity/used/peak/attempts.
 
+FP8 is **not ported**, and the port says so rather than silently degrading: an
+FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
+`fp8_static`.
+
 ### Streaming int8 loads
 
 A real-checkpoint `int8_dynamic` load never materializes the whole host model.
@@ -289,18 +293,22 @@ bytes on demand; `Int8DynamicWeights::from_checkpoint` feeds those tensors
 through `WeightSource` one layer at a time, folds them in F32, quantizes and
 uploads them, then drops the host copy before the next layer. The reader shares
 header parsing and the sharded index's wrong-shard, duplicate, missing and
-unsafe-path checks with the whole-file loader. `bf16_to_device` copies a tensor
+unsafe-path checks with the whole-file loader, and it rejects a non-forward or
+overflowing `data_offsets` entry before any tensor is exposed. The streaming
+path runs the same shape validation as `Pi05Weights::from_map`, including the
+six checkpoint-wide tensors (`token_embedding`, `multimodal_projector`,
+`action_in_proj`, `action_out_proj`, `time_mlp_in`, `time_mlp_out`); only the
+order in which checks are reached differs, because the streaming builder
+validates each tensor when it takes it. `bf16_to_device` copies a tensor
 already in BF16 straight to the device rather than round-tripping through F32;
 `Pi05Weights` and the BF16 path are unchanged. On M1000 with
 `pi05_libero_pytorch` (two camera views), the measured host peak falls from
 14.1 GiB to 2.1 GiB while the device weights and the L0 actions stay
 bit-identical; the largest remaining transients are the token embedding and the
 language gate/up group's F32 staging. Loading stays synchronous per group, so
-capture and replay are unchanged.
-
-FP8 is **not ported**, and the port says so rather than silently degrading: an
-FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
-`fp8_static`.
+capture and replay are unchanged. `CheckpointReader` reads with
+`FileExt::read_exact_at`, so the loader targets Unix; CI is Linux and the MLX
+target is macOS.
 
 ## Serving on MUSA
 

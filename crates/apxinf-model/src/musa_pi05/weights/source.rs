@@ -9,13 +9,13 @@ use apxinf_loader::safetensors::CheckpointReader;
 /// One checkpoint, consumed by tensor name.
 ///
 /// `Pi05Weights::from_map` and the streaming int8 builder both take tensors
-/// through this seam, so extraction, folding and the error text are written
-/// once and the two paths cannot drift.
+/// through this seam, so extraction, folding, shape validation and the error
+/// text are shared. The streaming builder validates each tensor when it takes
+/// it, so with several bad tensors the first reported error can differ from
+/// the map path's order.
 pub(crate) trait WeightSource {
     /// Remove `name`; `Ok(None)` when absent or already taken.
     fn take_opt(&mut self, name: &str) -> Result<Option<Tensor>>;
-    /// Present in the checkpoint, taken or not.
-    fn contains(&self, name: &str) -> bool;
 
     fn take(&mut self, name: &str) -> Result<Tensor> {
         self.take_opt(name)?
@@ -38,10 +38,6 @@ pub(crate) trait WeightSource {
 impl WeightSource for HashMap<String, Tensor> {
     fn take_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
         Ok(self.remove(name))
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.contains_key(name)
     }
 }
 
@@ -78,9 +74,5 @@ impl WeightSource for CheckpointSource {
     fn take_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
         let key = self.key(name).into_owned();
         self.reader.take(&key).map_err(Error::Other)
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.reader.contains(&self.key(name))
     }
 }

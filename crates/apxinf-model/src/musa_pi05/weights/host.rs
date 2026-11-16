@@ -120,126 +120,49 @@ impl Pi05Weights {
         normalize_lerobot_prefix(&mut tensors);
 
         let vision_prefix = format!("{ROOT}.paligemma.model.vision_tower.vision_model");
-        let mut vision_blocks = Vec::with_capacity(config.vision_depth);
-        for layer in 0..config.vision_depth {
-            let p = format!("{vision_prefix}.encoder.layers.{layer}");
-            vision_blocks.push(VisionBlockWeights {
-                norm1: take_layer_norm(&mut tensors, &format!("{p}.layer_norm1"))?,
-                q: take_linear(&mut tensors, &format!("{p}.self_attn.q_proj"), true)?,
-                k: take_linear(&mut tensors, &format!("{p}.self_attn.k_proj"), true)?,
-                v: take_linear(&mut tensors, &format!("{p}.self_attn.v_proj"), true)?,
-                output: take_linear(&mut tensors, &format!("{p}.self_attn.out_proj"), true)?,
-                norm2: take_layer_norm(&mut tensors, &format!("{p}.layer_norm2"))?,
-                fc1: take_linear(&mut tensors, &format!("{p}.mlp.fc1"), true)?,
-                fc2: take_linear(&mut tensors, &format!("{p}.mlp.fc2"), true)?,
-            });
-        }
+        let vision_blocks = (0..config.vision_depth)
+            .map(|layer| take_vision_block(&mut tensors, &vision_prefix, layer))
+            .collect::<Result<Vec<_>>>()?;
 
-        let patch_weight_name = format!("{vision_prefix}.embeddings.patch_embedding.weight");
-        let patch_weight = take(&mut tensors, &patch_weight_name)?;
-        let expected_patch_elements =
-            config.vision_width * 3 * config.patch_size * config.patch_size;
-        if patch_weight.numel() != expected_patch_elements {
-            return Err(Error::Other(format!(
-                "{patch_weight_name}: expected {expected_patch_elements} elements, got {}",
-                patch_weight.numel()
-            )));
-        }
-        let patch_weight = patch_weight.reshape(vec![
-            config.vision_width,
-            3 * config.patch_size * config.patch_size,
-        ])?;
-        let patch_embedding = LinearWeights {
-            weight: transpose_2d(&patch_weight)?,
-            bias: Some(take(
-                &mut tensors,
-                &format!("{vision_prefix}.embeddings.patch_embedding.bias"),
-            )?),
-        };
-
+        let patch_embedding = take_patch_embedding(&mut tensors, config, &vision_prefix)?;
+        let position_embedding = take_position_embedding(&mut tensors, &vision_prefix)?;
+        let post_layer_norm = take_vision_post_layer_norm(&mut tensors, &vision_prefix)?;
+        let multimodal_projector = take_multimodal_projector(&mut tensors)?;
+        let token_embedding = take_token_embedding(&mut tensors)?;
         let vision = VisionWeights {
             patch_embedding,
-            position_embedding: take(
-                &mut tensors,
-                &format!("{vision_prefix}.embeddings.position_embedding.weight"),
-            )?,
+            position_embedding,
             blocks: vision_blocks,
-            post_layer_norm: take_layer_norm(
-                &mut tensors,
-                &format!("{vision_prefix}.post_layernorm"),
-            )?,
-            multimodal_projector: take_linear(
-                &mut tensors,
-                &format!("{ROOT}.paligemma.model.multi_modal_projector.linear"),
-                true,
-            )?,
-            token_embedding: take_any(
-                &mut tensors,
-                &[
-                    format!("{ROOT}.paligemma.model.language_model.embed_tokens.weight"),
-                    format!("{ROOT}.paligemma.lm_head.weight"),
-                ],
-            )?,
+            post_layer_norm,
+            multimodal_projector,
+            token_embedding,
         };
 
         let language_prefix = format!("{ROOT}.paligemma.model.language_model");
-        let mut language_layers = Vec::with_capacity(config.language.depth);
-        for layer in 0..config.language.depth {
-            let p = format!("{language_prefix}.layers.{layer}");
-            // Fold Gemma's learned RMSNorm multiplier into the consuming
-            // weights in FP32 before the destination format is chosen. Keeping
-            // it as an activation multiply can round channels near -1 to zero,
-            // and it gives the packed QKV/gate-up matrix a much worse tensor
-            // scale; after the fold the norm multipliers become `ones` below.
-            let attention_scale =
-                add_one(take(&mut tensors, &format!("{p}.input_layernorm.weight"))?)?;
-            let mlp_scale = add_one(take(
-                &mut tensors,
-                &format!("{p}.post_attention_layernorm.weight"),
-            )?)?;
-            let mut attention = take_attention(&mut tensors, &p)?;
-            attention.q = fold_input_scale(attention.q, &attention_scale)?;
-            attention.k = fold_input_scale(attention.k, &attention_scale)?;
-            attention.v = fold_input_scale(attention.v, &attention_scale)?;
-            let mut mlp = take_mlp(&mut tensors, &p)?;
-            mlp.gate = fold_input_scale(mlp.gate, &mlp_scale)?;
-            mlp.up = fold_input_scale(mlp.up, &mlp_scale)?;
-            language_layers.push(LanguageLayerWeights {
-                input_norm_scale: ones(attention_scale.shape().dims())?,
-                attention,
-                post_attention_norm_scale: ones(mlp_scale.shape().dims())?,
-                mlp,
-            });
-        }
+        let language_layers = (0..config.language.depth)
+            .map(|layer| take_language_layer(&mut tensors, &language_prefix, layer))
+            .collect::<Result<Vec<_>>>()?;
 
         let action_prefix = format!("{ROOT}.gemma_expert.model");
-        let mut action_layers = Vec::with_capacity(config.action_expert.depth);
-        for layer in 0..config.action_expert.depth {
-            let p = format!("{action_prefix}.layers.{layer}");
-            action_layers.push(ActionLayerWeights {
-                input_norm: take_ada_norm(&mut tensors, &format!("{p}.input_layernorm"))?,
-                attention: take_attention(&mut tensors, &p)?,
-                post_attention_norm: take_ada_norm(
-                    &mut tensors,
-                    &format!("{p}.post_attention_layernorm"),
-                )?,
-                mlp: take_mlp(&mut tensors, &p)?,
-            });
-        }
+        let action_layers = (0..config.action_expert.depth)
+            .map(|layer| take_action_layer(&mut tensors, &action_prefix, layer))
+            .collect::<Result<Vec<_>>>()?;
+
+        let language_final_norm_scale =
+            take_language_final_norm_scale(&mut tensors, &language_prefix)?;
+        let action_final_norm = take_action_final_norm(&mut tensors, &action_prefix)?;
+        let glue = take_action_glue(&mut tensors)?;
 
         let weights = Self {
             vision,
             language_layers,
-            language_final_norm_scale: add_one(take(
-                &mut tensors,
-                &format!("{language_prefix}.norm.weight"),
-            )?)?,
+            language_final_norm_scale,
             action_layers,
-            action_final_norm: take_ada_norm(&mut tensors, &format!("{action_prefix}.norm"))?,
-            action_in: take_linear(&mut tensors, "action_in_proj", true)?,
-            action_out: take_linear(&mut tensors, "action_out_proj", true)?,
-            time_mlp_in: take_linear(&mut tensors, "time_mlp_in", true)?,
-            time_mlp_out: take_linear(&mut tensors, "time_mlp_out", true)?,
+            action_final_norm,
+            action_in: glue.action_in,
+            action_out: glue.action_out,
+            time_mlp_in: glue.time_mlp_in,
+            time_mlp_out: glue.time_mlp_out,
         };
 
         validate_shapes(config, &weights)?;
@@ -797,41 +720,71 @@ fn fold_input_scale(mut linear: LinearWeights, scale: &Tensor) -> Result<LinearW
     Ok(linear)
 }
 
-fn validate_shapes(config: &Pi05Config, weights: &Pi05Weights) -> Result<()> {
+pub(in crate::musa_pi05) fn validate_token_embedding(
+    config: &Pi05Config,
+    token_embedding: &Tensor,
+) -> Result<()> {
     expect_shape(
         "token_embedding",
-        &weights.vision.token_embedding,
+        token_embedding,
         &[config.vocab_size, config.language.width],
-    )?;
+    )
+}
+
+pub(in crate::musa_pi05) fn validate_multimodal_projector(
+    config: &Pi05Config,
+    projector: &LinearWeights,
+) -> Result<()> {
     expect_linear(
         "multimodal_projector",
-        &weights.vision.multimodal_projector,
+        projector,
         config.vision_width,
         config.language.width,
-    )?;
+    )
+}
+
+pub(in crate::musa_pi05) fn validate_action_glue(
+    config: &Pi05Config,
+    action_in: &LinearWeights,
+    action_out: &LinearWeights,
+    time_mlp_in: &LinearWeights,
+    time_mlp_out: &LinearWeights,
+) -> Result<()> {
     expect_linear(
         "action_in_proj",
-        &weights.action_in,
+        action_in,
         config.action_dim,
         config.action_expert.width,
     )?;
     expect_linear(
         "action_out_proj",
-        &weights.action_out,
+        action_out,
         config.action_expert.width,
         config.action_dim,
     )?;
     expect_linear(
         "time_mlp_in",
-        &weights.time_mlp_in,
+        time_mlp_in,
         config.action_expert.width,
         config.action_expert.width,
     )?;
     expect_linear(
         "time_mlp_out",
+        time_mlp_out,
+        config.action_expert.width,
+        config.action_expert.width,
+    )
+}
+
+fn validate_shapes(config: &Pi05Config, weights: &Pi05Weights) -> Result<()> {
+    validate_token_embedding(config, &weights.vision.token_embedding)?;
+    validate_multimodal_projector(config, &weights.vision.multimodal_projector)?;
+    validate_action_glue(
+        config,
+        &weights.action_in,
+        &weights.action_out,
+        &weights.time_mlp_in,
         &weights.time_mlp_out,
-        config.action_expert.width,
-        config.action_expert.width,
     )?;
     validate_expert_shapes("language", &config.language, &weights.language_layers)?;
     validate_action_shapes(&config.action_expert, &weights.action_layers)?;
@@ -1021,6 +974,67 @@ mod tests {
         normalize_lerobot_prefix(&mut tensors);
         assert!(tensors.contains_key(&format!("{ROOT}.paligemma.lm_head.weight")));
         assert!(tensors.contains_key("action_in_proj.bias"));
+    }
+
+    fn linear(fan_in: usize, fan_out: usize) -> LinearWeights {
+        LinearWeights {
+            weight: Tensor::from_f32(vec![fan_in, fan_out], &vec![0.0; fan_in * fan_out]).unwrap(),
+            bias: None,
+        }
+    }
+
+    fn bad_linear() -> LinearWeights {
+        linear(1, 1)
+    }
+
+    #[test]
+    fn validate_glue_rejects_each_bad_tensor_by_name() {
+        let config = Pi05Config::default();
+
+        let error = validate_token_embedding(
+            &config,
+            &Tensor::from_f32(vec![1, 1], &[0.0]).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("token_embedding"), "{error}");
+
+        let error = validate_multimodal_projector(&config, &bad_linear())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multimodal_projector"), "{error}");
+
+        let width = config.action_expert.width;
+        let action_in = linear(config.action_dim, width);
+        let action_out = linear(width, config.action_dim);
+        let time_mlp_in = linear(width, width);
+        let time_mlp_out = linear(width, width);
+        assert!(
+            validate_action_glue(&config, &action_in, &action_out, &time_mlp_in, &time_mlp_out)
+                .is_ok()
+        );
+
+        for (name, result) in [
+            (
+                "action_in_proj",
+                validate_action_glue(&config, &bad_linear(), &action_out, &time_mlp_in, &time_mlp_out),
+            ),
+            (
+                "action_out_proj",
+                validate_action_glue(&config, &action_in, &bad_linear(), &time_mlp_in, &time_mlp_out),
+            ),
+            (
+                "time_mlp_in",
+                validate_action_glue(&config, &action_in, &action_out, &bad_linear(), &time_mlp_out),
+            ),
+            (
+                "time_mlp_out",
+                validate_action_glue(&config, &action_in, &action_out, &time_mlp_in, &bad_linear()),
+            ),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(name), "{name}: {error}");
+        }
     }
 
     #[test]

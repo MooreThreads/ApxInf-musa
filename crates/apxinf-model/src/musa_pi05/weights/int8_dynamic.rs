@@ -893,7 +893,8 @@ use super::host::{
     take_action_final_norm, take_action_glue, take_action_layer,
     take_language_final_norm_scale, take_language_layer, take_multimodal_projector,
     take_patch_embedding, take_position_embedding, take_token_embedding, take_vision_block,
-    take_vision_post_layer_norm, validate_action_layer, validate_language_layer, ROOT,
+    take_vision_post_layer_norm, validate_action_glue, validate_action_layer,
+    validate_language_layer, validate_multimodal_projector, validate_token_embedding, ROOT,
 };
 use super::source::WeightSource;
 
@@ -1061,13 +1062,16 @@ impl Int8DynamicWeights {
             &take_vision_post_layer_norm(source, &vision_prefix)?,
             backend,
         )?;
-        let multimodal_projector = Int8DynamicLinearWeights::from_host(
-            &take_multimodal_projector(source)?,
-            backend,
-            "glue",
-            scope,
-        )?;
-        let token_embedding = bf16_to_device(&take_token_embedding(source)?, backend)?;
+        let multimodal_projector = {
+            let host = take_multimodal_projector(source)?;
+            validate_multimodal_projector(config, &host)?;
+            Int8DynamicLinearWeights::from_host(&host, backend, "glue", scope)?
+        };
+        let token_embedding = {
+            let host = take_token_embedding(source)?;
+            validate_token_embedding(config, &host)?;
+            bf16_to_device(&host, backend)?
+        };
 
         let mut language_layers = Vec::with_capacity(config.language.depth);
         for layer in 0..config.language.depth {
@@ -1096,6 +1100,13 @@ impl Int8DynamicWeights {
             scope,
         )?;
         let glue = take_action_glue(source)?;
+        validate_action_glue(
+            config,
+            &glue.action_in,
+            &glue.action_out,
+            &glue.time_mlp_in,
+            &glue.time_mlp_out,
+        )?;
 
         Ok(Self {
             patch_embedding,

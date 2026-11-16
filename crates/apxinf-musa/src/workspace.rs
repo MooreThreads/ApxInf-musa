@@ -463,10 +463,6 @@ impl ExecutionSession {
         &self.inner.workspace
     }
 
-    pub fn capacity(&self) -> usize {
-        self.inner.workspace.capacity()
-    }
-
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic arena slices, prepares native resources and
