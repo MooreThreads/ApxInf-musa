@@ -244,6 +244,17 @@ device path:
   (`k = 588`), the action input and the action head — and the ViT MLP is zero
   padded from 4304 to 4352 so that it does not.
 
+PI0.5 vision attention defaults to the bundled `custom` Flash Attention on
+MP22 for B=2, H=16, T=256, D=72. Other shapes keep their normal dispatch.
+Set `APXINF_PI05_FA=custom` to require that kernel, `mudnn` to select the
+vendor path, or `auto` to allow fallback if the custom kernel fails.
+
+For PI0.5 eager and graph execution, set `APXINF_MUSA_PI05_WORKSPACE_MIB=128`
+to request exactly 128 MiB per workspace (134217728 bytes), without retrying
+at a larger capacity. Unset it to restore automatic sizing. Values must be
+positive whole MiB; invalid values are errors. This setting does not toggle
+pooling. Set `APXINF_MUSA_WORKSPACE_REPORT=1` to verify the selected capacity.
+
 Full-encode quantization needs per-channel equalization to clear the 0.999 gate:
 the encode layers' shared residual stream has outlier channels one `amax/127`
 row scale cannot cover. `APXINF_INT8_EQUALIZATION` names the checked-in
