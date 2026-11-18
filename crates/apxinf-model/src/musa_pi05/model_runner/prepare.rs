@@ -9,6 +9,27 @@ use crate::musa_pi05::{Pi05Config, Pi05ImageLayout};
 use apxinf_core::{Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
+const WORKSPACE_MIB: &str = "APXINF_MUSA_PI05_WORKSPACE_MIB";
+
+pub(super) fn configured_workspace_capacities(required_bytes: usize) -> Result<Vec<usize>> {
+    match std::env::var(WORKSPACE_MIB) {
+        Ok(value) => fixed_workspace_bytes(&value).map(|bytes| vec![bytes]),
+        Err(std::env::VarError::NotPresent) => Ok(workspace_capacities(required_bytes)),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Other(format!(
+            "{WORKSPACE_MIB} must be a positive integer in MiB"
+        ))),
+    }
+}
+
+fn fixed_workspace_bytes(value: &str) -> Result<usize> {
+    value.parse::<usize>().ok()
+        .filter(|&mib| mib > 0 && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .ok_or_else(|| Error::Other(format!(
+            "invalid {WORKSPACE_MIB}={value:?}: expected a positive integer in MiB that fits in bytes"
+        )))
+}
+
 /// Capacities the capture and eager paths try in order.
 ///
 /// The first rung is an eighth of the modeled reservation (floored), doubling
@@ -254,7 +275,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         }
         backend::synchronize(backend)?;
         let required = self.model.workspace_requirements(token_count)?.bytes;
-        let capacities = workspace_capacities(required);
+        let capacities = configured_workspace_capacities(required)?;
         let mut last_exhaustion = None;
         for (attempt, &capacity) in capacities.iter().enumerate() {
             let session = ExecutionSession::with_capacity(capacity, self.ctx().device_id())?;
@@ -433,6 +454,16 @@ pub(super) fn capture_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_workspace_accepts_positive_mib_and_checks_byte_overflow() {
+        assert_eq!(fixed_workspace_bytes("128").unwrap(), 134_217_728);
+        assert_eq!(fixed_workspace_bytes("1").unwrap(), 1 << 20);
+        for invalid in ["", "0", "-1", "abc", "1.5", "128MB"] {
+            assert!(fixed_workspace_bytes(invalid).is_err());
+        }
+        assert!(fixed_workspace_bytes(&usize::MAX.to_string()).is_err());
+    }
 
     #[test]
     fn the_capacity_ladder_is_ascending_and_ends_at_the_reservation() {

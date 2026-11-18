@@ -65,7 +65,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -527,6 +529,223 @@ extern "C" int apxinf_musa_fa_d256(const void* q, const void* k, const void* v, 
       set_error("the split-KV merge kernel failed: %s", musaGetErrorString(launch));
       return -1;
     }
+  }
+  return 0;
+}
+
+
+// ── Independent QY2 BF16 D72 forward ────────────────────────────────────────
+// Generated from the licensed QY2 MP22 assembly source. This route is fixed to
+// the PI0.5 vision geometry and deliberately owns its module/LSE state rather
+// than touching muDNN descriptors or Scratch.
+namespace {
+struct D72Loaded {
+  MUmodule module = nullptr;
+  MUfunction function = nullptr;
+  float* lse = nullptr;
+  int device = -1;
+  MUcontext context = nullptr;
+};
+// A MusaContext owns this slot. Captured graphs retain that owner across replay.
+
+MUfunction load_d72(void** owner, int device, void* stream) {
+  MUcontext stream_context = nullptr;
+  MUresult context_status = muStreamGetCtx(reinterpret_cast<MUstream>(stream), &stream_context);
+  if (context_status != MUSA_SUCCESS || stream_context == nullptr) {
+    apxinf_adapters::set_error("custom FA D72 cannot query stream context (%d)", static_cast<int>(context_status));
+    return nullptr;
+  }
+  if (auto* loaded = static_cast<D72Loaded*>(*owner)) {
+    if (loaded->context != stream_context || loaded->device != device) {
+      apxinf_adapters::set_error("custom FA D72 owner/stream context mismatch");
+      return nullptr;
+    }
+    return loaded->function;
+  }
+  if (apxinf_adapters::capturing(stream)) {
+    apxinf_adapters::set_error("custom FA D72 image was first needed during graph capture");
+    return nullptr;
+  }
+  if (!apxinf_adapters::select_device(device) ||
+      muCtxSetCurrent(stream_context) != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 image cannot select stream context for device %d", device);
+    return nullptr;
+  }
+  MUmodule module = nullptr;
+  MUresult status = muModuleLoadData(&module, kApxinfMusaFaD72Mp22Image);
+  if (status != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 muModuleLoadData failed (%d)", static_cast<int>(status));
+    return nullptr;
+  }
+  MUfunction function = nullptr;
+  status = muModuleGetFunction(&function, module,
+                               "apxinf_qy2_bf16flash_atten_512_256x64x128");
+  if (status != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 muModuleGetFunction failed (%d)", static_cast<int>(status));
+    muModuleUnload(module);
+    return nullptr;
+  }
+  constexpr size_t kLseBytes = size_t(2) * 16 * 256 * sizeof(float);
+  float* lse = nullptr;
+  if (muMemAlloc(reinterpret_cast<MUdeviceptr*>(&lse), kLseBytes) != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 LSE driver allocation failed");
+    muModuleUnload(module);
+    return nullptr;
+  }
+  *owner = new (std::nothrow) D72Loaded{module, function, lse, device, stream_context};
+  if (!*owner) {
+    muMemFree(reinterpret_cast<MUdeviceptr>(lse));
+    muModuleUnload(module);
+    apxinf_adapters::set_error("custom FA D72 host allocation failed");
+    return nullptr;
+  }
+  return function;
+}
+}  // namespace
+
+// Eager launches and replays may be asynchronous. Wait in the owning driver
+// context; on failure do not reclaim memory that may still be in use.
+extern "C" void apxinf_musa_fa_d72_release(void* owner) {
+  auto* state = static_cast<D72Loaded*>(owner);
+  if (!state) return;
+  MUcontext previous = nullptr;
+  if (muCtxGetCurrent(&previous) == MUSA_SUCCESS &&
+      muCtxSetCurrent(state->context) == MUSA_SUCCESS) {
+    if (muCtxSynchronize() == MUSA_SUCCESS) {
+      muMemFree(reinterpret_cast<MUdeviceptr>(state->lse));
+      muModuleUnload(state->module);
+    } else {
+      std::fprintf(stderr, "[apxinf] custom FA D72: synchronization failed; retaining driver resources\n");
+    }
+    muCtxSetCurrent(previous);
+  } else {
+    std::fprintf(stderr, "[apxinf] custom FA D72: owner context unavailable at teardown\n");
+  }
+  delete state;
+}
+
+extern "C" const char* apxinf_musa_fa_d72_last_error() {
+  return apxinf_adapters::error_buffer();
+}
+
+extern "C" int apxinf_musa_fa_d72(void** owner, const void* q, const void* k, const void* v,
+                                   void* out, int batch, int heads, int tokens,
+                                   int head_dim, void* stream) {
+  if (!owner || !q || !k || !v || !out || batch != 2 || heads != 16 || tokens != 256 ||
+      head_dim != 72) {
+    apxinf_adapters::set_error("custom FA D72 expects B=2,H=16,T=256,D=72");
+    return -1;
+  }
+  const int device = apxinf_adapters::stream_device(stream);
+  MUfunction function = load_d72(owner, device, stream);
+  if (!function) return -1;
+  auto* loaded = static_cast<D72Loaded*>(*owner);
+  MUcontext stream_context = nullptr;
+  if (muStreamGetCtx(reinterpret_cast<MUstream>(stream), &stream_context) != MUSA_SUCCESS ||
+      muCtxSetCurrent(stream_context) != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 cannot make stream context current");
+    return -1;
+  }
+  const size_t tensor_bytes = size_t(batch) * heads * tokens * head_dim * sizeof(uint16_t);
+  RobustPointer out_rp{reinterpret_cast<uint64_t>(out), tensor_bytes};
+  RobustPointer lse_rp{reinterpret_cast<uint64_t>(loaded->lse), size_t(batch) * heads * tokens * sizeof(float)};
+  RobustPointer q_rp{reinterpret_cast<uint64_t>(q), tensor_bytes};
+  RobustPointer k_rp{reinterpret_cast<uint64_t>(k), tensor_bytes};
+  RobustPointer v_rp{reinterpret_cast<uint64_t>(v), tensor_bytes};
+  RobustPointer mask_rp{0, 0};
+  const float scale = 1.0f / std::sqrt(72.0f);
+  const float nr_ln2 = 0.6931471805599453f;
+  const float rln2_scale = scale * 1.4426950408889634f;
+  // Q/K/V/output are flattened [B,S,H,D], so batch stride is one sequence,
+  // not the complete tensor. The generated QY2 wrapper uses these byte-stride
+  // values to address the second batch.
+  // `tokens` is the per-batch sequence length passed by launch_mha.
+  const int batch_stride = tokens * heads * head_dim;
+  const int head_stride = head_dim;
+  const int seq_stride = heads * head_dim;
+  const int head_dim_sub1 = 71;
+  // Vision Q/K/V all have H=16; this is MHA, not GQA. QY2 still receives
+  // kvheads and the quotient explicitly, so keep kvheads=16 and group=1.
+  const int kv_heads = heads;
+  const int head_offset = 0;
+  const int head_group = 1;
+  const uint32_t group_mul = 0;
+  const uint32_t group_shift = 0;
+  const int ldg_k_rewind = (64 * seq_stride - (128 / 32 - 1) * 32) * 2;
+  const int ldg_v_stride = 32 * seq_stride * 2;
+  const long zero_stride_long = 0;
+  const int zero_stride_int = 0;
+  void* params[] = {
+      &out_rp, &lse_rp, &q_rp, &k_rp, &v_rp, &mask_rp,
+      const_cast<float*>(&scale), const_cast<float*>(&nr_ln2),
+      &batch, &heads, &tokens, &tokens, &head_dim, const_cast<int*>(&head_dim_sub1),
+      const_cast<int*>(&batch_stride), const_cast<int*>(&head_stride), const_cast<int*>(&seq_stride),
+      const_cast<int*>(&batch_stride), const_cast<int*>(&head_stride), const_cast<int*>(&seq_stride),
+      const_cast<int*>(&batch_stride), const_cast<int*>(&head_stride), const_cast<int*>(&seq_stride),
+      const_cast<long*>(&zero_stride_long), const_cast<long*>(&zero_stride_long),
+      const_cast<int*>(&zero_stride_int), const_cast<int*>(&batch_stride), const_cast<int*>(&head_stride), const_cast<int*>(&seq_stride),
+      const_cast<float*>(&rln2_scale), const_cast<int*>(&kv_heads), const_cast<int*>(&head_offset),
+      const_cast<int*>(&head_group), const_cast<uint32_t*>(&group_mul), const_cast<uint32_t*>(&group_shift),
+      const_cast<int*>(&ldg_k_rewind), const_cast<int*>(&ldg_v_stride)};
+  static thread_local bool route_logged = false;
+  if (!route_logged) {
+    MUcontext current_context = nullptr;
+    muCtxGetCurrent(&current_context);
+    std::fprintf(stderr, "[apxinf] PI0.5 custom FA D72 route active\n");
+    std::fprintf(stderr, "[apxinf] custom FA context dev=%d stream=%p stream_ctx=%p current_ctx=%p module=%p function=%p\n", device, stream, stream_context, current_context, loaded->module, function);
+    std::fprintf(stderr, "[apxinf] custom FA params dev=%d stream=%p B=%d H=%d T=%d D=%d bs=%d hs=%d ss=%d kv=%d off=%d group=%d ldg=%d lvs=%d\n",
+                 device, stream, batch, heads, tokens, head_dim, batch_stride, head_stride,
+                 seq_stride, kv_heads, head_offset, head_group, ldg_k_rewind, ldg_v_stride);
+    route_logged = true;
+  }
+  static thread_local bool dumped = false;
+  if (!dumped && std::getenv("APXINF_CUSTOM_FA_D72_DUMP") != nullptr) {
+    if (musaStreamSynchronize(reinterpret_cast<musaStream_t>(stream)) != musaSuccess) {
+      apxinf_adapters::set_error("custom FA D72 debug dump synchronize failed");
+      return -1;
+    }
+    const size_t bytes = tensor_bytes;
+    std::vector<unsigned char> host(bytes);
+    auto dump = [&](const char* path, const void* ptr) {
+      if (musaMemcpy(host.data(), ptr, bytes, musaMemcpyDeviceToHost) != musaSuccess) return false;
+      FILE* file = std::fopen(path, "wb");
+      if (!file) return false;
+      const bool ok = std::fwrite(host.data(), 1, bytes, file) == bytes;
+      std::fclose(file);
+      return ok;
+    };
+    if (!dump("/tmp/apxinf-custom-fa-q.bin", q) || !dump("/tmp/apxinf-custom-fa-k.bin", k) ||
+        !dump("/tmp/apxinf-custom-fa-v.bin", v)) {
+      apxinf_adapters::set_error("custom FA D72 debug dump copy failed");
+      return -1;
+    }
+    dumped = true;
+  }
+  MUresult status = muLaunchKernel(function, 1, heads, batch, 512, 1, 1, 0,
+                                    reinterpret_cast<MUstream>(stream), params, nullptr);
+  if (status != MUSA_SUCCESS) {
+    apxinf_adapters::set_error("custom FA D72 muLaunchKernel failed (%d)", static_cast<int>(status));
+    return -1;
+  }
+  static thread_local bool output_dumped = false;
+  if (dumped && !output_dumped && std::getenv("APXINF_CUSTOM_FA_D72_DUMP") != nullptr) {
+    if (musaStreamSynchronize(reinterpret_cast<musaStream_t>(stream)) != musaSuccess) {
+      apxinf_adapters::set_error("custom FA D72 output dump synchronize failed");
+      return -1;
+    }
+    std::vector<unsigned char> host(tensor_bytes);
+    if (musaMemcpy(host.data(), out, tensor_bytes, musaMemcpyDeviceToHost) != musaSuccess) {
+      apxinf_adapters::set_error("custom FA D72 output dump copy failed");
+      return -1;
+    }
+    FILE* file = std::fopen("/tmp/apxinf-custom-fa-out.bin", "wb");
+    if (!file || std::fwrite(host.data(), 1, tensor_bytes, file) != tensor_bytes) {
+      if (file) std::fclose(file);
+      apxinf_adapters::set_error("custom FA D72 output dump write failed");
+      return -1;
+    }
+    std::fclose(file);
+    output_dumped = true;
   }
   return 0;
 }

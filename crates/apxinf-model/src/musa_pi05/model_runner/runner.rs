@@ -359,7 +359,7 @@ impl Pi05ModelRunner {
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
         let required = self.model.workspace_requirements(spec.token_count)?.bytes;
-        let capacities = super::prepare::workspace_capacities(required);
+        let capacities = super::prepare::configured_workspace_capacities(required)?;
         let mut last_exhaustion = None;
         for (attempt, &capacity) in capacities.iter().enumerate() {
             let session = ExecutionSession::with_capacity(capacity, self.backend.device_id())?;

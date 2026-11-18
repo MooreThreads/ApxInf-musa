@@ -155,6 +155,11 @@ const KNOBS: &[Knob] = &[
         note: "=legacy selects the MUSA legacy vision MHA; cuda-new no longer reads APXINF_MHA_NAIVE",
     },
     Knob {
+        name: "APXINF_PI05_FA",
+        counterpart: None,
+        note: "select PI0.5 vision FlashAttention provider: custom (default for MP22 D72), mudnn, or auto",
+    },
+    Knob {
         name: "APXINF_MUSA_BF16_RMS",
         counterpart: None,
         note: "=scalar forces the language qkv input RMSNorm onto the scalar two-pass kernel; cuda-new has no matching switch",
