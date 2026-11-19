@@ -85,7 +85,11 @@ pub(crate) fn load_model_runner(
 
     let host_weights = match options.synthetic {
         Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
-        None => Pi05Weights::from_safetensors(&config, path)?,
+        None => Pi05Weights::from_safetensors(
+            &config,
+            path,
+            matches!(model_variant, ModelVariantChoice::W4A16Bf16Expert),
+        )?,
     };
     let policies = L3Policies::default();
     install_tactics(&backend, options)?;

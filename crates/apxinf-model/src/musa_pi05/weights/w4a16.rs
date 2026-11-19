@@ -139,9 +139,9 @@ impl W4DeviceLanguageLayer {
             post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
             gate_up: W4LinearWeights::from_host_parts_policy(
                 &[&weights.mlp.gate, &weights.mlp.up],
-                backend, 16, 1.0,
+                backend, 16, 0.98,
             )?,
-            down: W4LinearWeights::from_host_policy(&weights.mlp.down, backend, 16, 1.0)?,
+            down: W4LinearWeights::from_host_policy(&weights.mlp.down, backend, 16, 0.98)?,
         })
     }
 }
@@ -157,9 +157,9 @@ pub struct W4LinearWeights {
     pub clip_ratio: f32,
 }
 impl W4LinearWeights {
-    pub fn from_host(linear: &LinearWeights, ctx: &Context) -> Result<Self> { Self::from_host_policy(linear, ctx, 16, 1.0) }
+    pub fn from_host(linear: &LinearWeights, ctx: &Context) -> Result<Self> { Self::from_host_policy(linear, ctx, 16, 0.98) }
     pub fn from_host_policy(linear: &LinearWeights, ctx: &Context, group_size: usize, clip_ratio: f32) -> Result<Self> { Self::from_host_parts_policy(&[linear], ctx, group_size, clip_ratio) }
-    pub fn from_host_parts(parts: &[&LinearWeights], ctx: &Context) -> Result<Self> { Self::from_host_parts_policy(parts, ctx, 16, 1.0) }
+    pub fn from_host_parts(parts: &[&LinearWeights], ctx: &Context) -> Result<Self> { Self::from_host_parts_policy(parts, ctx, 16, 0.98) }
     pub fn from_host_parts_policy(parts: &[&LinearWeights], ctx: &Context, group_size: usize, clip_ratio: f32) -> Result<Self> {
         let weight=super::packing::concat_host_2d(&parts.iter().map(|p| &p.weight).collect::<Vec<_>>())?;
         let dims=weight.shape().dims();
