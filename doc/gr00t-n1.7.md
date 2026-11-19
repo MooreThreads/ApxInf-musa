@@ -20,12 +20,15 @@ graph lifetime, and the flow schedule.
 | Jetson AGX Thor (SM110) | BF16, calibrated FP8 |
 | Jetson AGX Orin (SM87) | BF16, INT8/W8A8 |
 | MTT M1000 (MP22) | BF16 (preprocessed two-view); FP8/INT8 rejected at load |
+| MTT S5000 (MP31) | BF16, calibrated static FP8; INT8 rejected at load |
 
-Not validated: S5000 (MP31), single-camera input, and sequence lengths other
-than the measured 145-token profile.
+Not validated: single-camera input, and sequence lengths other than the
+measured 145-token profile.
 
-`precision="auto"` selects BF16 on both platforms. Unsupported combinations
-fail at load time; they never silently fall back to another precision.
+`precision="auto"` selects BF16 on every platform. Unsupported combinations
+fail at load time; they never silently fall back to another precision. Static
+FP8 is an explicit deployment choice that also requires a calibration profile
+matching the weights and processor resources.
 
 The loader selects the precision exactly once and constructs a concrete
 runtime/executor pair:
@@ -204,6 +207,12 @@ not copied into the read-only checkpoint and is not committed to this tree.
 | Thor | FP8 | 32.557 ms | 35.436 ms |
 | Orin | BF16 | 75.778 ms | 84.864 ms |
 | Orin | W8A8 | 56.711 ms | 64.924 ms |
+| MTT S5000 (MUSA) | BF16 | — | 23.1 ms (2026-11-17) |
+| MTT S5000 (MUSA) | static FP8 | — | 17.46 ms (2026-11-17) |
+
+The S5000 rows are the 145-token preprocessed fixture on an idle card, not the
+LIBERO simulator; see `doc/musa-backend.md` for the FP8 route, fusion
+inventory, tactics regeneration and the rejected native plain-GEMM prototype.
 
 ## LIBERO-10 task accuracy
 
@@ -227,7 +236,7 @@ action D2H; it excludes simulator and raw-observation preprocessing time.
 python scripts/bench_gr00t.py \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
   --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
-  --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
+  --fixture devlocal/gr00t/fixtures/libero-two-view \
   --precision bf16 \
   --warmup 10 \
   --iterations 50
@@ -240,15 +249,19 @@ explicit new `--tactics` path together with `--autotune`; never rewrite the
 bundled database merely to bypass provenance validation. The report records
 P50/P95 and the complete normalized model-core output. Generated fixtures,
 reference dumps, logs, tactic databases, and result JSON belong under
-`devlocal/gr00t-n1d7/` and are not committed.
+`devlocal/gr00t/` and are not committed.
 
-### MUSA BF16
+### MUSA
 
 The MUSA implementation is a self-contained backend-native port under
 `crates/apxinf-model/src/musa_gr00t/`; it does not import or modify the CUDA
-`gr00t/` implementation. The maintained MUSA scope is BF16, batch 1, two
-camera grids, explicit processor-owned initial noise, and preprocessed tensors
-from NVIDIA's official processor. FP8 and INT8 are rejected at load time.
+`gr00t/` implementation. The maintained MUSA scope is batch 1, two camera
+grids, explicit processor-owned initial noise, and preprocessed tensors from
+NVIDIA's official processor. BF16 runs on every generation; calibrated static
+FP8 runs only on native-E4M3 hardware (`MP31`, S5000/S4000) and is rejected at
+load on `MP22` and on builds without the muDNN FP8 route. INT8 is rejected on
+MUSA. `precision="auto"` stays BF16; FP8 is an explicit choice that requires a
+calibration profile matching the weights and processor resources.
 
 Build the native runner for the target MUSA generation, then use the Python
 script only as a launcher and report/parity wrapper:
@@ -270,6 +283,15 @@ python scripts/gr00t/bench_apxinf_musa_rust.py \
   --iterations 50 \
   --output path_to/gr00t-musa-bf16.json
 ```
+
+On S5000 (`APXINF_MUSA_ARCH=mp_31`), static FP8 is selected with
+`--precision fp8 --calibration <profile>`; the profile is produced on the target
+by the shared model-neutral `CalibrationRunner` through
+`ModelRunner._calibrate_preprocessed` (the public `Gr00tPolicy.collect_calibration`
+seam). The MUSA FP8 executor quantizes every backbone and action-head linear
+with per-tensor E4M3 scales; activations, biases, normalization and attention
+stay BF16, matching the CUDA static-FP8 boundaries. See
+`doc/musa-backend.md` for the FP8 route and the measured S5000 numbers.
 
 The benchmark defaults to strict prepared Graph execution (`require-graph`) and
 requires the runtime to report `musa-graph`; capture failure is an error rather
@@ -404,8 +426,8 @@ python scripts/eval_libero.py \
   --trials-per-task 10 \
   --max-steps 720 \
   --replan-steps 8 \
-  --results-jsonl devlocal/gr00t-n1d7/results/libero-bf16.jsonl \
-  --summary-json devlocal/gr00t-n1d7/results/libero-bf16-summary.json
+  --results-jsonl devlocal/gr00t/results/libero-bf16.jsonl \
+  --summary-json devlocal/gr00t/results/libero-bf16-summary.json
 ```
 
 ## Validation contract

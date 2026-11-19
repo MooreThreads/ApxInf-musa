@@ -4,6 +4,7 @@
 // Copyright 2026 apxinf contributors); the differences are explained below.
 
 #include "normalization.cuh"
+#include "math.cuh"
 #include "reduction.cuh"
 
 // Fused operators, a port of the parts of
@@ -128,6 +129,113 @@ __global__ void ada_gate_residual_rms_norm_bf16_vector_kernel(
         __bfloat162float(packed_shift[lane]));
   }
   *reinterpret_cast<LoadT*>(normalized + index) = out_raw;
+}
+
+// Static-E4M3 output for the same operator. The arithmetic up to and including
+// the BF16 rounding is the sibling's; the store adds `inverse_scale` and the
+// E4M3 conversion, which is what makes this one launch instead of
+// `normalized` + `quantize_fixed_e4m3`.
+template <int VEC>
+__global__ void ada_gate_residual_rms_norm_bf16_e4m3_vector_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* residual,
+    const __mt_bfloat16* gate_style, const __mt_bfloat16* norm_style,
+    __mt_bfloat16* hidden, uint8_t* normalized, int rows, int cols, float eps,
+    float inverse_scale) {
+  static_assert(VEC == 4 || VEC == 8, "VEC must be 4 or 8 bf16 lanes");
+  using LoadT = typename RmsPack<VEC>::Type;
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int column = threadIdx.x * VEC;
+  const int64_t index = static_cast<int64_t>(row) * cols + column;
+  const LoadT projection_raw =
+      *reinterpret_cast<const LoadT*>(projection + index);
+  const LoadT residual_raw = *reinterpret_cast<const LoadT*>(residual + index);
+  const LoadT gate_raw =
+      *reinterpret_cast<const LoadT*>(gate_style + 2 * cols + column);
+  const __mt_bfloat16* packed_projection =
+      reinterpret_cast<const __mt_bfloat16*>(&projection_raw);
+  const __mt_bfloat16* packed_residual =
+      reinterpret_cast<const __mt_bfloat16*>(&residual_raw);
+  const __mt_bfloat16* packed_gate =
+      reinterpret_cast<const __mt_bfloat16*>(&gate_raw);
+  float values[VEC];
+  float square_sum = 0.0f;
+  LoadT hidden_raw;
+  __mt_bfloat16* packed_hidden = reinterpret_cast<__mt_bfloat16*>(&hidden_raw);
+#pragma unroll
+  for (int lane = 0; lane < VEC; ++lane) {
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(packed_residual[lane]) +
+        __bfloat162float(packed_projection[lane]) *
+            __bfloat162float(packed_gate[lane]));
+    packed_hidden[lane] = rounded;
+    values[lane] = __bfloat162float(rounded);
+    square_sum += values[lane] * values[lane];
+  }
+  *reinterpret_cast<LoadT*>(hidden + index) = hidden_raw;
+  const float inverse_rms =
+      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+  const LoadT scale_raw =
+      *reinterpret_cast<const LoadT*>(norm_style + column);
+  const LoadT shift_raw =
+      *reinterpret_cast<const LoadT*>(norm_style + cols + column);
+  const __mt_bfloat16* packed_scale =
+      reinterpret_cast<const __mt_bfloat16*>(&scale_raw);
+  const __mt_bfloat16* packed_shift =
+      reinterpret_cast<const __mt_bfloat16*>(&shift_raw);
+  uint64_t packed_out = 0;
+#pragma unroll
+  for (int lane = 0; lane < VEC; ++lane) {
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        values[lane] * inverse_rms *
+            (1.0f + __bfloat162float(packed_scale[lane])) +
+        __bfloat162float(packed_shift[lane]));
+    packed_out |= static_cast<uint64_t>(
+                      quantize_e4m3_value(__bfloat162float(rounded),
+                                          inverse_scale))
+                  << (8 * lane);
+  }
+  if constexpr (VEC == 4) {
+    *reinterpret_cast<uint32_t*>(normalized + index) =
+        static_cast<uint32_t>(packed_out);
+  } else {
+    *reinterpret_cast<uint64_t*>(normalized + index) = packed_out;
+  }
+}
+
+// The scalar two-pass sibling, for widths the vector form does not cover.
+// Kept shape-for-shape identical to `ada_gate_residual_rms_norm_bf16_kernel`:
+// the second pass reads `hidden` back, so the BF16 rounding the composed path
+// stores is still part of the arithmetic.
+__global__ void ada_gate_residual_rms_norm_bf16_e4m3_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* residual,
+    const __mt_bfloat16* gate_style, const __mt_bfloat16* norm_style,
+    __mt_bfloat16* hidden, uint8_t* normalized, int rows, int cols, float eps,
+    float inverse_scale) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  float square_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(residual[index]) +
+        __bfloat162float(projection[index]) *
+            __bfloat162float(gate_style[2 * cols + col]));
+    hidden[index] = rounded;
+    const float value = __bfloat162float(rounded);
+    square_sum += value * value;
+  }
+  const float inverse_rms =
+      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(hidden[index]) * inverse_rms *
+            (1.0f + __bfloat162float(norm_style[col])) +
+        __bfloat162float(norm_style[cols + col]));
+    normalized[index] =
+        quantize_e4m3_value(__bfloat162float(rounded), inverse_scale);
+  }
 }
 
 // Projection plus an optional bias, added into the residual, rounded once.
@@ -547,6 +655,308 @@ __global__ void bias_residual_layer_norm_bf16_warp_kernel(
   }
 }
 
+// Static-E4M3 output for the same operator. The arithmetic up to and including
+// the BF16 rounding is the sibling's; the store adds `inverse_scale` and the
+// E4M3 conversion. `hidden` is still BF16 and written from the same registers.
+//
+// One block per row, three warps per block, where the sibling above runs one
+// warp per row: the recorded call is `[512, 1152]`, so the warp form launched
+// 64 blocks and left every SM with 8-16 warps to hide the load -> reduce ->
+// store dependency. Three warps move the grid to 512 blocks (32 warps per SM)
+// and the reduction becomes one barrier over three warp partials. Measured on
+// an idle S5000: 6.50 us against the warp form's 10.76, bit-identical outputs.
+template <int kBlockThreads, int kChunks, bool HAS_BIAS>
+__global__ void bias_residual_layer_norm_bf16_e4m3_block_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* projection_bias,
+    const __mt_bfloat16* residual, const __mt_bfloat16* norm_weight,
+    const __mt_bfloat16* norm_bias, __mt_bfloat16* hidden, uint8_t* normalized,
+    int cols, float eps, float inverse_scale) {
+  constexpr int kWarps = kBlockThreads / 32;
+  static_assert(kBlockThreads % 32 == 0, "kBlockThreads must be a warp multiple");
+  static_assert(kBlockThreads * 4 * kChunks == 1152 ||
+                    kBlockThreads * 4 * kChunks == 1024,
+                "block shape must cover the supported widths");
+  const int tid = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  float values[kChunks * 4];
+  float sum = 0.0f;
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int64_t column =
+        static_cast<int64_t>(chunk * kBlockThreads + tid) * 4;
+    const uint2 projection_raw =
+        *reinterpret_cast<const uint2*>(projection + base + column);
+    const __mt_bfloat16* packed_projection =
+        reinterpret_cast<const __mt_bfloat16*>(&projection_raw);
+    const uint2 residual_raw =
+        *reinterpret_cast<const uint2*>(residual + base + column);
+    const __mt_bfloat16* packed_residual =
+        reinterpret_cast<const __mt_bfloat16*>(&residual_raw);
+    uint2 bias_raw;
+    const __mt_bfloat16* packed_bias = nullptr;
+    if (HAS_BIAS) {
+      bias_raw = *reinterpret_cast<const uint2*>(projection_bias + column);
+      packed_bias = reinterpret_cast<const __mt_bfloat16*>(&bias_raw);
+    }
+    uint2 hidden_raw;
+    __mt_bfloat16* packed_hidden = reinterpret_cast<__mt_bfloat16*>(&hidden_raw);
+#pragma unroll
+    for (int lane_in = 0; lane_in < 4; ++lane_in) {
+      float value = __bfloat162float(packed_projection[lane_in]) +
+                    __bfloat162float(packed_residual[lane_in]);
+      if (HAS_BIAS) value += __bfloat162float(packed_bias[lane_in]);
+      packed_hidden[lane_in] = __float2bfloat16(value);
+      const float rounded = __bfloat162float(packed_hidden[lane_in]);
+      values[chunk * 4 + lane_in] = rounded;
+      sum += rounded;
+      square_sum += rounded * rounded;
+    }
+    *reinterpret_cast<uint2*>(hidden + base + column) = hidden_raw;
+  }
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  __shared__ float ssum[kWarps];
+  __shared__ float ssq[kWarps];
+  sum = warp_sum(sum);
+  square_sum = warp_sum(square_sum);
+  if (lane == 0) {
+    ssum[warp] = sum;
+    ssq[warp] = square_sum;
+  }
+  __syncthreads();
+  float total = 0.0f;
+  float total_sq = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kWarps; ++w) {
+    total += ssum[w];
+    total_sq += ssq[w];
+  }
+  const float mean = total / cols;
+  const float inverse_std = rsqrtf(total_sq / cols - mean * mean + eps);
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int64_t column =
+        static_cast<int64_t>(chunk * kBlockThreads + tid) * 4;
+    const uint2 weight_raw =
+        *reinterpret_cast<const uint2*>(norm_weight + column);
+    const uint2 bias_raw = *reinterpret_cast<const uint2*>(norm_bias + column);
+    const __mt_bfloat16* packed_weight =
+        reinterpret_cast<const __mt_bfloat16*>(&weight_raw);
+    const __mt_bfloat16* packed_bias =
+        reinterpret_cast<const __mt_bfloat16*>(&bias_raw);
+    uint32_t packed_out = 0;
+#pragma unroll
+    for (int lane_in = 0; lane_in < 4; ++lane_in) {
+      const __mt_bfloat16 rounded = __float2bfloat16(
+          (values[chunk * 4 + lane_in] - mean) * inverse_std *
+              __bfloat162float(packed_weight[lane_in]) +
+          __bfloat162float(packed_bias[lane_in]));
+      packed_out |= static_cast<uint32_t>(
+                        quantize_e4m3_value(__bfloat162float(rounded),
+                                            inverse_scale))
+                    << (8 * lane_in);
+    }
+    *reinterpret_cast<uint32_t*>(normalized + base + column) = packed_out;
+  }
+}
+
+// Eight-lane sibling for the 1024-column vision width: one block per row, 128
+// threads, `uint4` loads and a 64-bit E4M3 store. The arithmetic, the two BF16
+// roundings and the per-warp reduction are the four-lane kernel's; only the
+// cross-warp sum has four partials instead of eight, which is the same class
+// of rounding-boundary difference the other fused norm kernels carry.
+union BiasResidualPacked8 {
+  uint4 bits;
+  __mt_bfloat16 lanes[8];
+};
+
+union BiasResidualE4m3x8 {
+  uint64_t bits;
+  uint8_t lanes[8];
+};
+
+__global__ void bias_residual_layer_norm_bf16_e4m3_block8_1024_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* projection_bias,
+    const __mt_bfloat16* residual, const __mt_bfloat16* norm_weight,
+    const __mt_bfloat16* norm_bias, __mt_bfloat16* hidden, uint8_t* normalized,
+    float eps, float inverse_scale) {
+  constexpr int kThreads = 128;
+  constexpr int kWarps = kThreads / 32;
+  constexpr int kCols = 1024;
+  const int tid = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * kCols;
+  const int64_t column = static_cast<int64_t>(tid) * 8;
+  BiasResidualPacked8 projection_raw, residual_raw, bias_raw, hidden_raw;
+  BiasResidualPacked8 weight_raw, norm_bias_raw;
+  projection_raw.bits =
+      *reinterpret_cast<const uint4*>(projection + base + column);
+  residual_raw.bits = *reinterpret_cast<const uint4*>(residual + base + column);
+  bias_raw.bits = *reinterpret_cast<const uint4*>(projection_bias + column);
+  // The norm affine is row-independent and is prefetched with the row so both
+  // global round trips overlap instead of the affine arriving after the
+  // reduction. The arithmetic is unchanged.
+  weight_raw.bits = *reinterpret_cast<const uint4*>(norm_weight + column);
+  norm_bias_raw.bits = *reinterpret_cast<const uint4*>(norm_bias + column);
+  float values[8];
+  float sum = 0.0f;
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int lane_in = 0; lane_in < 8; ++lane_in) {
+    const __mt_bfloat16 biased = __float2bfloat16(
+        __bfloat162float(projection_raw.lanes[lane_in]) +
+        __bfloat162float(bias_raw.lanes[lane_in]));
+    hidden_raw.lanes[lane_in] = __float2bfloat16(
+        __bfloat162float(biased) +
+        __bfloat162float(residual_raw.lanes[lane_in]));
+    const float rounded = __bfloat162float(hidden_raw.lanes[lane_in]);
+    values[lane_in] = rounded;
+    sum += rounded;
+    square_sum += rounded * rounded;
+  }
+  *reinterpret_cast<uint4*>(hidden + base + column) = hidden_raw.bits;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  __shared__ float ssum[kWarps];
+  __shared__ float ssq[kWarps];
+  sum = warp_sum(sum);
+  square_sum = warp_sum(square_sum);
+  if (lane == 0) {
+    ssum[warp] = sum;
+    ssq[warp] = square_sum;
+  }
+  __syncthreads();
+  float total = 0.0f;
+  float total_sq = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kWarps; ++w) {
+    total += ssum[w];
+    total_sq += ssq[w];
+  }
+  const float mean = total / kCols;
+  const float inverse_std = rsqrtf(total_sq / kCols - mean * mean + eps);
+  BiasResidualE4m3x8 packed_out;
+  packed_out.bits = 0;
+#pragma unroll
+  for (int lane_in = 0; lane_in < 8; ++lane_in) {
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        (values[lane_in] - mean) * inverse_std *
+            __bfloat162float(weight_raw.lanes[lane_in]) +
+        __bfloat162float(norm_bias_raw.lanes[lane_in]));
+    packed_out.lanes[lane_in] = quantize_e4m3_value(
+        __bfloat162float(rounded), inverse_scale);
+  }
+  *reinterpret_cast<uint64_t*>(normalized + base + column) = packed_out.bits;
+}
+
+// Templated two-rounding sibling for the GR00T DiT widths: the projection bias
+// is added and rounded to BF16, then the residual is added and rounded again,
+// matching `bias_bf16` followed by `add_bf16`. `hidden` carries the second
+// rounded value, the statistics are taken over it, and the normalized value is
+// written both as BF16 and as static E4M3 in the same pass.
+template <int kThreads, int kChunks>
+__global__ void bias_then_residual_layer_norm_bf16_e4m3_dual_block_t_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* projection_bias,
+    const __mt_bfloat16* residual, const __mt_bfloat16* norm_weight,
+    const __mt_bfloat16* norm_bias, __mt_bfloat16* hidden,
+    __mt_bfloat16* normalized, uint8_t* quantized, int cols, float eps,
+    float inverse_scale) {
+  constexpr int kWarps = kThreads / 32;
+  static_assert(kThreads % 32 == 0, "kThreads must be a warp multiple");
+  const int tid = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  float values[kChunks * 4];
+  // The norm affine is row-independent, so it is prefetched with the row: both
+  // global round trips are in flight together instead of the affine arriving
+  // only after the reduction. The arithmetic is unchanged.
+  uint2 norm_weight_raw[kChunks];
+  uint2 norm_bias_raw[kChunks];
+  float sum = 0.0f;
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int64_t column = static_cast<int64_t>(chunk * kThreads + tid) * 4;
+    const uint2 projection_raw =
+        *reinterpret_cast<const uint2*>(projection + base + column);
+    const uint2 residual_raw =
+        *reinterpret_cast<const uint2*>(residual + base + column);
+    const uint2 bias_raw =
+        *reinterpret_cast<const uint2*>(projection_bias + column);
+    norm_weight_raw[chunk] =
+        *reinterpret_cast<const uint2*>(norm_weight + column);
+    norm_bias_raw[chunk] = *reinterpret_cast<const uint2*>(norm_bias + column);
+    const __mt_bfloat16* packed_projection =
+        reinterpret_cast<const __mt_bfloat16*>(&projection_raw);
+    const __mt_bfloat16* packed_residual =
+        reinterpret_cast<const __mt_bfloat16*>(&residual_raw);
+    const __mt_bfloat16* packed_bias =
+        reinterpret_cast<const __mt_bfloat16*>(&bias_raw);
+    uint2 hidden_raw;
+    __mt_bfloat16* packed_hidden =
+        reinterpret_cast<__mt_bfloat16*>(&hidden_raw);
+#pragma unroll
+    for (int lane_in = 0; lane_in < 4; ++lane_in) {
+      const __mt_bfloat16 biased = __float2bfloat16(
+          __bfloat162float(packed_projection[lane_in]) +
+          __bfloat162float(packed_bias[lane_in]));
+      packed_hidden[lane_in] = __float2bfloat16(
+          __bfloat162float(biased) +
+          __bfloat162float(packed_residual[lane_in]));
+      const float rounded = __bfloat162float(packed_hidden[lane_in]);
+      values[chunk * 4 + lane_in] = rounded;
+      sum += rounded;
+      square_sum += rounded * rounded;
+    }
+    *reinterpret_cast<uint2*>(hidden + base + column) = hidden_raw;
+  }
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  __shared__ float ssum[kWarps];
+  __shared__ float ssq[kWarps];
+  sum = warp_sum(sum);
+  square_sum = warp_sum(square_sum);
+  if (lane == 0) {
+    ssum[warp] = sum;
+    ssq[warp] = square_sum;
+  }
+  __syncthreads();
+  float total = 0.0f;
+  float total_sq = 0.0f;
+#pragma unroll
+  for (int w = 0; w < kWarps; ++w) {
+    total += ssum[w];
+    total_sq += ssq[w];
+  }
+  const float mean = total / cols;
+  const float inverse_std = rsqrtf(total_sq / cols - mean * mean + eps);
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int64_t column = static_cast<int64_t>(chunk * kThreads + tid) * 4;
+    const __mt_bfloat16* packed_weight =
+        reinterpret_cast<const __mt_bfloat16*>(&norm_weight_raw[chunk]);
+    const __mt_bfloat16* packed_bias =
+        reinterpret_cast<const __mt_bfloat16*>(&norm_bias_raw[chunk]);
+    uint2 normalized_raw;
+    __mt_bfloat16* packed_normalized =
+        reinterpret_cast<__mt_bfloat16*>(&normalized_raw);
+    uint32_t packed_out = 0;
+#pragma unroll
+    for (int lane_in = 0; lane_in < 4; ++lane_in) {
+      const __mt_bfloat16 rounded = __float2bfloat16(
+          (values[chunk * 4 + lane_in] - mean) * inverse_std *
+              __bfloat162float(packed_weight[lane_in]) +
+          __bfloat162float(packed_bias[lane_in]));
+      packed_normalized[lane_in] = rounded;
+      packed_out |= static_cast<uint32_t>(
+                        quantize_e4m3_value(__bfloat162float(rounded),
+                                            inverse_scale))
+                    << (8 * lane_in);
+    }
+    *reinterpret_cast<uint2*>(normalized + base + column) = normalized_raw;
+    *reinterpret_cast<uint32_t*>(quantized + base + column) = packed_out;
+  }
+}
+
 // Vectorized, register-cached bias + residual + RMSNorm: one block per row,
 // each thread loads its eight columns once, holds them across the block
 // reduction, and writes both `hidden` and `normalized` from those registers, so
@@ -614,4 +1024,91 @@ __global__ void bias_residual_rms_norm_bf16_vector8_kernel(
         values[lane_in] * inverse_rms * __bfloat162float(packed_weight[lane_in]));
   }
   *reinterpret_cast<uint4*>(normalized + index) = out_raw;
+}
+
+// Static-E4M3 output for the same operator. The arithmetic up to and including
+// the BF16 rounding is the sibling's; the store adds `inverse_scale` and the
+// E4M3 conversion, which is what makes this one launch instead of `normalized`
+// + `quantize_fixed_e4m3`. `hidden` is still BF16 and written from the same
+// rounded registers.
+//
+// Two rows per block. One block per row launched 522 blocks for the recorded
+// `[522, 2048]` call, and its per-block prologue and barrier made a 3.2 MB
+// pass cost nearly as much as the twice-larger fused pair above. A 512-thread
+// block carries two rows, each half reducing into its own scratch behind one
+// barrier. Measured on an idle S5000: 10.05 us against 11.24; `hidden` is
+// bit-identical and two of 1,069,056 E4M3 bytes differ, from the two-way
+// reduction tree.
+template <bool HAS_BIAS>
+__global__ void bias_residual_rms_norm_bf16_e4m3_block2_kernel(
+    const __mt_bfloat16* projection, const __mt_bfloat16* bias,
+    const __mt_bfloat16* residual, const __mt_bfloat16* weight,
+    __mt_bfloat16* hidden, uint8_t* normalized, int rows, int cols, float eps,
+    float inverse_scale) {
+  const int half = threadIdx.x >> 8;
+  const int local = threadIdx.x & 255;
+  const int row = blockIdx.x * 2 + half;
+  const bool active = row < rows;
+  const int64_t column = static_cast<int64_t>(local) * 8;
+  const int64_t index = static_cast<int64_t>(row) * cols + column;
+  float values[8];
+  float square_sum = 0.0f;
+  // The weight is row-independent and is prefetched with the row so both global
+  // round trips overlap instead of the weight arriving only after the
+  // reduction. The arithmetic is unchanged.
+  uint4 weight_raw;
+  if (active) {
+    const uint4 projection_raw =
+        *reinterpret_cast<const uint4*>(projection + index);
+    const uint4 residual_raw =
+        *reinterpret_cast<const uint4*>(residual + index);
+    weight_raw = *reinterpret_cast<const uint4*>(weight + column);
+    const __mt_bfloat16* packed_projection =
+        reinterpret_cast<const __mt_bfloat16*>(&projection_raw);
+    const __mt_bfloat16* packed_residual =
+        reinterpret_cast<const __mt_bfloat16*>(&residual_raw);
+    uint4 bias_raw;
+    const __mt_bfloat16* packed_bias = nullptr;
+    if (HAS_BIAS) {
+      bias_raw = *reinterpret_cast<const uint4*>(bias + column);
+      packed_bias = reinterpret_cast<const __mt_bfloat16*>(&bias_raw);
+    }
+    uint4 hidden_raw;
+    __mt_bfloat16* packed_hidden =
+        reinterpret_cast<__mt_bfloat16*>(&hidden_raw);
+#pragma unroll
+    for (int lane_in = 0; lane_in < 8; ++lane_in) {
+      float value = __bfloat162float(packed_projection[lane_in]) +
+                    __bfloat162float(packed_residual[lane_in]);
+      if (HAS_BIAS) value += __bfloat162float(packed_bias[lane_in]);
+      packed_hidden[lane_in] = __float2bfloat16(value);
+      values[lane_in] = __bfloat162float(packed_hidden[lane_in]);
+      square_sum += values[lane_in] * values[lane_in];
+    }
+    *reinterpret_cast<uint4*>(hidden + index) = hidden_raw;
+  }
+  const int lane = local & 31;
+  const int warp = local >> 5;
+  __shared__ float sscratch[2][8];
+  square_sum = warp_sum(square_sum);
+  if (lane == 0) sscratch[half][warp] = square_sum;
+  __syncthreads();
+  float total = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) total += sscratch[half][i];
+  const float inverse_rms = rsqrtf(total / cols + eps);
+  if (!active) return;
+  const __mt_bfloat16* packed_weight =
+      reinterpret_cast<const __mt_bfloat16*>(&weight_raw);
+  uint64_t packed_out = 0;
+#pragma unroll
+  for (int lane_in = 0; lane_in < 8; ++lane_in) {
+    const __mt_bfloat16 rounded = __float2bfloat16(
+        values[lane_in] * inverse_rms * __bfloat162float(packed_weight[lane_in]));
+    packed_out |= static_cast<uint64_t>(
+                      quantize_e4m3_value(__bfloat162float(rounded),
+                                          inverse_scale))
+                  << (8 * lane_in);
+  }
+  *reinterpret_cast<uint64_t*>(normalized + index) = packed_out;
 }

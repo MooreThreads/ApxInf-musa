@@ -15,10 +15,11 @@ use apxinf_core::{Error, Result, Tensor};
 use crate::context::MusaContext;
 use crate::tuning::{TuningDb, TuningMode, TuningPaths};
 
+pub(crate) mod assembly;
+mod bf16;
+mod fp8;
 #[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
 mod qint8_tiles;
-mod bf16;
-pub(crate) mod assembly;
 mod w8a8;
 
 pub use assembly::{prepare_bf16_nn_weight, prepare_bf16_nt_weight};
@@ -27,6 +28,7 @@ pub use bf16::{
     gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused, gemm_bf16_into,
     gemm_bf16_into_with,
 };
+pub use fp8::{gemm_fp8_bias_into, gemm_fp8_bias_residual_into, gemm_fp8_into};
 pub use qint8_tiles::serves as w8a8_tile_serves;
 pub use w8a8::{
     norm_quantize_w8a8_activation,

@@ -39,11 +39,23 @@ pub(crate) type VisionBiasGelu<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Te
 pub(crate) type VisionConcatQuant<'a> =
     dyn Fn(&str, &Tensor, &Tensor) -> Result<Option<Tensor>> + 'a;
 pub(crate) type VisionSegmentedAttention<'a> =
-    dyn Fn(&Tensor, &Tensor, &Tensor, &[usize], usize, usize) -> Result<Option<Tensor>> + 'a;
+    dyn Fn(&str, &Tensor, &Tensor, &Tensor, &[usize], usize, usize) -> Result<Option<Tensor>> + 'a;
 pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Tensor, Tensor)>
     + 'a;
 pub(crate) type VisionBiasResidual<'a> =
     dyn Fn(&str, &Tensor, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+
+/// Fused `bias + residual + next-block pre-attention LayerNorm`, writing the
+/// residual stream in BF16 and the normalized tensor as static E4M3.
+///
+/// It replaces the `bias_residual` launch plus the next block's `norm_matmul`
+/// LayerNorm with one producer. The next QKV projection consumes the E4M3
+/// tensor directly because `qwen_matmul` already dispatches on `F8E4M3`. The
+/// name is the *next* block's `qkv` linear, which supplies the activation
+/// scale.
+pub(crate) type VisionResidualNormQuantized<'a> =
+    dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32) -> Result<(Tensor, Tensor)>
+        + 'a;
 
 fn fused_vision_mlp_residual_norm_shape_supported(
     n_patches: usize,
@@ -159,6 +171,7 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    residual_norm_quantized: Option<&VisionResidualNormQuantized<'_>>,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
     allow_cached_residual_layer_norm: bool,
@@ -179,6 +192,7 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
         segmented_attention,
         concat_quant,
         residual_norm_matmul,
+        residual_norm_quantized,
         true,
         allow_gr00t_fused_mlp_residual_norm,
         bias_residual,
@@ -202,6 +216,7 @@ fn forward_impl(
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    residual_norm_quantized: Option<&VisionResidualNormQuantized<'_>>,
     allow_gr00t_fused_qkv_rope: bool,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
@@ -215,6 +230,7 @@ fn forward_impl(
         allow_cached_residual_layer_norm,
         allow_batched_segmented_attention,
         prefer_precomputed_qkv_vec2,
+        residual_norm_quantized,
     );
     #[cfg(feature = "musa")]
     let _ = prefer_precomputed_qkv_vec2;
@@ -254,7 +270,6 @@ fn forward_impl(
                 && allow_cached_residual_layer_norm
                 && n_patches == 512
                 && hidden == 1024
-                && std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_RESIDUAL_LN").is_none()
         }
         #[cfg(not(feature = "musa"))]
         {
@@ -491,7 +506,30 @@ fn forward_impl(
             &blk.fc2_w,
         )
         .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?;
-        if (allow_gr00t_fused_mlp_residual_norm
+        if let (Some(residual_norm_quantized), true) =
+            (residual_norm_quantized, i + 1 < w.blocks.len())
+        {
+            // Fused `bias + residual + next-block norm1 + E4M3`: one producer
+            // instead of `bias_residual` plus the next block's norm launch. The
+            // next QKV projection consumes the E4M3 tensor directly.
+            let next = &w.blocks[i + 1];
+            let (residual_hidden, quantized) = residual_norm_quantized(
+                &format!("backbone.vision.blocks.{}.qkv", i + 1),
+                &h2,
+                &blk.fc2_b,
+                &x,
+                &next.norm1_w,
+                &next.norm1_b,
+                eps,
+            )
+            .map_err(|error| {
+                Error::Other(format!(
+                    "vision block {i} fused residual/next norm failed: {error}"
+                ))
+            })?;
+            x = residual_hidden;
+            prepared_norm1 = Some(quantized);
+        } else if (allow_gr00t_fused_mlp_residual_norm
             && fused_vision_mlp_residual_norm_shape_supported(n_patches, hidden, i, w.blocks.len()))
             || (use_cached_residual_layer_norm && i + 1 < w.blocks.len())
         {
@@ -692,7 +730,7 @@ fn vision_bias_residual(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_bias_residual_layer_norm(
+pub(crate) fn apply_bias_residual_layer_norm(
     b: &GpuBackend,
     projection: &Tensor,
     projection_bias: &Tensor,
@@ -949,13 +987,24 @@ fn segmented_vision_sdpa(
     }
 
     #[cfg(feature = "musa")]
+    if let Some(attention) = segmented_attention {
+        if let Some(output) = attention(output_name, q, k, v, segment_lengths, n_heads, head_dim)? {
+            return Ok(output);
+        }
+    }
+
+    #[cfg(feature = "musa")]
     if let Some(musa) = b.as_any().downcast_ref::<GpuBackend>() {
-        if allow_batched_segmented_attention
-            && segment_lengths == [256, 256]
-            && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
-        {
+        if allow_batched_segmented_attention && segment_lengths == [256, 256] {
             if let Some(output) = kernels::attention::try_noncausal_batched_equal(
-                musa.context(), q, k, v, 2, 256, n_heads, head_dim,
+                musa.context(),
+                q,
+                k,
+                v,
+                2,
+                256,
+                n_heads,
+                head_dim,
             )? {
                 return Ok(output);
             }

@@ -27,8 +27,8 @@ mod error;
 pub(crate) mod ffi;
 mod graph;
 pub mod kernels;
-pub mod ops;
 pub mod mttx;
+pub mod ops;
 pub mod sampling;
 pub mod stream;
 pub mod transfers;
@@ -36,7 +36,7 @@ pub mod tuning;
 mod workspace;
 
 pub use buffer::{MusaBuffer, MusaDeviceAddress};
-pub use context::{MusaLibraryVersions, MusaContext};
+pub use context::{MusaContext, MusaLibraryVersions};
 pub use device_caps::{MusaArchFamily, MusaDeviceCaps};
 pub use graph::{capture, capture_isolated, CapturedGraph};
 pub use stream::MusaStream;
@@ -106,6 +106,24 @@ const _: () = {
         b"assembly" | b"mutlass" | b"unsupported"
     ) {
         panic!("build.rs published a D256 route this crate does not understand");
+    }
+};
+
+/// Which FP8 GEMM provider this build has: `"mudnn"` or `"unsupported"`.
+///
+/// Published by `build.rs` from `build_support::musa_arch::fp8_route`, the one
+/// place the arch rule is written. `mp_31` has the vendor E4M3 kernels and
+/// selects muDNN; `mp_22` has no FP8 MMA and no emulation fallback.
+pub const FP8_ROUTE: &str = env!("APXINF_MUSA_FP8_ROUTE");
+
+/// The published FP8 route has to be one this crate understands.
+///
+/// Same reasoning as the D256 assertion above: a name from a future build
+/// script would look like a missing kernel rather than a build/library
+/// disagreement.
+const _: () = {
+    if !matches!(FP8_ROUTE.as_bytes(), b"mudnn" | b"unsupported") {
+        panic!("build.rs published an FP8 route this crate does not understand");
     }
 };
 

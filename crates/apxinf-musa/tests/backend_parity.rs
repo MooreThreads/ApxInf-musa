@@ -160,6 +160,21 @@ const KNOBS: &[Knob] = &[
         note: "=scalar forces the language qkv input RMSNorm onto the scalar two-pass kernel; cuda-new has no matching switch",
     },
     Knob {
+        name: "APXINF_MUSA_FA_UNPACKED",
+        counterpart: None,
+        note: "=0 restores the packed MATE decode tile instead of the unpacked tile16 render for an A/B; cuda-new has no matching switch",
+    },
+    Knob {
+        name: "APXINF_MUSA_BENCH_DEVICE",
+        counterpart: None,
+        note: "selects the device index for the ignored MUSA benchmark tests; test-only and never read on a production path",
+    },
+    Knob {
+        name: "APXINF_MUSA_BENCH_COLD",
+        counterpart: None,
+        note: "=1 flushes device caches before each timed MUSA FP8 GEMM benchmark call; test-only",
+    },
+    Knob {
         name: "APXINF_MUSA_FA_REPLAY_DIR",
         counterpart: None,
         note: "directory a captured MATE reference is replayed from, for \

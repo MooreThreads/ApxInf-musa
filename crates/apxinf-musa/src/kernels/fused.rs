@@ -1,12 +1,13 @@
 //! Fused residual and normalization operator contracts.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matching_bf16, require_matrix_bf16,
-    require_optional_vector_bf16, require_output_matrix, require_positive_eps,
+    require_optional_vector_bf16, require_output_dtype_tensor, require_output_matrix,
+    require_positive_eps,
     require_vector_at_least_bf16, require_vector_bf16,
 };
 use crate::context::MusaContext;
@@ -216,6 +217,118 @@ fn launch_bias_residual_rms(
     Err(native_unavailable("fused::bias_residual_rms_bf16"))
 }
 
+/// `bias_residual_rms_bf16_e4m3` serves `kThreads * 8` (2048) columns.
+pub fn bias_residual_rms_e4m3_supported(cols: usize) -> bool {
+    cols == 2048
+}
+
+/// Write the residual sum and its RMS normalization, quantized E4M3, in one
+/// launch. `hidden` stays BF16 and carries the same rounded bytes as the BF16
+/// sibling.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_residual_rms_e4m3_into(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    weight: &Tensor,
+    hidden: &mut Tensor,
+    normalized: &mut Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<()> {
+    let (rows, cols) = require_matrix_bf16(ctx, projection, "bias residual rms e4m3", "projection")?;
+    require_matching_bf16(ctx, "bias residual rms e4m3", "residual", projection, residual)?;
+    require_vector_bf16(ctx, weight, cols, "bias residual rms e4m3", "weight")?;
+    require_optional_vector_bf16(ctx, bias, cols, "bias residual rms e4m3", "bias")?;
+    require_output_matrix(ctx, hidden, rows, cols, "bias residual rms e4m3", "hidden")?;
+    require_output_dtype_tensor(
+        ctx,
+        normalized,
+        &[rows, cols],
+        DType::F8E4M3,
+        "bias residual rms e4m3",
+        "normalized",
+    )?;
+    if !bias_residual_rms_e4m3_supported(cols) {
+        return Err(apxinf_core::Error::Other(format!(
+            "MUSA bias_residual_rms_e4m3: no fused kernel for width {cols}"
+        )));
+    }
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    launch_bias_residual_rms_e4m3(
+        ctx,
+        projection,
+        bias,
+        residual,
+        weight,
+        hidden,
+        normalized,
+        rows,
+        cols,
+        eps,
+        inverse_scale,
+    )
+}
+
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_bias_residual_rms_e4m3(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    weight: &Tensor,
+    hidden: &Tensor,
+    normalized: &Tensor,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("bias_residual_rms_e4m3", "rows", rows)?;
+    let cols = checked_i32("bias_residual_rms_e4m3", "cols", cols)?;
+    let bias_pointer = optional_tensor_ptr(bias)?;
+    // SAFETY: as in `launch_bias_residual_rms`, with the E4M3 output checked
+    // above; every buffer outlives the asynchronous launch.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_bias_residual_rms_norm_bf16_e4m3(
+                tensor_ptr(projection)?,
+                bias_pointer,
+                tensor_ptr(residual)?,
+                tensor_ptr(weight)?,
+                tensor_ptr(hidden)?,
+                tensor_ptr(normalized)?,
+                rows,
+                cols,
+                eps,
+                inverse_scale,
+                ctx.stream().handle(),
+            ),
+            "bias_residual_rms_e4m3",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+#[allow(clippy::too_many_arguments)]
+fn launch_bias_residual_rms_e4m3(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _bias: Option<&Tensor>,
+    _residual: &Tensor,
+    _weight: &Tensor,
+    _hidden: &Tensor,
+    _normalized: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable("fused::bias_residual_rms_e4m3_into"))
+}
+
 /// Bias, residual add, and layer normalization in one pass.
 ///
 /// Native: `kernels/custom/fused.cuh`'s `bias_residual_layer_norm_bf16_kernel`,
@@ -369,6 +482,402 @@ fn launch_layer(
     Err(native_unavailable("fused::bias_residual_layer_bf16"))
 }
 
+/// `bias_residual_layer_bf16_e4m3` serves the vision MLP boundary widths:
+/// 1024 (main vision blocks) and 1152 (the deepstack merger).
+pub fn bias_residual_layer_e4m3_supported(cols: usize) -> bool {
+    matches!(cols, 1024 | 1152)
+}
+
+/// Allocating form of [`bias_residual_layer_e4m3_into`]: the residual sum as
+/// BF16 plus its LayerNorm quantized to static E4M3.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_residual_layer_e4m3(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: Option<&Tensor>,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let (rows, cols) = require_matrix_bf16(
+        ctx,
+        projection,
+        "bias_residual_layer_e4m3",
+        "projection",
+    )?;
+    let mut hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    let mut normalized = ctx.allocate_output(Shape::new(vec![rows, cols]), DType::F8E4M3)?;
+    bias_residual_layer_e4m3_into(
+        ctx,
+        projection,
+        projection_bias,
+        residual,
+        norm_weight,
+        norm_bias,
+        &mut hidden,
+        &mut normalized,
+        eps,
+        scale,
+    )?;
+    Ok((hidden, normalized))
+}
+
+/// Write the residual sum and its layer normalization, quantized E4M3, in one
+/// launch. `hidden` stays BF16 and carries the same rounded bytes as the BF16
+/// sibling.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_residual_layer_e4m3_into(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: Option<&Tensor>,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    hidden: &mut Tensor,
+    normalized: &mut Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<()> {
+    let (rows, cols) =
+        require_matrix_bf16(ctx, projection, "bias residual layer e4m3", "projection")?;
+    require_matching_bf16(
+        ctx,
+        "bias residual layer e4m3",
+        "residual",
+        projection,
+        residual,
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_weight,
+        cols,
+        "bias residual layer e4m3",
+        "norm_weight",
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_bias,
+        cols,
+        "bias residual layer e4m3",
+        "norm_bias",
+    )?;
+    require_optional_vector_bf16(
+        ctx,
+        projection_bias,
+        cols,
+        "bias residual layer e4m3",
+        "projection_bias",
+    )?;
+    require_output_matrix(ctx, hidden, rows, cols, "bias residual layer e4m3", "hidden")?;
+    require_output_dtype_tensor(
+        ctx,
+        normalized,
+        &[rows, cols],
+        DType::F8E4M3,
+        "bias residual layer e4m3",
+        "normalized",
+    )?;
+    if !bias_residual_layer_e4m3_supported(cols) {
+        return Err(apxinf_core::Error::Other(format!(
+            "MUSA bias_residual_layer_e4m3: no fused kernel for width {cols}"
+        )));
+    }
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    launch_layer_e4m3(
+        ctx,
+        projection,
+        projection_bias,
+        residual,
+        norm_weight,
+        norm_bias,
+        hidden,
+        normalized,
+        rows,
+        cols,
+        eps,
+        inverse_scale,
+    )
+}
+
+/// The three outputs of a projection-bias, residual, LayerNorm, and E4M3 step.
+#[derive(Debug)]
+pub struct ResidualNormQuantizedTensors {
+    pub hidden: Tensor,
+    pub normalized: Tensor,
+    pub quantized: Tensor,
+}
+
+/// `bias_then_residual_layer_e4m3_dual` serves the GR00T DiT/vl widths.
+pub fn bias_then_residual_layer_e4m3_dual_supported(cols: usize) -> bool {
+    matches!(cols, 1024 | 1536 | 2048)
+}
+
+/// Projection plus a bias, added into the residual with the bias rounded to
+/// BF16 first, then a LayerNorm whose output is written as BF16 and static
+/// E4M3 in one launch.
+#[allow(clippy::too_many_arguments)]
+pub fn bias_then_residual_layer_e4m3_dual(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<ResidualNormQuantizedTensors> {
+    let (rows, cols) = require_matrix_bf16(
+        ctx,
+        projection,
+        "bias then residual layer e4m3 dual",
+        "projection",
+    )?;
+    let mut hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    let mut normalized = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
+    let mut quantized = ctx.allocate_output(Shape::new(vec![rows, cols]), DType::F8E4M3)?;
+    bias_then_residual_layer_e4m3_dual_into(
+        ctx,
+        projection,
+        projection_bias,
+        residual,
+        norm_weight,
+        norm_bias,
+        &mut hidden,
+        &mut normalized,
+        &mut quantized,
+        eps,
+        scale,
+    )?;
+    Ok(ResidualNormQuantizedTensors {
+        hidden,
+        normalized,
+        quantized,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bias_then_residual_layer_e4m3_dual_into(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    hidden: &mut Tensor,
+    normalized: &mut Tensor,
+    quantized: &mut Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<()> {
+    let (rows, cols) = require_matrix_bf16(
+        ctx,
+        projection,
+        "bias then residual layer e4m3 dual",
+        "projection",
+    )?;
+    require_matching_bf16(
+        ctx,
+        "bias then residual layer e4m3 dual",
+        "residual",
+        projection,
+        residual,
+    )?;
+    require_vector_bf16(
+        ctx,
+        projection_bias,
+        cols,
+        "bias then residual layer e4m3 dual",
+        "projection_bias",
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_weight,
+        cols,
+        "bias then residual layer e4m3 dual",
+        "norm_weight",
+    )?;
+    require_vector_bf16(
+        ctx,
+        norm_bias,
+        cols,
+        "bias then residual layer e4m3 dual",
+        "norm_bias",
+    )?;
+    require_output_matrix(
+        ctx,
+        hidden,
+        rows,
+        cols,
+        "bias then residual layer e4m3 dual",
+        "hidden",
+    )?;
+    require_output_dtype_tensor(
+        ctx,
+        normalized,
+        &[rows, cols],
+        DType::BF16,
+        "bias then residual layer e4m3 dual",
+        "normalized",
+    )?;
+    require_output_dtype_tensor(
+        ctx,
+        quantized,
+        &[rows, cols],
+        DType::F8E4M3,
+        "bias then residual layer e4m3 dual",
+        "quantized",
+    )?;
+    if !bias_then_residual_layer_e4m3_dual_supported(cols) {
+        return Err(apxinf_core::Error::Other(format!(
+            "MUSA bias_then_residual_layer_e4m3_dual: no fused kernel for width {cols}"
+        )));
+    }
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    launch_bias_then_residual_layer_e4m3_dual(
+        ctx,
+        projection,
+        projection_bias,
+        residual,
+        norm_weight,
+        norm_bias,
+        hidden,
+        normalized,
+        quantized,
+        rows,
+        cols,
+        eps,
+        inverse_scale,
+    )
+}
+
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_bias_then_residual_layer_e4m3_dual(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: &Tensor,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    hidden: &Tensor,
+    normalized: &Tensor,
+    quantized: &Tensor,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("bias_then_residual_layer_e4m3_dual", "rows", rows)?;
+    let cols = checked_i32("bias_then_residual_layer_e4m3_dual", "cols", cols)?;
+    // SAFETY: as in `launch_layer_e4m3`; every buffer is a caller `Tensor`
+    // that outlives the asynchronous launch on `ctx.stream()`.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_bias_then_residual_layer_norm_bf16_e4m3_dual(
+                tensor_ptr(projection)?,
+                tensor_ptr(projection_bias)?,
+                tensor_ptr(residual)?,
+                tensor_ptr(norm_weight)?,
+                tensor_ptr(norm_bias)?,
+                tensor_ptr(hidden)?,
+                tensor_ptr(normalized)?,
+                tensor_ptr(quantized)?,
+                rows,
+                cols,
+                eps,
+                inverse_scale,
+                ctx.stream().handle(),
+            ),
+            "bias_then_residual_layer_e4m3_dual",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+#[allow(clippy::too_many_arguments)]
+fn launch_bias_then_residual_layer_e4m3_dual(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _projection_bias: &Tensor,
+    _residual: &Tensor,
+    _norm_weight: &Tensor,
+    _norm_bias: &Tensor,
+    _hidden: &Tensor,
+    _normalized: &Tensor,
+    _quantized: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable(
+        "fused::bias_then_residual_layer_e4m3_dual_into",
+    ))
+}
+
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_layer_e4m3(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    projection_bias: Option<&Tensor>,
+    residual: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: &Tensor,
+    hidden: &Tensor,
+    normalized: &Tensor,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("bias_residual_layer_e4m3", "rows", rows)?;
+    let cols = checked_i32("bias_residual_layer_e4m3", "cols", cols)?;
+    let projection_bias = optional_tensor_ptr(projection_bias)?;
+    // SAFETY: as in `launch_layer`, with the E4M3 output checked above; every
+    // buffer outlives the asynchronous launch on `ctx.stream()`.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_bias_residual_layer_norm_bf16_e4m3(
+                tensor_ptr(projection)?,
+                projection_bias,
+                tensor_ptr(residual)?,
+                tensor_ptr(norm_weight)?,
+                tensor_ptr(norm_bias)?,
+                tensor_ptr(hidden)?,
+                tensor_ptr(normalized)?,
+                rows,
+                cols,
+                eps,
+                inverse_scale,
+                ctx.stream().handle(),
+            ),
+            "bias_residual_layer_e4m3",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+#[allow(clippy::too_many_arguments)]
+fn launch_layer_e4m3(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _projection_bias: Option<&Tensor>,
+    _residual: &Tensor,
+    _norm_weight: &Tensor,
+    _norm_bias: &Tensor,
+    _hidden: &Tensor,
+    _normalized: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable("fused::bias_residual_layer_e4m3_into"))
+}
+
 /// Gated residual add plus adaptive RMS normalization.
 ///
 /// `gate_style` and `norm_style` are each BF16 `[3 * cols]`: scale, shift and
@@ -496,39 +1005,112 @@ fn launch(
     Err(native_unavailable("fused::adaptive_gate_residual_rms_bf16"))
 }
 
-pub fn bias_residual_bf16_packed4(
-    _ctx: &MusaContext,
-    _projection: &Tensor,
-    _bias: &Tensor,
-    _residual: &Tensor,
-) -> Result<Tensor> {
-    Err(not_ported("fused::bias_residual_bf16_packed4"))
-}
-
-pub fn bias_then_residual_bf16_packed4(
-    _ctx: &MusaContext,
-    _projection: &Tensor,
-    _bias: Option<&Tensor>,
-    _residual: &Tensor,
-) -> Result<Tensor> {
-    Err(not_ported("fused::bias_then_residual_bf16_packed4"))
-}
-
+/// The same gated residual + adaLN RMSNorm, written directly as static E4M3.
+///
+/// One launch replaces the BF16 kernel plus `quantize_fixed_e4m3`. The second
+/// pass rounds to BF16 before the quantizer's multiply/clamp/convert, which is
+/// the composed path's arithmetic, so the bytes are unchanged.
 #[allow(clippy::too_many_arguments)]
-pub fn bias_residual_layer_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _projection: &Tensor,
-    _projection_bias: Option<&Tensor>,
-    _residual: &Tensor,
-    _norm_weight: &Tensor,
-    _norm_bias: &Tensor,
-    _eps: f32,
-    _scale: f32,
-) -> Result<ResidualNormTensors> {
-    Err(not_ported("fused::bias_residual_layer_quant_bf16_e4m3"))
+pub fn adaptive_gate_residual_rms_e4m3_into(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    residual: &Tensor,
+    gate_style: &Tensor,
+    norm_style: &Tensor,
+    hidden: &mut Tensor,
+    normalized: &mut Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<()> {
+    let (rows, cols) = require_matrix_bf16(ctx, projection, "ada gate residual", "projection")?;
+    require_matching_bf16(ctx, "ada gate residual", "residual", projection, residual)?;
+    require_vector_at_least_bf16(ctx, gate_style, 3 * cols, "ada gate residual", "gate_style")?;
+    require_vector_at_least_bf16(ctx, norm_style, 2 * cols, "ada gate residual", "norm_style")?;
+    require_output_matrix(ctx, hidden, rows, cols, "ada gate residual", "hidden")?;
+    require_output_dtype_tensor(
+        ctx,
+        normalized,
+        &[rows, cols],
+        DType::F8E4M3,
+        "ada gate residual",
+        "normalized",
+    )?;
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    launch_e4m3(
+        ctx,
+        projection,
+        residual,
+        gate_style,
+        norm_style,
+        hidden,
+        normalized,
+        rows,
+        cols,
+        eps,
+        inverse_scale,
+    )
 }
 
-// ── FP8 and FP8-output fused operators (not ported) ──────────────────────
+#[cfg(apxinf_musa_available)]
+#[allow(clippy::too_many_arguments)]
+fn launch_e4m3(
+    ctx: &MusaContext,
+    projection: &Tensor,
+    residual: &Tensor,
+    gate_style: &Tensor,
+    norm_style: &Tensor,
+    hidden: &Tensor,
+    normalized: &Tensor,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("adaptive_gate_residual_rms", "rows", rows)?;
+    let cols = checked_i32("adaptive_gate_residual_rms", "cols", cols)?;
+    // SAFETY: the checks above established shapes, dtypes and one device;
+    // every buffer outlives the asynchronous launch on `ctx.stream()`.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_ada_gate_residual_rms_norm_bf16_e4m3(
+                tensor_ptr(projection)?,
+                tensor_ptr(residual)?,
+                tensor_ptr(gate_style)?,
+                tensor_ptr(norm_style)?,
+                tensor_ptr(hidden)?,
+                tensor_ptr(normalized)?,
+                rows,
+                cols,
+                eps,
+                inverse_scale,
+                ctx.stream().handle(),
+            ),
+            "adaptive_gate_residual_rms",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+#[allow(clippy::too_many_arguments)]
+fn launch_e4m3(
+    _ctx: &MusaContext,
+    _projection: &Tensor,
+    _residual: &Tensor,
+    _gate_style: &Tensor,
+    _norm_style: &Tensor,
+    _hidden: &Tensor,
+    _normalized: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _eps: f32,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable(
+        "fused::adaptive_gate_residual_rms_bf16_e4m3",
+    ))
+}
+
+// ── FP8 GEMM post-ops and FP16 E4M3 producers (not ported) ───────────────
 
 /// FP8 GEMM plus an FP16 bias, returning FP16.
 #[allow(clippy::too_many_arguments)]
@@ -862,7 +1444,8 @@ mod tests {
 
     use crate::context::MusaContext;
     use crate::kernels::fused::{
-        adaptive_gate_residual_rms_bf16, bias_residual_bf16, bias_residual_layer_bf16,
+        adaptive_gate_residual_rms_bf16, adaptive_gate_residual_rms_bf16_into,
+        adaptive_gate_residual_rms_e4m3_into, bias_residual_bf16, bias_residual_layer_bf16,
         bias_residual_rms_bf16,
     };
     use crate::kernels::test_support::{
@@ -1261,5 +1844,97 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("residual is on"), "{message}");
+    }
+
+    /// The fused E4M3 producer must be the composed pair's bytes and must write
+    /// the same residual. `[10, 1024]` takes the VEC=4 vector path the action
+    /// expert uses; `[10, 512]` takes the scalar fallback.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn ada_gate_e4m3_matches_the_composed_pair_byte_for_byte() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let scale = 0.0512f32;
+        for (rows, cols) in [(10usize, 1024usize), (10, 512)] {
+            let projection = upload(
+                &ctx,
+                &values(rows * cols, 0x5eed_1234),
+                Shape::new(vec![rows, cols]),
+            );
+            let residual = upload(
+                &ctx,
+                &values(rows * cols, 0x0bad_c0de),
+                Shape::new(vec![rows, cols]),
+            );
+            let gate_style = upload(
+                &ctx,
+                &values(3 * cols, 0x1357_9bdf),
+                Shape::new(vec![3 * cols]),
+            );
+            let norm_style = upload(
+                &ctx,
+                &values(3 * cols, 0x2468_ace0),
+                Shape::new(vec![3 * cols]),
+            );
+
+            let mut hidden = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::BF16);
+            let mut composed = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::BF16);
+            adaptive_gate_residual_rms_bf16_into(
+                &ctx,
+                &projection,
+                &residual,
+                &gate_style,
+                &norm_style,
+                &mut hidden,
+                &mut composed,
+                EPS,
+            )
+            .expect("bf16 fused residual norm");
+            let mut composed_quantized =
+                zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F8E4M3);
+            crate::kernels::quantization::quantize_fixed_e4m3(
+                &ctx,
+                &composed,
+                &mut composed_quantized,
+                scale,
+            )
+            .expect("standalone quantizer");
+
+            let mut fused_hidden = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::BF16);
+            let mut fused = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F8E4M3);
+            adaptive_gate_residual_rms_e4m3_into(
+                &ctx,
+                &projection,
+                &residual,
+                &gate_style,
+                &norm_style,
+                &mut fused_hidden,
+                &mut fused,
+                EPS,
+                scale,
+            )
+            .expect("fused e4m3 residual norm");
+            ctx.stream().synchronize().expect("synchronise");
+
+            let expected = crate::transfers::to_cpu(&composed_quantized)
+                .expect("composed back")
+                .as_f8_e4m3()
+                .expect("composed e4m3")
+                .to_vec();
+            let got = crate::transfers::to_cpu(&fused)
+                .expect("fused back")
+                .as_f8_e4m3()
+                .expect("fused e4m3")
+                .to_vec();
+            assert_eq!(
+                got, expected,
+                "ada gate e4m3 [{rows} x {cols}] differs from the composed pair"
+            );
+            assert_eq!(
+                read_back(&fused_hidden),
+                read_back(&hidden),
+                "ada gate hidden [{rows} x {cols}] differs from the bf16 kernel"
+            );
+            println!("  ada gate e4m3 [{rows} x {cols}] byte-identical");
+        }
     }
 }

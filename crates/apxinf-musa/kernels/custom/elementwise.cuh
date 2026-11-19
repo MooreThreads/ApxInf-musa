@@ -92,6 +92,36 @@ __global__ void concat_columns_bf16_kernel(
   }
 }
 
+// Inverse of `concat_columns_bf16_kernel` for the text backbone's fused QKV:
+// the packed row is `q | k | v` with q wider than k and v. One pass, one row
+// per grid.y, so the three destinations are a branch rather than three
+// separate strided copies. Used only when the three projections share an
+// activation scale, which the calibration profile guarantees for text.
+__global__ void split_qkv_uneven_bf16_kernel(const __mt_bfloat16* packed,
+                                            __mt_bfloat16* q, __mt_bfloat16* k,
+                                            __mt_bfloat16* v, int rows,
+                                            int q_cols, int k_cols, int v_cols) {
+  const int total_cols = q_cols + k_cols + v_cols;
+  const int stride = blockDim.x * gridDim.x;
+  for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+    const int64_t input_base = static_cast<int64_t>(row) * total_cols;
+    const int64_t q_base = static_cast<int64_t>(row) * q_cols;
+    const int64_t k_base = static_cast<int64_t>(row) * k_cols;
+    const int64_t v_base = static_cast<int64_t>(row) * v_cols;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < total_cols;
+         col += stride) {
+      const __mt_bfloat16 value = packed[input_base + col];
+      if (col < q_cols) {
+        q[q_base + col] = value;
+      } else if (col < q_cols + k_cols) {
+        k[k_base + col - q_cols] = value;
+      } else {
+        v[v_base + col - q_cols - k_cols] = value;
+      }
+    }
+  }
+}
+
 // Gather complete rows through a prepared u32 index buffer.  Keeping rows on
 // grid.y avoids the CUDA reference's per-element division and remainder.
 __global__ void gather_rows_bf16_kernel(const __mt_bfloat16* input,
@@ -120,6 +150,36 @@ __global__ void add_bf16_kernel(const __mt_bfloat16* a,
   for (; index < count; index += stride) {
     output[index] = __float2bfloat16(__bfloat162float(a[index]) +
                                      __bfloat162float(b[index]));
+  }
+}
+
+// Eight BF16 per lane (16 B load + 16 B store), the same arithmetic and
+// single rounding as the scalar kernel above. The residual adds are all
+// `[41, 1536]` or wider, so the scalar form was sector-limited like the
+// concatenation kernels; the boundary case (`count % 8 != 0` or an unaligned
+// pointer) keeps the scalar launch.
+union __align__(16) AddPacked8 {
+  uint4 bits;
+  __mt_bfloat16 lanes[8];
+};
+
+__global__ void add_bf16_vector8_kernel(const __mt_bfloat16* a,
+                                        const __mt_bfloat16* b,
+                                        __mt_bfloat16* output, int64_t count) {
+  const int64_t lanes = count / 8;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t lane = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       lane < lanes; lane += stride) {
+    const int64_t index = lane * 8;
+    AddPacked8 left, right, result;
+    left.bits = *reinterpret_cast<const uint4*>(a + index);
+    right.bits = *reinterpret_cast<const uint4*>(b + index);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      result.lanes[i] = __float2bfloat16(__bfloat162float(left.lanes[i]) +
+                                         __bfloat162float(right.lanes[i]));
+    }
+    *reinterpret_cast<uint4*>(output + index) = result.bits;
   }
 }
 

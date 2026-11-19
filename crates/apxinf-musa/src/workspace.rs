@@ -1,9 +1,8 @@
 //! Persistent device arena and the prepare/run session a captured graph is
 //! recorded against.
 //!
-//! The arena is a port of `apxinf-cuda/src/workspace.rs`: 256-byte alignment,
-//! reused views that are **never cleared**, and FP8 emulation scratch for a
-//! path this port does not compile.
+//! The arena is a port of `apxinf-cuda/src/workspace.rs`: 256-byte alignment
+//! and reused views that are **never cleared**.
 //!
 //! The session is the contract `apxinf-cuda-new/src/workspace.rs` defines,
 //! because PI0.5's `model_runner` is written against it. `prepare` traverses
@@ -17,7 +16,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use apxinf_core::{DType, Error, Result};
+use apxinf_core::{Error, Result};
 
 use crate::buffer::MusaBuffer;
 use crate::context::MusaContext;
@@ -29,12 +28,6 @@ const WORKSPACE_ALIGNMENT: usize = 256;
 pub struct GraphWorkspace {
     storage: MusaBuffer,
     offset: Cell<usize>,
-    fp8_emulation: Option<Fp8EmulationWorkspace>,
-}
-
-struct Fp8EmulationWorkspace {
-    activation: MusaBuffer,
-    weight: MusaBuffer,
 }
 
 impl GraphWorkspace {
@@ -47,48 +40,7 @@ impl GraphWorkspace {
         Ok(Self {
             storage: MusaBuffer::alloc(capacity_bytes, device).map_err(musa_error)?,
             offset: Cell::new(0),
-            fp8_emulation: None,
         })
-    }
-
-    pub fn new_fp8(
-        capacity_bytes: usize,
-        max_activation_elements: usize,
-        max_weight_elements: usize,
-        device: usize,
-    ) -> Result<Self> {
-        let mut workspace = Self::new(capacity_bytes, device)?;
-        // MUSA native FP8 support on MP22 is **unverified**: the toolkit
-        // exposes the FP8 types and `mublasLt` the `..._INPUT_8F_E4M3`
-        // numerical flag, but whether M1000 executes them on tensor cores is
-        // not established here. The CUDA side decides this from compute
-        // capability; taking the conservative branch means an FP8 run on MUSA
-        // gets the emulation scratch it would need if there is no native path.
-        // FP8 is outside this port's scope, so nothing depends on the answer
-        // yet — but it must be measured before an FP8 port starts.
-        let native_fp8 = false;
-        if !native_fp8 {
-            if max_activation_elements == 0 || max_weight_elements == 0 {
-                return Err(Error::Other(
-                    "static inference FP8 emulation scratch capacities must be non-zero".into(),
-                ));
-            }
-            let activation_bytes = max_activation_elements
-                .checked_mul(DType::F16.size_in_bytes())
-                .ok_or_else(|| {
-                    Error::Other("static inference FP8 activation scratch overflow".into())
-                })?;
-            let weight_bytes = max_weight_elements
-                .checked_mul(DType::F16.size_in_bytes())
-                .ok_or_else(|| {
-                    Error::Other("static inference FP8 weight scratch overflow".into())
-                })?;
-            workspace.fp8_emulation = Some(Fp8EmulationWorkspace {
-                activation: MusaBuffer::alloc(activation_bytes, device).map_err(musa_error)?,
-                weight: MusaBuffer::alloc(weight_bytes, device).map_err(musa_error)?,
-            });
-        }
-        Ok(workspace)
     }
 
     pub fn capacity(&self) -> usize {
@@ -134,43 +86,6 @@ impl GraphWorkspace {
         }
         self.offset.set(end);
         self.storage.view(start, bytes).map_err(musa_error)
-    }
-
-    fn uses_fp8_emulation(&self) -> bool {
-        self.fp8_emulation.is_some()
-    }
-
-    fn fp8_emulation_buffers(
-        &self,
-        activation_bytes: usize,
-        weight_bytes: usize,
-        device: usize,
-    ) -> Result<(MusaBuffer, MusaBuffer)> {
-        let scratch = self.fp8_emulation.as_ref().ok_or_else(|| {
-            Error::Other(
-                "static inference FP8 emulation requires GraphWorkspace::new_fp8 before graph capture".into(),
-            )
-        })?;
-        if device != scratch.activation.device() {
-            return Err(Error::Other(format!(
-                "static inference FP8 emulation workspace is on MUSA {}, but operation targets MUSA {device}",
-                scratch.activation.device()
-            )));
-        }
-        if activation_bytes > scratch.activation.len() || weight_bytes > scratch.weight.len() {
-            return Err(Error::Other(format!(
-                "static inference FP8 emulation scratch exhausted: activation {activation_bytes}/{} bytes, weight {weight_bytes}/{} bytes",
-                scratch.activation.len(),
-                scratch.weight.len()
-            )));
-        }
-        Ok((
-            scratch
-                .activation
-                .view(0, activation_bytes)
-                .map_err(musa_error)?,
-            scratch.weight.view(0, weight_bytes).map_err(musa_error)?,
-        ))
     }
 }
 
@@ -493,53 +408,10 @@ pub(crate) fn output_buffer_zeroed(ctx: &MusaContext, bytes: usize) -> Result<Mu
     })
 }
 
-/// Whether FP8 must be emulated rather than executed natively.
-///
-/// Every FP8 operator in this crate reports `not_ported`, so nothing asks yet;
-/// this is what a ported one consults, next to the emulation buffers below.
-#[allow(dead_code)]
-pub(crate) fn fp8_emulation_required(ctx: &MusaContext) -> Result<bool> {
-    Ok(ACTIVE_SESSION.with(|active| {
-        let inner = active.get();
-        if inner.is_null() {
-            let _ = ctx;
-            // No native FP8 path is established on M1000; see `new_fp8`.
-            true
-        } else {
-            unsafe { &*inner }.workspace.uses_fp8_emulation()
-        }
-    }))
-}
-
-/// The FP8 emulation scratch bound to the active session.
-///
-/// Uncalled for the same reason as `fp8_emulation_required`; it is the pair
-/// that a ported FP8 operator needs together.
-#[allow(dead_code)]
-pub(crate) fn fp8_emulation_buffers(
-    _ctx: &MusaContext,
-    activation_bytes: usize,
-    weight_bytes: usize,
-    device: usize,
-) -> Result<(MusaBuffer, MusaBuffer)> {
-    ACTIVE_SESSION.with(|active| {
-        let inner = active.get();
-        if inner.is_null() {
-            return Err(Error::Other(
-                "static inference FP8 emulation requires an active FP8 session".into(),
-            ));
-        }
-        unsafe { &*inner }.workspace.fp8_emulation_buffers(
-            activation_bytes,
-            weight_bytes,
-            device,
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apxinf_core::DType;
 
     /// A refused nested traversal must not touch the arena the outer one is
     /// still allocating from.

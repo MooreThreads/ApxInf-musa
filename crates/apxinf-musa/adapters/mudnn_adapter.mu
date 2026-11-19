@@ -95,6 +95,45 @@ struct Matmul {
     check(operation.SetDeterministic(true));
   }
 };
+struct MatmulFp8 {
+  md::Tensor a, w, y;
+  md::MatMul operation;
+  Scratch scratch;
+  MatmulFp8(int m,int n,int k,musaStream_t stream) : scratch(stream) {
+    check(a.SetType(md::Tensor::Type::FP8_E4M3));
+    check(w.SetType(md::Tensor::Type::FP8_E4M3));
+    check(y.SetType(md::Tensor::Type::BFLOAT16));
+    check(a.SetNdInfo({m,k})); check(w.SetNdInfo({k,n})); check(y.SetNdInfo({m,n}));
+    check(operation.SetTranspose(false,false));
+    check(operation.SetComputeMode(md::MatMul::ComputeMode::TENSOR));
+    check(operation.SetBeta(0));
+    check(operation.SetDeterministic(true));
+  }
+};
+// FP8 GEMM with the muDNN bias epilogue:
+//   d = alpha * a * b + beta * residual + gamma * bias
+// `c` is the residual operand. The bias-only entry point points `c` at the
+// output and uses the inplace overload with beta = 0, so no zero buffer is
+// needed. `alpha` is the static-FP8 `activation_scale * weight_scale`; the
+// epilogue does bias and residual in f32 and rounds once to BF16.
+struct MatmulFp8Bias {
+  md::Tensor a, w, y, c, bias;
+  md::MatMul operation;
+  Scratch scratch;
+  MatmulFp8Bias(int m,int n,int k,musaStream_t stream) : scratch(stream) {
+    check(a.SetType(md::Tensor::Type::FP8_E4M3));
+    check(w.SetType(md::Tensor::Type::FP8_E4M3));
+    check(y.SetType(md::Tensor::Type::BFLOAT16));
+    check(c.SetType(md::Tensor::Type::BFLOAT16));
+    check(bias.SetType(md::Tensor::Type::BFLOAT16));
+    check(a.SetNdInfo({m,k})); check(w.SetNdInfo({k,n}));
+    check(y.SetNdInfo({m,n})); check(c.SetNdInfo({m,n}));
+    check(bias.SetNdInfo({n}));
+    check(operation.SetTranspose(false,false));
+    check(operation.SetComputeMode(md::MatMul::ComputeMode::TENSOR));
+    check(operation.SetDeterministic(true));
+  }
+};
 struct Flash {
   md::Tensor q,k,v,y,lse,mask,dropout;
   md::ScaledDotProductAttention operation;
@@ -173,6 +212,8 @@ struct GeneralFlash {
 struct Stream {
   md::Handle handle;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
+  std::map<std::tuple<int,int,int>,std::unique_ptr<MatmulFp8>> fp8_matmuls;
+  std::map<std::tuple<int,int,int>,std::unique_ptr<MatmulFp8Bias>> fp8_bias_matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
   std::map<std::tuple<int,int,int,int,int,int,bool,bool>,std::unique_ptr<GeneralFlash>> general_flashes;
   Stream(int device,musaStream_t stream) : handle(device) {
@@ -262,6 +303,116 @@ extern "C" int apxinf_musa_mudnn_bf16_gemm(const void* a,const void* w,void* y,
    return e.status;
  } catch(...) {
    record_failure(kStatusUnknown, "muDNN BF16 GEMM");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* a,const void* w,void* y,
+ int m,int n,int k,float alpha,musaStream_t stream) {
+ if(!a||!w||!y||m<=0||n<=0||k<=0||!std::isfinite(alpha)) {
+   record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream); auto key=std::make_tuple(m,n,k); auto it=s.fp8_matmuls.find(key);
+  if(it==s.fp8_matmuls.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress, "muDNN FP8 GEMM");
+      return kStatusCaptureInProgress;
+    }
+    it=s.fp8_matmuls.emplace(key,std::make_unique<MatmulFp8>(m,n,k,stream)).first;
+  }
+  auto& p=*it->second; check(p.a.SetAddr(const_cast<void*>(a)));
+  check(p.w.SetAddr(const_cast<void*>(w))); check(p.y.SetAddr(y));
+  check(p.operation.SetAlpha(static_cast<double>(alpha)));
+  p.scratch.cursor=0;
+  const int status = int(p.operation.Run(s.handle,p.y,p.a,p.w,[&](size_t n){return p.scratch.get(n);}));
+  if (status != 0) record_failure(status, "muDNN FP8 GEMM");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status, "muDNN FP8 GEMM");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown, "muDNN FP8 GEMM");
+   return kStatusUnknown;
+ }
+}
+
+// d = alpha * a * b + residual + bias in one muDNN call. The residual path
+// uses the outplace overload (c is a separate BF16 [m,n]); the bias-only path
+// points c at the output and uses the inplace overload with beta = 0.
+extern "C" int apxinf_musa_mudnn_fp8_gemm_bias_residual(const void* a,const void* w,void* y,
+ const void* bias,const void* residual,int m,int n,int k,float alpha,musaStream_t stream) {
+ if(!a||!w||!y||!bias||!residual||m<=0||n<=0||k<=0||!std::isfinite(alpha)) {
+   record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM bias+residual");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream); auto key=std::make_tuple(m,n,k); auto it=s.fp8_bias_matmuls.find(key);
+  if(it==s.fp8_bias_matmuls.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress, "muDNN FP8 GEMM bias+residual");
+      return kStatusCaptureInProgress;
+    }
+    it=s.fp8_bias_matmuls.emplace(key,std::make_unique<MatmulFp8Bias>(m,n,k,stream)).first;
+  }
+  auto& p=*it->second;
+  check(p.a.SetAddr(const_cast<void*>(a)));
+  check(p.w.SetAddr(const_cast<void*>(w)));
+  check(p.y.SetAddr(y));
+  check(p.c.SetAddr(const_cast<void*>(residual)));
+  check(p.bias.SetAddr(const_cast<void*>(bias)));
+  check(p.operation.SetAlpha(static_cast<double>(alpha)));
+  check(p.operation.SetBeta(1.0));
+  check(p.operation.SetGamma(1.0));
+  p.scratch.cursor=0;
+  const int status = int(p.operation.RunWithBiasAdd(
+      s.handle,p.y,p.a,p.w,p.c,p.bias,[&](size_t n){return p.scratch.get(n);}));
+  if (status != 0) record_failure(status, "muDNN FP8 GEMM bias+residual");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status, "muDNN FP8 GEMM bias+residual");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown, "muDNN FP8 GEMM bias+residual");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_fp8_gemm_bias(const void* a,const void* w,void* y,
+ const void* bias,int m,int n,int k,float alpha,musaStream_t stream) {
+ if(!a||!w||!y||!bias||m<=0||n<=0||k<=0||!std::isfinite(alpha)) {
+   record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM bias");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream); auto key=std::make_tuple(m,n,k); auto it=s.fp8_bias_matmuls.find(key);
+  if(it==s.fp8_bias_matmuls.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress, "muDNN FP8 GEMM bias");
+      return kStatusCaptureInProgress;
+    }
+    it=s.fp8_bias_matmuls.emplace(key,std::make_unique<MatmulFp8Bias>(m,n,k,stream)).first;
+  }
+  auto& p=*it->second;
+  check(p.a.SetAddr(const_cast<void*>(a)));
+  check(p.w.SetAddr(const_cast<void*>(w)));
+  check(p.y.SetAddr(y));
+  check(p.c.SetAddr(y));
+  check(p.bias.SetAddr(const_cast<void*>(bias)));
+  check(p.operation.SetAlpha(static_cast<double>(alpha)));
+  check(p.operation.SetBeta(0.0));
+  check(p.operation.SetGamma(1.0));
+  p.scratch.cursor=0;
+  const int status = int(p.operation.RunWithBiasAdd(
+      s.handle,p.c,p.a,p.w,p.bias,[&](size_t n){return p.scratch.get(n);}));
+  if (status != 0) record_failure(status, "muDNN FP8 GEMM bias");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status, "muDNN FP8 GEMM bias");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown, "muDNN FP8 GEMM bias");
    return kStatusUnknown;
  }
 }

@@ -15,6 +15,7 @@ Installing the MUSA driver and SDK on an M1000 is covered by Moore Threads'
 | Typed-operator facade (`ops`) | in place |
 | PI0.5 BF16 port | in place (`crates/apxinf-model/src/musa_pi05/`) |
 | PI0.5 INT8 (W8A8) routes | in place: `int8_dynamic` and `int8_dynamic_no_encode`, fused GeGLU quantization, NN/NT decode images |
+| PI0.5 FP8 (static E4M3) route | in place on mp_31: muDNN FP8 MatMul, calibration and `uniform:<scale>` bring-up; mp_22 reports the gap |
 | Fixed-shape preparation and capture | in place: per-stream vendor handles, same-stream warm-up, per-session shape coverage |
 
 This file is the status summary. The architecture, the relationship to the
@@ -33,8 +34,9 @@ build produced and round-trips a buffer through the device.
 
 ## Where the numbers in these files come from
 
-Kernel comments cite measurements taken on an M1000 with probe programs that are
-not part of this repository. They state the shape, the device and the result,
+Kernel comments cite measurements taken on the device the comment names — an
+M1000, or an MTT S5000 for the FP8 route — with probe programs that are not
+part of this repository. They state the shape, the device and the result,
 and they stop there: a comment never carries a path to the probe. The working
 directory `devlocal/` is ignored by Git, so a path into it dangles for every
 other checkout and cannot be checked by reading the tree. A check that has to

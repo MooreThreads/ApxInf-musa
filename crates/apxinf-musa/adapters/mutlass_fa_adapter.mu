@@ -26,7 +26,7 @@
 //
 // The scale is `1/sqrt(256)`. It is not a parameter: the vendored
 // instantiation's tile shape and head dimension are compile-time constants, and
-// 256 is the only head dimension these two kernels have.
+// 256 is the only head dimension these kernels have.
 //
 // Threading and lifetime
 // ----------------------
@@ -80,9 +80,9 @@ using Launcher = const char* (*)(const void* q, const void* k, const void* v, vo
 
 // ── Variants ────────────────────────────────────────────────────────────────
 //
-// The two vendored instantiations and their names in one table, indexed by the
-// caller's `variant` argument. Which kernel to run and what to call it in an
-// error are the same fact, and a third variant that had to update two switches
+// The three vendored instantiations and their names in one table, indexed by
+// the caller's `variant` argument. Which kernel to run and what to call it in
+// an error are the same fact, and a variant that had to update two switches
 // would be one edit away from being wrong in a way nothing would catch.
 //
 // Indexing is unchecked: `apxinf_musa_mutlass_fa_d256` rejects an out-of-range
@@ -91,7 +91,9 @@ using Launcher = const char* (*)(const void* q, const void* k, const void* v, vo
 enum Variant {
   kPackedDecodeTile128 = 0,
   kGeneralTile192 = 1,
-  kVariantCount = 2,
+  /// `TileM=16`, `IsPackGQA=false`: one block per query head.
+  kUnpackedDecodeTile16 = 2,
+  kVariantCount = 3,
 };
 
 struct VariantInfo {
@@ -102,6 +104,7 @@ struct VariantInfo {
 const VariantInfo kVariants[kVariantCount] = {
     {"packed-decode-tile128", apxinf_musa_mp31_fmha_fwd_tile128_packed},
     {"general-tile192", apxinf_musa_mp31_fmha_fwd_tile192_general},
+    {"unpacked-decode-tile16", apxinf_musa_mp31_fmha_fwd_tile16_unpacked},
 };
 
 using apxinf_adapters::capturing;
@@ -214,7 +217,7 @@ extern "C" const char* apxinf_musa_mutlass_fa_d256_last_error(void) { return err
 //
 // Returns 0 on success. On failure it returns non-zero and
 // `apxinf_musa_mutlass_fa_d256_last_error()` names the reason. Nothing here
-// falls back to another variant: the two instantiations tile the same
+// falls back to another variant: the instantiations tile the same
 // arithmetic differently, and a caller that asked for one and silently got the
 // other would be measuring a kernel it did not choose.
 extern "C" int apxinf_musa_mutlass_fa_d256(const void* q, const void* k, const void* v, void* out,
@@ -250,6 +253,295 @@ extern "C" int apxinf_musa_mutlass_fa_d256(const void* q, const void* k, const v
                                 key_tokens, stream);
   if (failure != nullptr) {
     set_error("the %s D256 attention failed: %s", kVariants[variant].name, failure);
+    return -1;
+  }
+  return 0;
+}
+
+// ── GR00T DiT D48 E4M3 ─────────────────────────────────────────────────────
+//
+// GR00T's DiT attention is q=41, 32 heads, D=48 (tile 64), non-causal. The
+// epilogue folds the o-projection's activation scale into the E4M3 conversion,
+// so this entry replaces both the muDNN SDPA call and the separate post-
+// attention quantize. The LSE buffer is `[32, tokens]` f32; the two
+// `cu_seqlens` arrays are one segment each.
+namespace {
+
+constexpr int kGr00tHeads = 32;
+
+struct Gr00tMetadata {
+  int device_id = -1;
+  int32_t tokens = 0;
+  int32_t key_tokens = 0;
+  uint32_t* cu_seqlens = nullptr;  // [4] = {0, tokens, 0, key_tokens}
+  float* lse = nullptr;            // [kGr00tHeads * tokens] f32
+};
+
+thread_local std::vector<Gr00tMetadata> g_gr00t_metadata;
+
+bool ensure_gr00t_metadata(int32_t tokens, int32_t key_tokens, int device_id, void* stream,
+                           const uint32_t** out_cu_seqlens, float** out_lse) {
+  for (const Gr00tMetadata& entry : g_gr00t_metadata) {
+    if (entry.device_id == device_id && entry.tokens == tokens &&
+        entry.key_tokens == key_tokens) {
+      *out_cu_seqlens = entry.cu_seqlens;
+      *out_lse = entry.lse;
+      return true;
+    }
+  }
+
+  // Same capture contract as the D256 table: the pointers are baked into the
+  // graph, so every shape must have been seen once on the warmup traversal.
+  if (capturing(stream)) {
+    set_error(
+        "the GR00T D48 attention metadata for %d x %d was first needed during graph "
+        "capture; a captured graph bakes the pointers it recorded",
+        tokens, key_tokens);
+    return false;
+  }
+  if (!apxinf_adapters::select_device(device_id)) {
+    set_error(
+        "the GR00T D48 attention metadata for %d x %d cannot be allocated: MUSA %d could "
+        "not be selected",
+        tokens, key_tokens, device_id);
+    return false;
+  }
+
+  const size_t lse_count = size_t(kGr00tHeads) * size_t(tokens);
+  Gr00tMetadata entry;
+  entry.device_id = device_id;
+  entry.tokens = tokens;
+  entry.key_tokens = key_tokens;
+  if (musaMalloc(reinterpret_cast<void**>(&entry.cu_seqlens), 4 * sizeof(uint32_t)) !=
+      musaSuccess) {
+    set_error("musaMalloc failed for the GR00T D48 attention metadata");
+    return false;
+  }
+  if (musaMalloc(reinterpret_cast<void**>(&entry.lse), lse_count * sizeof(float)) !=
+      musaSuccess) {
+    musaFree(entry.cu_seqlens);
+    set_error("musaMalloc failed for the GR00T D48 attention's %zu element LSE buffer",
+              lse_count);
+    return false;
+  }
+  const uint32_t host[4] = {0, static_cast<uint32_t>(tokens), 0,
+                            static_cast<uint32_t>(key_tokens)};
+  if (musaMemcpy(entry.cu_seqlens, host, sizeof(host), musaMemcpyHostToDevice) != musaSuccess) {
+    musaFree(entry.cu_seqlens);
+    musaFree(entry.lse);
+    set_error("musaMemcpy failed for the GR00T D48 attention metadata");
+    return false;
+  }
+  g_gr00t_metadata.push_back(entry);
+  *out_cu_seqlens = entry.cu_seqlens;
+  *out_lse = entry.lse;
+  return true;
+}
+
+}  // namespace
+
+extern "C" const char* apxinf_musa_mutlass_fa_gr00t_d48_last_error(void) {
+  return error_buffer();
+}
+
+extern "C" int apxinf_musa_mutlass_fa_gr00t_d48_e4m3(
+    const void* q, const void* k, const void* v, void* out, int32_t tokens,
+    int32_t key_tokens, float output_scale, void* stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || out == nullptr) {
+    set_error("the GR00T D48 attention operands must not be null");
+    return -1;
+  }
+  if (tokens <= 0 || key_tokens <= 0) {
+    set_error(
+        "the GR00T D48 attention shapes must be positive, got tokens %d key_tokens %d",
+        tokens, key_tokens);
+    return -1;
+  }
+  if (!std::isfinite(output_scale) || output_scale <= 0.0f) {
+    set_error(
+        "the GR00T D48 attention output scale must be finite and positive, got %g",
+        output_scale);
+    return -1;
+  }
+
+  const int device_id = apxinf_adapters::stream_device(stream);
+  const uint32_t* cu_seqlens = nullptr;
+  float* lse = nullptr;
+  if (!ensure_gr00t_metadata(tokens, key_tokens, device_id, stream, &cu_seqlens, &lse)) {
+    return -1;
+  }
+
+  const char* failure = apxinf_musa_mp31_fmha_fwd_dit_e4m3(
+      q, k, v, out, lse, cu_seqlens, cu_seqlens + 2, tokens, key_tokens, output_scale,
+      stream);
+  if (failure != nullptr) {
+    set_error("the GR00T D48 attention failed: %s", failure);
+    return -1;
+  }
+  return 0;
+}
+
+// The packed-QKV sibling: `q`, `k` and `v` point at columns 0/1536/3072 of one
+// 4608-wide BF16 row, and the kernel's row stride is 3*heads*head_dim. The
+// metadata/LSE cache is the one above, keyed by `(tokens, key_tokens)`.
+extern "C" int apxinf_musa_mutlass_fa_gr00t_d48_e4m3_packed(
+    const void* q, const void* k, const void* v, void* out, int32_t tokens,
+    int32_t key_tokens, float output_scale, void* stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || out == nullptr) {
+    set_error("the GR00T D48 packed attention operands must not be null");
+    return -1;
+  }
+  if (tokens <= 0 || key_tokens <= 0) {
+    set_error(
+        "the GR00T D48 packed attention shapes must be positive, got tokens %d key_tokens %d",
+        tokens, key_tokens);
+    return -1;
+  }
+  if (!std::isfinite(output_scale) || output_scale <= 0.0f) {
+    set_error(
+        "the GR00T D48 packed attention output scale must be finite and positive, got %g",
+        output_scale);
+    return -1;
+  }
+
+  const int device_id = apxinf_adapters::stream_device(stream);
+  const uint32_t* cu_seqlens = nullptr;
+  float* lse = nullptr;
+  if (!ensure_gr00t_metadata(tokens, key_tokens, device_id, stream, &cu_seqlens, &lse)) {
+    return -1;
+  }
+
+  const char* failure = apxinf_musa_mp31_fmha_fwd_dit_e4m3_packed(
+      q, k, v, out, lse, cu_seqlens, cu_seqlens + 2, tokens, key_tokens, output_scale,
+      stream);
+  if (failure != nullptr) {
+    set_error("the GR00T D48 packed attention failed: %s", failure);
+    return -1;
+  }
+  return 0;
+}
+
+// ── GR00T vision D64 E4M3 ──────────────────────────────────────────────────
+//
+// Vision attention is batch=2 x 256 tokens, 16 heads, D=64, non-causal. The
+// E4M3 output folds the vision output projection's activation scale in, so the
+// projection's FP8 GEMM consumes it directly. The two `cu_seqlens` arrays have
+// `batch + 1 = 3` entries each; the LSE buffer is `[16, tokens]` f32.
+namespace {
+
+constexpr int kGr00tVisionHeads = 16;
+
+struct Gr00tVisionMetadata {
+  int device_id = -1;
+  int32_t tokens = 0;
+  int32_t key_tokens = 0;
+  uint32_t* cu_seqlens = nullptr;  // [6] = {0, t/2, t, 0, k/2, k}
+  float* lse = nullptr;            // [kGr00tVisionHeads * tokens] f32
+};
+
+thread_local std::vector<Gr00tVisionMetadata> g_gr00t_vision_metadata;
+
+bool ensure_gr00t_vision_metadata(int32_t tokens, int32_t key_tokens, int device_id,
+                                  void* stream, const uint32_t** out_cu_q,
+                                  const uint32_t** out_cu_k, float** out_lse) {
+  for (const Gr00tVisionMetadata& entry : g_gr00t_vision_metadata) {
+    if (entry.device_id == device_id && entry.tokens == tokens &&
+        entry.key_tokens == key_tokens) {
+      *out_cu_q = entry.cu_seqlens;
+      *out_cu_k = entry.cu_seqlens + 3;
+      *out_lse = entry.lse;
+      return true;
+    }
+  }
+
+  if (capturing(stream)) {
+    set_error(
+        "the GR00T vision attention metadata for %d x %d was first needed during graph "
+        "capture; a captured graph bakes the pointers it recorded",
+        tokens, key_tokens);
+    return false;
+  }
+  if (!apxinf_adapters::select_device(device_id)) {
+    set_error(
+        "the GR00T vision attention metadata for %d x %d cannot be allocated: MUSA %d could "
+        "not be selected",
+        tokens, key_tokens, device_id);
+    return false;
+  }
+
+  const size_t lse_count = size_t(kGr00tVisionHeads) * size_t(tokens);
+  Gr00tVisionMetadata entry;
+  entry.device_id = device_id;
+  entry.tokens = tokens;
+  entry.key_tokens = key_tokens;
+  if (musaMalloc(reinterpret_cast<void**>(&entry.cu_seqlens), 6 * sizeof(uint32_t)) !=
+      musaSuccess) {
+    set_error("musaMalloc failed for the GR00T vision attention metadata");
+    return false;
+  }
+  if (musaMalloc(reinterpret_cast<void**>(&entry.lse), lse_count * sizeof(float)) !=
+      musaSuccess) {
+    musaFree(entry.cu_seqlens);
+    set_error("musaMalloc failed for the GR00T vision attention's %zu element LSE buffer",
+              lse_count);
+    return false;
+  }
+  // Two segments of tokens/2 rows: the two camera views. Q and K get their own
+  // three-entry arrays because the kernel reads them as separate pointers.
+  const uint32_t host[6] = {0,
+                            static_cast<uint32_t>(tokens / 2),
+                            static_cast<uint32_t>(tokens),
+                            0,
+                            static_cast<uint32_t>(key_tokens / 2),
+                            static_cast<uint32_t>(key_tokens)};
+  if (musaMemcpy(entry.cu_seqlens, host, sizeof(host), musaMemcpyHostToDevice) != musaSuccess) {
+    musaFree(entry.cu_seqlens);
+    musaFree(entry.lse);
+    set_error("musaMemcpy failed for the GR00T vision attention metadata");
+    return false;
+  }
+  g_gr00t_vision_metadata.push_back(entry);
+  *out_cu_q = entry.cu_seqlens;
+  *out_cu_k = entry.cu_seqlens + 3;
+  *out_lse = entry.lse;
+  return true;
+}
+
+}  // namespace
+
+extern "C" int apxinf_musa_mutlass_fa_gr00t_vision_d64_e4m3(
+    const void* q, const void* k, const void* v, void* out, int32_t tokens,
+    int32_t key_tokens, float output_scale, void* stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || out == nullptr) {
+    set_error("the GR00T vision attention operands must not be null");
+    return -1;
+  }
+  if (tokens <= 0 || key_tokens <= 0 || (tokens % 2) != 0 || (key_tokens % 2) != 0) {
+    set_error(
+        "the GR00T vision attention expects even token counts, got %d and %d", tokens,
+        key_tokens);
+    return -1;
+  }
+  if (!std::isfinite(output_scale) || output_scale <= 0.0f) {
+    set_error(
+        "the GR00T vision attention output scale must be finite and positive, got %g",
+        output_scale);
+    return -1;
+  }
+
+  const int device_id = apxinf_adapters::stream_device(stream);
+  const uint32_t* cu_q = nullptr;
+  const uint32_t* cu_k = nullptr;
+  float* lse = nullptr;
+  if (!ensure_gr00t_vision_metadata(tokens, key_tokens, device_id, stream, &cu_q, &cu_k,
+                                    &lse)) {
+    return -1;
+  }
+
+  const char* failure = apxinf_musa_mp31_fmha_fwd_vision_e4m3(
+      q, k, v, out, lse, cu_q, cu_k, tokens, key_tokens, output_scale, stream);
+  if (failure != nullptr) {
+    set_error("the GR00T vision attention failed: %s", failure);
     return -1;
   }
   return 0;

@@ -24,10 +24,12 @@
 // it; `MusaAllocation`'s two `musaFree` sites are the only ones, and both clear.
 
 #include <musa_runtime.h>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
+#include <musa_fp8.h>
 
 #include <cstdint>
 #include <map>
@@ -200,6 +202,33 @@ extern "C" musaError_t apxinf_musa_silu_mul_bf16(
   return musaGetLastError();
 }
 
+// Fused `silu(gate) * up` with the same BF16 product rounding followed by the
+// fixed per-tensor E4M3 conversion, in one launch. Byte-identical to
+// `silu_mul_bf16` then `quantize_bf16_e4m3` by construction.
+extern "C" musaError_t apxinf_musa_silu_mul_bf16_e4m3(
+    const void* gate, const void* up, void* output, int64_t count,
+    float inverse_scale, musaStream_t stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr || count <= 0 ||
+      !std::isfinite(inverse_scale) || inverse_scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  const bool vectorized = (count % 8 == 0) && aligned_to(gate, 16) &&
+                          aligned_to(up, 16) && aligned_to(output, 8);
+  if (vectorized) {
+    silu_mul_bf16_e4m3_vec8_kernel<<<elementwise_grid(count / 8), kThreads, 0,
+                                     stream>>>(
+        static_cast<const __mt_bfloat16*>(gate),
+        static_cast<const __mt_bfloat16*>(up), static_cast<uint8_t*>(output),
+        count, inverse_scale);
+  } else {
+    silu_mul_bf16_e4m3_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(gate),
+        static_cast<const __mt_bfloat16*>(up), static_cast<uint8_t*>(output),
+        count, inverse_scale);
+  }
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_silu_bf16(
     const void* input, void* output, int64_t count, musaStream_t stream) {
   if (input == nullptr || output == nullptr || count <= 0) {
@@ -209,6 +238,58 @@ extern "C" musaError_t apxinf_musa_silu_bf16(
       static_cast<const __mt_bfloat16*>(input),
       static_cast<__mt_bfloat16*>(output), count);
   return musaGetLastError();
+}
+
+// Static-E4M3 output for the bias + activation epilogue. Only the eight-lane
+// vector form carries a fused store; any other width returns
+// `musaErrorInvalidValue` and the caller composes.
+extern "C" musaError_t apxinf_musa_bias_activation_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    int activation, float inverse_scale, musaStream_t stream) {
+  if (input == nullptr || output == nullptr || rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if (activation != 0 && activation != 1 && activation != 2) {
+    return musaErrorInvalidValue;
+  }
+  if (cols % 8 == 0 && aligned_to(input, 16) && aligned_to(output, 8) &&
+      (bias == nullptr || aligned_to(bias, 16))) {
+    const dim3 grid = row_grid(rows, cols / 8);
+    const auto* wide_in = static_cast<const __mt_bfloat16*>(input);
+    const auto* wide_bias = static_cast<const __mt_bfloat16*>(bias);
+    auto* wide_out = static_cast<uint8_t*>(output);
+    if (bias == nullptr) {
+      if (activation == 0) {
+        bias_activation_bf16_e4m3_vector8_kernel<0, false>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      } else if (activation == 1) {
+        bias_activation_bf16_e4m3_vector8_kernel<1, false>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      } else {
+        bias_activation_bf16_e4m3_vector8_kernel<2, false>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      }
+    } else {
+      if (activation == 0) {
+        bias_activation_bf16_e4m3_vector8_kernel<0, true>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      } else if (activation == 1) {
+        bias_activation_bf16_e4m3_vector8_kernel<1, true>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      } else {
+        bias_activation_bf16_e4m3_vector8_kernel<2, true>
+            <<<grid, kThreads, 0, stream>>>(wide_in, wide_bias, wide_out, rows,
+                                            cols, inverse_scale);
+      }
+    }
+    return musaGetLastError();
+  }
+  return musaErrorInvalidValue;
 }
 
 // One block per row. `blockDim.x` must be a multiple of 32 (the reduction's
@@ -248,6 +329,44 @@ extern "C" musaError_t apxinf_musa_ada_gate_residual_rms_norm_bf16(
       static_cast<const __mt_bfloat16*>(norm_style),
       static_cast<__mt_bfloat16*>(hidden),
       static_cast<__mt_bfloat16*>(normalized), rows, cols, eps);
+  return musaGetLastError();
+}
+
+// The same operator with the static-E4M3 quantizer in its second pass. The
+// launch policy mirrors the BF16 entry exactly; only the normalized tensor's
+// type and the extra `inverse_scale` differ, and the arithmetic up to the
+// second pass's BF16 rounding is the sibling's.
+extern "C" musaError_t apxinf_musa_ada_gate_residual_rms_norm_bf16_e4m3(
+    const void* projection, const void* residual, const void* gate_style,
+    const void* norm_style, void* hidden, void* normalized, int rows, int cols,
+    float eps, float inverse_scale, musaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || gate_style == nullptr ||
+      norm_style == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols <= 0 || !std::isfinite(inverse_scale) ||
+      inverse_scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  if (cols == kThreads * 4 && aligned_to(projection, 8) &&
+      aligned_to(residual, 8) && aligned_to(gate_style, 8) &&
+      aligned_to(norm_style, 8) && aligned_to(hidden, 8) &&
+      aligned_to(normalized, 8)) {
+    ada_gate_residual_rms_norm_bf16_e4m3_vector_kernel<4>
+        <<<rows, kThreads, 0, stream>>>(
+            static_cast<const __mt_bfloat16*>(projection),
+            static_cast<const __mt_bfloat16*>(residual),
+            static_cast<const __mt_bfloat16*>(gate_style),
+            static_cast<const __mt_bfloat16*>(norm_style),
+            static_cast<__mt_bfloat16*>(hidden),
+            static_cast<uint8_t*>(normalized), rows, cols, eps, inverse_scale);
+    return musaGetLastError();
+  }
+  ada_gate_residual_rms_norm_bf16_e4m3_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(projection),
+      static_cast<const __mt_bfloat16*>(residual),
+      static_cast<const __mt_bfloat16*>(gate_style),
+      static_cast<const __mt_bfloat16*>(norm_style),
+      static_cast<__mt_bfloat16*>(hidden),
+      static_cast<uint8_t*>(normalized), rows, cols, eps, inverse_scale);
   return musaGetLastError();
 }
 
@@ -298,6 +417,35 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16_scalar(
   return musaGetLastError();
 }
 
+// The same operator with a static-E4M3 output. Only the register-cached vector
+// forms carry a fused store; any other width returns `musaErrorInvalidValue`
+// and the caller composes `rms_norm` + `quantize_fixed_e4m3` instead.
+extern "C" musaError_t apxinf_musa_rms_norm_bf16_e4m3(
+    const void* input, const void* weight, void* output, int rows, int cols,
+    float eps, float inverse_scale, musaStream_t stream) {
+  if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  const auto* in = static_cast<const __mt_bfloat16*>(input);
+  const auto* w = static_cast<const __mt_bfloat16*>(weight);
+  auto* out = static_cast<uint8_t*>(output);
+  if (cols == kThreads * 8 && aligned_to(input, 16) &&
+      aligned_to(weight, 16) && aligned_to(output, 8)) {
+    rms_norm_bf16_e4m3_block2_kernel<<<(rows + 1) / 2, 2 * kThreads, 0,
+                                       stream>>>(in, w, out, rows, cols, eps,
+                                                 inverse_scale);
+    return musaGetLastError();
+  }
+  if (cols == kThreads * 4 && aligned_to(input, 8) && aligned_to(weight, 8) &&
+      aligned_to(output, 8)) {
+    rms_norm_bf16_e4m3_vector_kernel<4, 4><<<rows, kThreads, 0, stream>>>(
+        in, w, out, rows, cols, eps, inverse_scale);
+    return musaGetLastError();
+  }
+  return musaErrorInvalidValue;
+}
+
 extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
     const void* input, const void* style, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
@@ -323,6 +471,27 @@ extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
       static_cast<const __mt_bfloat16*>(style),
       static_cast<__mt_bfloat16*>(output), rows, cols, eps);
   return musaGetLastError();
+}
+
+// Static-E4M3 output for the adaLN RMSNorm. Only the register-cached vector
+// form carries a fused store; any other width returns `musaErrorInvalidValue`
+// and the caller composes.
+extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16_e4m3(
+    const void* input, const void* style, void* output, int rows, int cols,
+    float eps, float inverse_scale, musaStream_t stream) {
+  if (input == nullptr || style == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if (cols == kThreads * 4 && aligned_to(input, 8) && aligned_to(style, 8) &&
+      aligned_to(output, 8)) {
+    ada_rms_norm_bf16_e4m3_vector_kernel<4><<<rows, kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(input),
+        static_cast<const __mt_bfloat16*>(style),
+        static_cast<uint8_t*>(output), rows, cols, eps, inverse_scale);
+    return musaGetLastError();
+  }
+  return musaErrorInvalidValue;
 }
 
 // ── Fused bias + residual ────────────────────────────────────────────────
@@ -470,6 +639,46 @@ extern "C" musaError_t apxinf_musa_bias_residual_rms_norm_bf16(
   return musaGetLastError();
 }
 
+// Static-E4M3 output for the bias + residual + RMSNorm. Only the
+// register-cached eight-lane form carries a fused store; any other width
+// returns `musaErrorInvalidValue` and the caller composes.
+extern "C" musaError_t apxinf_musa_bias_residual_rms_norm_bf16_e4m3(
+    const void* projection, const void* bias, const void* residual,
+    const void* weight, void* hidden, void* normalized, int rows, int cols,
+    float eps, float inverse_scale, musaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || weight == nullptr ||
+      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if (cols == kThreads * 8 && aligned_to(projection, 16) &&
+      aligned_to(residual, 16) && aligned_to(weight, 16) &&
+      aligned_to(hidden, 16) && aligned_to(normalized, 8) &&
+      (bias == nullptr || aligned_to(bias, 16))) {
+    if (bias == nullptr) {
+      bias_residual_rms_norm_bf16_e4m3_block2_kernel<false>
+          <<<(rows + 1) / 2, 2 * kThreads, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection), nullptr,
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<uint8_t*>(normalized), rows, cols, eps,
+              inverse_scale);
+    } else {
+      bias_residual_rms_norm_bf16_e4m3_block2_kernel<true>
+          <<<(rows + 1) / 2, 2 * kThreads, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<uint8_t*>(normalized), rows, cols, eps,
+              inverse_scale);
+    }
+    return musaGetLastError();
+  }
+  return musaErrorInvalidValue;
+}
+
 // ── Elementwise ──────────────────────────────────────────────────────────
 
 extern "C" musaError_t apxinf_musa_concat_rows_bf16(
@@ -520,6 +729,22 @@ extern "C" musaError_t apxinf_musa_concat_columns_bf16(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_split_qkv_uneven_bf16(
+    const void* packed, void* q, void* k, void* v, int rows, int q_cols,
+    int k_cols, int v_cols, musaStream_t stream) {
+  if (packed == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+      rows <= 0 || q_cols <= 0 || k_cols <= 0 || v_cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  const int total_cols = q_cols + k_cols + v_cols;
+  split_qkv_uneven_bf16_kernel<<<row_grid(rows, total_cols), kThreads, 0,
+                                 stream>>>(
+      static_cast<const __mt_bfloat16*>(packed), static_cast<__mt_bfloat16*>(q),
+      static_cast<__mt_bfloat16*>(k), static_cast<__mt_bfloat16*>(v), rows,
+      q_cols, k_cols, v_cols);
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_gather_rows_bf16(
     const void* input, const void* indices, void* output, int rows, int cols,
     musaStream_t stream) {
@@ -538,6 +763,14 @@ extern "C" musaError_t apxinf_musa_add_bf16(
     musaStream_t stream) {
   if (a == nullptr || b == nullptr || output == nullptr || count <= 0) {
     return musaErrorInvalidValue;
+  }
+  if (count % 8 == 0 && aligned_to(a, 16) && aligned_to(b, 16) &&
+      aligned_to(output, 16)) {
+    add_bf16_vector8_kernel<<<elementwise_grid(count / 8), kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(a),
+        static_cast<const __mt_bfloat16*>(b),
+        static_cast<__mt_bfloat16*>(output), count);
+    return musaGetLastError();
   }
   add_bf16_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
       static_cast<const __mt_bfloat16*>(a),
@@ -848,6 +1081,148 @@ extern "C" musaError_t apxinf_musa_adaptive_layer_norm_bf16(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_adaptive_layer_norm_bf16_e4m3_dual(
+    const void* input, const void* modulation, void* normalized,
+    void* quantized, int rows, int cols, float eps, float inverse_scale,
+    musaStream_t stream) {
+  if (input == nullptr || modulation == nullptr || normalized == nullptr ||
+      quantized == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return musaErrorInvalidValue;
+  }
+  if (aligned_to(input, 8) && aligned_to(modulation, 8) &&
+      aligned_to(normalized, 8) && aligned_to(quantized, 8)) {
+    if (cols == 1024) {
+      adaptive_layer_norm_bf16_e4m3_dual_block_t_kernel<128, 2>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(modulation),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 1536) {
+      adaptive_layer_norm_bf16_e4m3_dual_block_t_kernel<384, 1>
+          <<<rows, 384, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(modulation),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 2048) {
+      adaptive_layer_norm_bf16_e4m3_dual_block_t_kernel<128, 4>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(modulation),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+  }
+  adaptive_layer_norm_bf16_e4m3_dual_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(modulation),
+      static_cast<__mt_bfloat16*>(normalized), static_cast<uint8_t*>(quantized),
+      rows, cols, eps, inverse_scale);
+  return musaGetLastError();
+}
+
+// Static-E4M3 output for the LayerNorm. Only the barrier-free warp-per-row
+// form carries a fused store; any other width returns `musaErrorInvalidValue`
+// and the caller composes.
+extern "C" musaError_t apxinf_musa_layer_norm_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float inverse_scale, musaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if (cols == 32 * 4 * 9 && aligned_to(input, 8) && aligned_to(weight, 8) &&
+      aligned_to(bias, 8) && aligned_to(output, 8)) {
+    layer_norm_bf16_e4m3_block_kernel<<<rows, 96, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(input),
+        static_cast<const __mt_bfloat16*>(weight),
+        static_cast<const __mt_bfloat16*>(bias),
+        static_cast<uint8_t*>(output), cols, eps, inverse_scale);
+    return musaGetLastError();
+  }
+  if (aligned_to(input, 8) && aligned_to(weight, 8) && aligned_to(bias, 8) &&
+      aligned_to(output, 8)) {
+    if (cols == 1024) {
+      layer_norm_bf16_e4m3_block_t_kernel<128, 2><<<rows, 128, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(bias),
+          static_cast<uint8_t*>(output), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 1536) {
+      layer_norm_bf16_e4m3_block_t_kernel<128, 3><<<rows, 128, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(bias),
+          static_cast<uint8_t*>(output), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 2048) {
+      layer_norm_bf16_e4m3_block_t_kernel<128, 4><<<rows, 128, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(input),
+          static_cast<const __mt_bfloat16*>(weight),
+          static_cast<const __mt_bfloat16*>(bias),
+          static_cast<uint8_t*>(output), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+  }
+  return musaErrorInvalidValue;
+}
+
+// Dual-output LayerNorm: BF16 normalized and static E4M3 in one pass. Serves
+// the widths the templated kernel covers; any other width returns
+// `musaErrorInvalidValue` and the caller composes.
+extern "C" musaError_t apxinf_musa_layer_norm_bf16_e4m3_dual(
+    const void* input, const void* weight, const void* bias, void* normalized,
+    void* quantized, int rows, int cols, float eps, float inverse_scale,
+    musaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      normalized == nullptr || quantized == nullptr || rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if (aligned_to(input, 8) && aligned_to(weight, 8) && aligned_to(bias, 8) &&
+      aligned_to(normalized, 8) && aligned_to(quantized, 8)) {
+    if (cols == 1024) {
+      layer_norm_bf16_e4m3_dual_block_t_kernel<128, 2>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(bias),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 1536) {
+      layer_norm_bf16_e4m3_dual_block_t_kernel<128, 3>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(bias),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 2048) {
+      layer_norm_bf16_e4m3_dual_block_t_kernel<128, 4>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(input),
+              static_cast<const __mt_bfloat16*>(weight),
+              static_cast<const __mt_bfloat16*>(bias),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+  }
+  return musaErrorInvalidValue;
+}
+
 extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
     const void* projection, const void* projection_bias, const void* residual,
     const void* norm_weight, const void* norm_bias, void* hidden,
@@ -856,6 +1231,35 @@ extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
       norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
       rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
+  }
+  if (cols == 1024 && aligned_to(projection, 8) && aligned_to(residual, 8) &&
+      aligned_to(norm_weight, 8) && aligned_to(norm_bias, 8) &&
+      aligned_to(hidden, 8) && aligned_to(normalized, 8) &&
+      (projection_bias == nullptr || aligned_to(projection_bias, 8))) {
+    constexpr int kWarpWarps = 8;
+    const dim3 grid((rows + kWarpWarps - 1) / kWarpWarps);
+    if (projection_bias != nullptr) {
+      bias_residual_layer_norm_bf16_warp_kernel<8, 4, kWarpWarps, true>
+          <<<grid, kWarpWarps * 32, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(norm_weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<__mt_bfloat16*>(normalized), rows, cols, eps);
+    } else {
+      bias_residual_layer_norm_bf16_warp_kernel<8, 4, kWarpWarps, false>
+          <<<grid, kWarpWarps * 32, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(norm_weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<__mt_bfloat16*>(normalized), rows, cols, eps);
+    }
+    return musaGetLastError();
   }
   if (cols == 1024) {
     bias_residual_layer_norm_bf16_cached_1024_kernel
@@ -913,6 +1317,158 @@ extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
       static_cast<__mt_bfloat16*>(hidden),
       static_cast<__mt_bfloat16*>(normalized), rows, cols, eps);
   return musaGetLastError();
+}
+
+// Static-E4M3 output for the bias + residual + LayerNorm. Only the
+// barrier-free warp-per-row form carries a fused store; any other width
+// returns `musaErrorInvalidValue` and the caller composes.
+extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16_e4m3(
+    const void* projection, const void* projection_bias, const void* residual,
+    const void* norm_weight, const void* norm_bias, void* hidden,
+    void* normalized, int rows, int cols, float eps, float inverse_scale,
+    musaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
+      norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  if ((cols == 1152 || cols == 1024) && aligned_to(projection, 8) &&
+      aligned_to(residual, 8) && aligned_to(norm_weight, 8) &&
+      aligned_to(norm_bias, 8) && aligned_to(hidden, 8) &&
+      aligned_to(normalized, 8) &&
+      (projection_bias == nullptr || aligned_to(projection_bias, 8))) {
+    const dim3 grid(rows);
+    const bool has_bias = projection_bias != nullptr;
+    if (cols == 1152) {
+      if (has_bias) {
+        bias_residual_layer_norm_bf16_e4m3_block_kernel<96, 3, true>
+            <<<grid, 96, 0, stream>>>(
+                static_cast<const __mt_bfloat16*>(projection),
+                static_cast<const __mt_bfloat16*>(projection_bias),
+                static_cast<const __mt_bfloat16*>(residual),
+                static_cast<const __mt_bfloat16*>(norm_weight),
+                static_cast<const __mt_bfloat16*>(norm_bias),
+                static_cast<__mt_bfloat16*>(hidden),
+                static_cast<uint8_t*>(normalized), cols, eps, inverse_scale);
+      } else {
+        bias_residual_layer_norm_bf16_e4m3_block_kernel<96, 3, false>
+            <<<grid, 96, 0, stream>>>(
+                static_cast<const __mt_bfloat16*>(projection),
+                static_cast<const __mt_bfloat16*>(projection_bias),
+                static_cast<const __mt_bfloat16*>(residual),
+                static_cast<const __mt_bfloat16*>(norm_weight),
+                static_cast<const __mt_bfloat16*>(norm_bias),
+                static_cast<__mt_bfloat16*>(hidden),
+                static_cast<uint8_t*>(normalized), cols, eps, inverse_scale);
+      }
+    } else {
+      // Vision width 1024: 256 threads x one 4-wide chunk per row; one block
+      // per row like the 1152 form. The eight-lane form (128 threads, 16-byte
+      // loads, 64-bit E4M3 store) halves the access count and is preferred
+      // when every operand is 16-byte aligned and the projection carries a
+      // bias; the four-lane form stays for the unaligned and bias-free cases.
+      if (has_bias && aligned_to(projection, 16) && aligned_to(residual, 16) &&
+          aligned_to(projection_bias, 16) && aligned_to(norm_weight, 16) &&
+          aligned_to(norm_bias, 16) && aligned_to(hidden, 16)) {
+        bias_residual_layer_norm_bf16_e4m3_block8_1024_kernel
+            <<<grid, 128, 0, stream>>>(
+                static_cast<const __mt_bfloat16*>(projection),
+                static_cast<const __mt_bfloat16*>(projection_bias),
+                static_cast<const __mt_bfloat16*>(residual),
+                static_cast<const __mt_bfloat16*>(norm_weight),
+                static_cast<const __mt_bfloat16*>(norm_bias),
+                static_cast<__mt_bfloat16*>(hidden),
+                static_cast<uint8_t*>(normalized), eps, inverse_scale);
+        return musaGetLastError();
+      }
+      if (has_bias) {
+        bias_residual_layer_norm_bf16_e4m3_block_kernel<256, 1, true>
+            <<<grid, 256, 0, stream>>>(
+                static_cast<const __mt_bfloat16*>(projection),
+                static_cast<const __mt_bfloat16*>(projection_bias),
+                static_cast<const __mt_bfloat16*>(residual),
+                static_cast<const __mt_bfloat16*>(norm_weight),
+                static_cast<const __mt_bfloat16*>(norm_bias),
+                static_cast<__mt_bfloat16*>(hidden),
+                static_cast<uint8_t*>(normalized), cols, eps, inverse_scale);
+      } else {
+        bias_residual_layer_norm_bf16_e4m3_block_kernel<256, 1, false>
+            <<<grid, 256, 0, stream>>>(
+                static_cast<const __mt_bfloat16*>(projection),
+                static_cast<const __mt_bfloat16*>(projection_bias),
+                static_cast<const __mt_bfloat16*>(residual),
+                static_cast<const __mt_bfloat16*>(norm_weight),
+                static_cast<const __mt_bfloat16*>(norm_bias),
+                static_cast<__mt_bfloat16*>(hidden),
+                static_cast<uint8_t*>(normalized), cols, eps, inverse_scale);
+      }
+    }
+    return musaGetLastError();
+  }
+  return musaErrorInvalidValue;
+}
+
+// Two-rounding sibling for the GR00T DiT widths: the projection bias is
+// rounded to BF16 before the residual add, both outputs are written, and the
+// normalized value is quantized in the same pass. Any other width returns
+// `musaErrorInvalidValue` and the caller composes.
+extern "C" musaError_t
+apxinf_musa_bias_then_residual_layer_norm_bf16_e4m3_dual(
+    const void* projection, const void* projection_bias, const void* residual,
+    const void* norm_weight, const void* norm_bias, void* hidden,
+    void* normalized, void* quantized, int rows, int cols, float eps,
+    float inverse_scale, musaStream_t stream) {
+  if (projection == nullptr || projection_bias == nullptr ||
+      residual == nullptr || norm_weight == nullptr || norm_bias == nullptr ||
+      hidden == nullptr || normalized == nullptr || quantized == nullptr ||
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return musaErrorInvalidValue;
+  }
+  if (aligned_to(projection, 8) && aligned_to(projection_bias, 8) &&
+      aligned_to(residual, 8) && aligned_to(norm_weight, 8) &&
+      aligned_to(norm_bias, 8) && aligned_to(hidden, 8) &&
+      aligned_to(normalized, 8) && aligned_to(quantized, 8)) {
+    if (cols == 1024) {
+      bias_then_residual_layer_norm_bf16_e4m3_dual_block_t_kernel<128, 2>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(norm_weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 1536) {
+      bias_then_residual_layer_norm_bf16_e4m3_dual_block_t_kernel<384, 1>
+          <<<rows, 384, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(norm_weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+    if (cols == 2048) {
+      bias_then_residual_layer_norm_bf16_e4m3_dual_block_t_kernel<128, 4>
+          <<<rows, 128, 0, stream>>>(
+              static_cast<const __mt_bfloat16*>(projection),
+              static_cast<const __mt_bfloat16*>(projection_bias),
+              static_cast<const __mt_bfloat16*>(residual),
+              static_cast<const __mt_bfloat16*>(norm_weight),
+              static_cast<const __mt_bfloat16*>(norm_bias),
+              static_cast<__mt_bfloat16*>(hidden),
+              static_cast<__mt_bfloat16*>(normalized),
+              static_cast<uint8_t*>(quantized), cols, eps, inverse_scale);
+      return musaGetLastError();
+    }
+  }
+  return musaErrorInvalidValue;
 }
 
 // ── Rotary position embedding ────────────────────────────────────────────
@@ -1020,11 +1576,27 @@ apxinf_musa_qkv_split_bias_vision_rope_precomputed_bf16(
     musaStream_t stream) {
   if (qkv == nullptr || bias == nullptr || query == nullptr || key == nullptr ||
       value == nullptr || rotation_table == nullptr || tokens <= 0 ||
-      heads <= 0 || head_dim <= 0 || head_dim % 4 != 0) {
+      heads <= 0 || head_dim <= 0 || head_dim % 8 != 0) {
     return musaErrorInvalidValue;
   }
+  if (heads == 16 && head_dim == 64) {
+    // Vision-tower specialization: 7.22 us/call against 19.45 us for the
+    // generic form on [512, 16, 64] (probe_vision_rope, 200 calls,
+    // flush-subtracted), byte-identical q/k/v.
+    const int64_t total = static_cast<int64_t>(tokens) * 16 * 4;
+    const int64_t needed = (total + kThreads - 1) / kThreads;
+    qkv_split_bias_vision_rope_precomputed_bf16_16x64_kernel<<<
+        static_cast<unsigned>(needed < 4096 ? needed : 4096), kThreads, 0,
+        stream>>>(
+        static_cast<const __mt_bfloat16*>(qkv),
+        static_cast<const __mt_bfloat16*>(bias),
+        static_cast<__mt_bfloat16*>(query), static_cast<__mt_bfloat16*>(key),
+        static_cast<__mt_bfloat16*>(value),
+        static_cast<const float*>(rotation_table), tokens);
+    return musaGetLastError();
+  }
   const int64_t total =
-      static_cast<int64_t>(tokens) * heads * (head_dim / 2);
+      static_cast<int64_t>(tokens) * heads * (head_dim / 8);
   qkv_split_bias_vision_rope_precomputed_bf16_kernel<<<
       elementwise_grid(total), kThreads, 0, stream>>>(
       static_cast<const __mt_bfloat16*>(qkv),
@@ -1087,9 +1659,10 @@ extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
       block_threads != 128) {
     return musaErrorInvalidValue;
   }
-  qk_rms_norm_mrope_precomputed_bf16_kernel<<<
-      dim3(static_cast<unsigned int>(tokens),
-           static_cast<unsigned int>(query_heads + key_heads)),
+  const int rows = tokens * (query_heads + key_heads);
+  const int warps = block_threads / 32;
+  qk_rms_norm_mrope_precomputed_bf16_warp_kernel<<<
+      dim3(static_cast<unsigned int>((rows + warps - 1) / warps)),
       block_threads, 0, stream>>>(
       static_cast<const __mt_bfloat16*>(query),
       static_cast<const __mt_bfloat16*>(query_weight),
@@ -1163,6 +1736,78 @@ extern "C" musaError_t apxinf_musa_geglu_bf16(const void* gate_up, void* output,
     geglu_bf16_kernel<<<row_grid(rows, inner), kThreads, 0, stream>>>(
         static_cast<const __mt_bfloat16*>(gate_up),
         static_cast<__mt_bfloat16*>(output), rows, inner);
+  }
+  return musaGetLastError();
+}
+
+// Gated GELU writing the static-FP8 quantizer's E4M3 directly. Same launch
+// policy and the same arithmetic as `apxinf_musa_geglu_bf16`; the only
+// addition is the BF16 rounding before `quantize_e4m3_value`, which is what
+// makes the bytes match reading a materialized BF16 GeGLU.
+extern "C" musaError_t apxinf_musa_geglu_bf16_e4m3(
+    const void* gate_up, void* output, int rows, int inner, int pair_width,
+    float inverse_scale, musaStream_t stream) {
+  if (gate_up == nullptr || output == nullptr || rows <= 0 || inner <= 0 ||
+      pair_width < 0 ||
+      (pair_width > 0 &&
+       (pair_width % 4 != 0 || pair_width > inner || inner % pair_width != 0)) ||
+      !std::isfinite(inverse_scale) || inverse_scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  if (pair_width > 0) {
+    // Pair-interleaved layout: one CTA per pair window, so the hot loop needs
+    // no integer division (MUSA's 64-bit division is a software routine).
+    const int blocks = inner / pair_width;
+    const int threads = pair_width < 256 ? pair_width : 256;
+    if (reinterpret_cast<uintptr_t>(gate_up) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(output) % 8 == 0) {
+      geglu_bf16_e4m3_pairs_packed4_kernel<<<dim3(blocks, rows), threads, 0,
+                                             stream>>>(
+          static_cast<const __mt_bfloat16*>(gate_up),
+          static_cast<uint8_t*>(output), rows, inner, pair_width,
+          inverse_scale);
+    } else {
+      geglu_bf16_e4m3_pairs_kernel<<<dim3(blocks, rows), threads, 0, stream>>>(
+          static_cast<const __mt_bfloat16*>(gate_up),
+          static_cast<uint8_t*>(output), rows, inner, pair_width,
+          inverse_scale);
+    }
+    return musaGetLastError();
+  }
+  if (inner % 8 == 0 &&
+      reinterpret_cast<uintptr_t>(gate_up) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(output) % 8 == 0) {
+    constexpr int kGegluThreads = 512;
+    constexpr int64_t kGegluTargetBlocks = 4096;
+    const int64_t groups = inner / 8;
+    const int64_t widest = (groups + kGegluThreads - 1) / kGegluThreads;
+    int64_t chunks = (kGegluTargetBlocks + rows - 1) / rows;
+    if (chunks > widest) chunks = widest;
+    if (chunks < 1) chunks = 1;
+    geglu_bf16_e4m3_packed8_kernel<<<dim3(static_cast<unsigned>(chunks),
+                                          static_cast<unsigned>(rows)),
+                                     kGegluThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(gate_up),
+        static_cast<uint8_t*>(output), rows, inner, inverse_scale);
+  } else if (inner % 4 == 0 &&
+      reinterpret_cast<uintptr_t>(gate_up) % 8 == 0 &&
+      reinterpret_cast<uintptr_t>(output) % 8 == 0) {
+    constexpr int kGegluThreads = 512;
+    constexpr int64_t kGegluTargetBlocks = 4096;
+    const int64_t groups = inner / 4;
+    const int64_t widest = (groups + kGegluThreads - 1) / kGegluThreads;
+    int64_t chunks = (kGegluTargetBlocks + rows - 1) / rows;
+    if (chunks > widest) chunks = widest;
+    if (chunks < 1) chunks = 1;
+    geglu_bf16_e4m3_packed4_kernel<<<dim3(static_cast<unsigned>(chunks),
+                                          static_cast<unsigned>(rows)),
+                                     kGegluThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(gate_up),
+        static_cast<uint8_t*>(output), rows, inner, inverse_scale);
+  } else {
+    geglu_bf16_e4m3_kernel<<<row_grid(rows, inner), kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(gate_up),
+        static_cast<uint8_t*>(output), rows, inner, inverse_scale);
   }
   return musaGetLastError();
 }
@@ -1440,5 +2085,54 @@ extern "C" musaError_t apxinf_musa_norm_quantize_bf16_int8(
           static_cast<__half*>(scales), rows, cols, eps,
           static_cast<const float*>(inv_c));
   }
+  return musaGetLastError();
+}
+
+// ── Static FP8 (E4M3) quantization ───────────────────────────────────────
+
+// Quantize a F16 or BF16 element run with one fixed per-tensor scale.
+//
+// `inverse_scale` is `1 / scale`, supplied by the caller as a host f32. The
+// kernels are grid-stride, so the same ABI serves the patch matrices and the
+// 16k-wide language activations. The finite-value bytes match the host e4m3fn
+// encoder; NaN is clamped to -448 (`0xfe`) by the kernel's clamp order, as
+// documented in `kernels/custom/quantization.cuh`.
+extern "C" musaError_t apxinf_musa_quantize_bf16_e4m3(
+    const void* input, void* output, int64_t count, float inverse_scale,
+    musaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0 ||
+      !std::isfinite(inverse_scale) || inverse_scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  // Eight elements per thread when the buffers allow it: one 16-byte load and
+  // one 8-byte store instead of eight 2-byte loads and eight 1-byte stores.
+  // The arithmetic is `quantize_e4m3_value` either way, so the bytes match.
+  const bool vec8 = count % 8 == 0 &&
+                    reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(output) % 8 == 0;
+  if (vec8) {
+    const int64_t groups = count / 8;
+    quantize_bf16_e4m3_vec8_kernel<<<elementwise_grid(groups), kThreads, 0,
+                                     stream>>>(
+        static_cast<const uint4*>(input), static_cast<uint2*>(output), groups,
+        inverse_scale);
+  } else {
+    quantize_bf16_e4m3_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(input), static_cast<uint8_t*>(output),
+        count, inverse_scale);
+  }
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_quantize_f16_e4m3(
+    const void* input, void* output, int64_t count, float inverse_scale,
+    musaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0 ||
+      !std::isfinite(inverse_scale) || inverse_scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  quantize_f16_e4m3_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __half*>(input), static_cast<uint8_t*>(output), count,
+      inverse_scale);
   return musaGetLastError();
 }

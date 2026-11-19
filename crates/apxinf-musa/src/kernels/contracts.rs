@@ -134,15 +134,21 @@ pub(super) fn checked_bytes(dtype: DType, dims: &[usize], operation: &str) -> Re
 /// the rule live here instead of in eight near-copies.
 #[cfg(apxinf_musa_available)]
 pub(super) fn checked_i32(operation: &str, name: &str, value: usize) -> Result<i32> {
-    i32::try_from(value)
-        .map_err(|_| Error::Other(format!("MUSA {operation} {name} {value} does not fit in i32")))
+    i32::try_from(value).map_err(|_| {
+        Error::Other(format!(
+            "MUSA {operation} {name} {value} does not fit in i32"
+        ))
+    })
 }
 
 /// The same for the one ABI that takes an element count as `int64_t`.
 #[cfg(apxinf_musa_available)]
 pub(super) fn checked_i64(operation: &str, name: &str, value: usize) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| Error::Other(format!("MUSA {operation} {name} {value} does not fit in i64")))
+    i64::try_from(value).map_err(|_| {
+        Error::Other(format!(
+            "MUSA {operation} {name} {value} does not fit in i64"
+        ))
+    })
 }
 
 pub(super) fn require_buffers(
@@ -300,11 +306,26 @@ pub(super) fn require_output_tensor(
     operation: &str,
     name: &str,
 ) -> Result<()> {
+    require_output_dtype_tensor(ctx, tensor, dims, DType::BF16, operation, name)
+}
+
+/// Require a caller-provided output of a specific dtype and exact rank-N
+/// extent on `ctx`'s device.
+///
+/// The static-FP8 operators write E4M3 as well as BF16, so the single-dtype
+/// helper above is a specialization rather than the whole rule.
+pub(super) fn require_output_dtype_tensor(
+    ctx: &MusaContext,
+    tensor: &Tensor,
+    dims: &[usize],
+    dtype: DType,
+    operation: &str,
+    name: &str,
+) -> Result<()> {
     let expected = Device::Musa(ctx.device_id());
-    if tensor.dtype() != DType::BF16 || tensor.shape().dims() != dims || tensor.device() != expected
-    {
+    if tensor.dtype() != dtype || tensor.shape().dims() != dims || tensor.device() != expected {
         return Err(Error::Other(format!(
-            "MUSA {operation} {name} expects BF16 {dims:?} on {expected}, got {} {:?} on {}",
+            "MUSA {operation} {name} expects {dtype} {dims:?} on {expected}, got {} {:?} on {}",
             tensor.dtype(),
             tensor.shape().dims(),
             tensor.device()
@@ -400,6 +421,16 @@ pub(super) fn bf16_tensor(ctx: &MusaContext, dims: &[usize]) -> Result<Tensor> {
 /// the result past the gate the port is held to.
 pub(super) fn f32_tensor(ctx: &MusaContext, dims: &[usize]) -> Result<Tensor> {
     output_tensor_dims(ctx, dims, DType::F32)
+}
+
+/// An E4M3 output tensor, for the fused attention epilogue that writes the
+/// quantized o-projection input directly instead of a BF16 tensor that a
+/// separate kernel would then quantize.
+pub(super) fn e4m3_tensor(ctx: &MusaContext, dims: &[usize]) -> Result<Tensor> {
+    // `checked_bytes` is the BF16/F16/F32 operator-output path; E4M3 outputs
+    // are allocated through `allocate_output`, the same arena path the static
+    // FP8 weights use for their quantized activations.
+    ctx.allocate_output(Shape::new(dims.to_vec()), DType::F8E4M3)
 }
 
 pub(super) fn f16_output(ctx: &MusaContext, rows: usize, cols: usize) -> Result<MusaBuffer> {

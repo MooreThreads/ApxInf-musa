@@ -41,6 +41,7 @@
 // 0.5052 ms.
 
 #include <musa_fp16.h>
+#include <musa_fp8.h>
 
 #include "math.cuh"
 #include "normalization.cuh"
@@ -456,4 +457,71 @@ __global__ void ada_rms_quantize_bf16_int8_kernel(
   for (int lane = 0; lane < 4; ++lane)
     bytes[lane] = quantize_rows_value(values[lane], row_scale);
   *reinterpret_cast<uint32_t*>(output + index) = packed;
+}
+
+// ── Static FP8 (E4M3) quantization ───────────────────────────────────────
+//
+// The fp8_static route quantizes an activation with one calibrated per-tensor
+// scale. Unlike the W8A8 quantizer above there is no reduction and no scale
+// vector: `inverse_scale` is `1 / scale`, already a host f32, and every
+// element takes the same multiply, clamp and E4M3 conversion.
+//
+// `__MT_SATFINITE` makes the conversion total, and
+// `__musa_cvt_float_to_fp8` rounds to nearest-even. NaN is reduced by the
+// `fminf/fmaxf` clamp to -448 (`0xfe`), because `fmaxf(-448, NaN)` returns its
+// non-NaN operand; the host test oracle canonicalises NaN to `0x7f` instead,
+// so the byte tests compare finite values only.
+__global__ void quantize_bf16_e4m3_kernel(const __mt_bfloat16* input,
+                                          uint8_t* output, int64_t count,
+                                          float inverse_scale) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       index < count; index += stride) {
+    output[index] =
+        quantize_e4m3_value(__bfloat162float(input[index]), inverse_scale);
+  }
+}
+
+union QuantPackedBf16 {
+  uint4 bits;
+  __mt_bfloat16 lanes[8];
+};
+
+union QuantPackedE4m3 {
+  uint2 bits;
+  uint8_t lanes[8];
+};
+
+// Eight BF16 per thread: one 16-byte load and one 8-byte store. The scalar
+// form moves 2 bytes per access, which is what its ~4.6 us/call is made of on
+// the DiT attention-output width (41x1536); this form keeps the same
+// `quantize_e4m3_value` arithmetic, so the bytes are identical.
+__global__ void quantize_bf16_e4m3_vec8_kernel(const uint4* input,
+                                               uint2* output, int64_t groups,
+                                               float inverse_scale) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       index < groups; index += stride) {
+    QuantPackedBf16 in;
+    in.bits = input[index];
+    QuantPackedE4m3 out;
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane)
+      out.lanes[lane] = quantize_e4m3_value(
+          __bfloat162float(in.lanes[lane]), inverse_scale);
+    output[index] = out.bits;
+  }
+}
+
+__global__ void quantize_f16_e4m3_kernel(const __half* input, uint8_t* output,
+                                         int64_t count, float inverse_scale) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       index < count; index += stride) {
+    output[index] =
+        quantize_e4m3_value(__half2float(input[index]), inverse_scale);
+  }
 }

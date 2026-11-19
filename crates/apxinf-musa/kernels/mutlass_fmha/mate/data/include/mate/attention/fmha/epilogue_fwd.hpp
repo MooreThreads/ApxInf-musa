@@ -72,6 +72,11 @@ struct CollectiveEpilogueFwd {
     int32_t const   nheads_kv;
     uint32_t const* cu_seqlens = nullptr;
     uint32_t const* seqused    = nullptr;
+    /// Applied to the FP32 accumulator before the output element conversion.
+    /// 1.0f is an exact no-op, so the existing BF16/FP8 paths are unchanged;
+    /// an E4M3 output instantiation passes 1/activation_scale to fuse the
+    /// post-attention quantize.
+    float           output_scale = 1.0f;
   };
 
   struct Params {
@@ -94,6 +99,7 @@ struct CollectiveEpilogueFwd {
 
     uint32_t const* cu_seqlens = nullptr;
     uint32_t const* seqused    = nullptr;
+    float           output_scale = 1.0f;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -158,7 +164,8 @@ struct CollectiveEpilogueFwd {
                   .stride_LSE_partial_packed = stride_LSE_partial_packed,
 
                   .cu_seqlens = args.cu_seqlens,
-                  .seqused    = args.seqused};
+                  .seqused    = args.seqused,
+                  .output_scale = args.output_scale};
   }
 
   template <bool StoreZero,
@@ -246,7 +253,7 @@ struct CollectiveEpilogueFwd {
             for (int j = 0; j < size<1>(tOgO_mn); ++j) {
               tOgO_mn(i, j) = [&] {
                 if constexpr (!SplitKV) {
-                  return assign(Element(tOrO_mn(i, j)), 0);
+                  return assign(Element(tOrO_mn(i, j) * params.output_scale), 0);
                 } else {
                   return assign(ElementPartial(tOrO_mn(i, j)), 0);
                 }
@@ -258,7 +265,7 @@ struct CollectiveEpilogueFwd {
               if (get<1>(tOcO_mn(_0{}, j)) < get<1>(params.shape_O)) {
                 tOgO_mn(i, j) = [&] {
                   if constexpr (!SplitKV) {
-                    return assign(Element(tOrO_mn(i, j)), 0);
+                    return assign(Element(tOrO_mn(i, j) * params.output_scale), 0);
                   } else {
                     return assign(ElementPartial(tOrO_mn(i, j)), 0);
                   }

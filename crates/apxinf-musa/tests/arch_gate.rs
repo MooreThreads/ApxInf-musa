@@ -29,6 +29,7 @@ mod mcc;
 mod build_side;
 
 use build_side::D256Route;
+use build_side::Fp8Route;
 
 /// The generations the build script gates on are the ones the library compares
 /// against. These are read from `build.rs` through `rustc-env`, so a build that
@@ -77,9 +78,15 @@ fn the_build_side_rule_routes_by_arch_and_vendor_gate() {
     // change its answer.
     assert_eq!(build_side::d256_route(assembly, true), D256Route::Assembly);
     assert_eq!(build_side::d256_route(vendor, true), D256Route::Mutlass);
-    assert_eq!(build_side::d256_route(vendor, false), D256Route::Unsupported);
+    assert_eq!(
+        build_side::d256_route(vendor, false),
+        D256Route::Unsupported
+    );
     // A generation neither kernel was built for has neither, whatever the gate.
-    assert_eq!(build_side::d256_route("mp_50", true), D256Route::Unsupported);
+    assert_eq!(
+        build_side::d256_route("mp_50", true),
+        D256Route::Unsupported
+    );
     assert_eq!(
         build_side::d256_route("mp_50", false),
         D256Route::Unsupported
@@ -94,7 +101,11 @@ fn the_build_side_rule_routes_by_arch_and_vendor_gate() {
 /// that cannot compile, rather than a route that silently became a gap.
 #[test]
 fn the_routes_the_library_understands_are_the_build_scripts_names() {
-    for route in [D256Route::Assembly, D256Route::Mutlass, D256Route::Unsupported] {
+    for route in [
+        D256Route::Assembly,
+        D256Route::Mutlass,
+        D256Route::Unsupported,
+    ] {
         assert!(
             matches!(route.as_str(), "assembly" | "mutlass" | "unsupported"),
             "{route:?} publishes a name lib.rs would reject"
@@ -117,4 +128,65 @@ fn the_family_capability_matches_the_generations_that_have_the_kernel() {
     assert_eq!(MusaArchFamily::from_mp(22), MusaArchFamily::Mp22);
     assert_eq!(MusaArchFamily::from_mp(31), MusaArchFamily::Mp31);
     assert_eq!(MusaArchFamily::from_mp(50), MusaArchFamily::Other(50));
+}
+
+/// The FP8 route obeys the arch rule and the library reads the published one.
+#[test]
+fn the_published_fp8_route_is_the_rules_answer_for_this_build() {
+    let expected = build_side::fp8_route(apxinf_musa::MUSA_ARCH);
+    assert_eq!(
+        expected.as_str(),
+        apxinf_musa::FP8_ROUTE,
+        "build.rs published an FP8 route ({}) its rule does not produce for arch={}",
+        apxinf_musa::FP8_ROUTE,
+        apxinf_musa::MUSA_ARCH
+    );
+}
+
+#[test]
+fn the_fp8_rule_is_mp31_only() {
+    assert_eq!(build_side::fp8_route(build_side::FP8_ARCH), Fp8Route::Mudnn);
+    for other in ["mp_22", "mp_21", "mp_10", "mp_50", "unknown"] {
+        assert_eq!(
+            build_side::fp8_route(other),
+            Fp8Route::Unsupported,
+            "{other} must not claim a native FP8 route"
+        );
+    }
+    // The route names are the two `lib.rs` accepts.
+    for route in [Fp8Route::Mudnn, Fp8Route::Unsupported] {
+        assert!(matches!(route.as_str(), "mudnn" | "unsupported"));
+    }
+}
+
+/// FP8 is mp_31-only at the capability layer too, and `Other` is conservative.
+#[test]
+fn only_the_mp31_family_has_native_fp8() {
+    use apxinf_musa::MusaArchFamily;
+
+    assert!(!MusaArchFamily::Mp22.has_native_fp8());
+    assert!(MusaArchFamily::Mp31.has_native_fp8());
+    assert!(!MusaArchFamily::Other(50).has_native_fp8());
+}
+
+/// The build-time route and the runtime capability are two spellings of one
+/// rule; a generation added to one but not the other must fail here rather
+/// than at the first FP8 launch.
+#[test]
+fn the_build_route_and_runtime_capability_agree() {
+    use apxinf_musa::MusaArchFamily;
+
+    for (mp, arch) in [
+        (10, "mp_10"),
+        (21, "mp_21"),
+        (22, "mp_22"),
+        (31, "mp_31"),
+        (50, "mp_50"),
+    ] {
+        assert_eq!(
+            build_side::fp8_route(arch) != Fp8Route::Unsupported,
+            MusaArchFamily::from_mp(mp).has_native_fp8(),
+            "{arch}: build and runtime FP8 rules disagree"
+        );
+    }
 }

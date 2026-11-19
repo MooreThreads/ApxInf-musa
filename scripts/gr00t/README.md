@@ -1,7 +1,7 @@
 # GR00T scripts
 
 Run these commands from the repository root. Keep generated results under
-`devlocal/gr00t-n1d7/`; scripts do not automatically run other benchmarks.
+`devlocal/gr00t/`; scripts do not automatically run other benchmarks.
 
 The MUSA gates check cosine, relative L2 and `max_abs <= 0.125`, and require
 the reference noise (`--reference-noise`, for example the Orin `inputs.npz`)

@@ -46,6 +46,17 @@ impl MusaArchFamily {
     pub const fn has_vision_flash_mha(self) -> bool {
         matches!(self, Self::Mp22 | Self::Mp31)
     }
+
+    /// Whether this family has a native E4M3 GEMM.
+    ///
+    /// Only `mp_31` does. `mp_22`'s vendored MMA builder has no FP8 atom and
+    /// its 8-bit tensor-core path is the INT8 `s8mma` assembly, so FP8 there
+    /// is not slow -- it does not exist. `Other` answers `false` for the same
+    /// reason [`Self::from_mp`] documents: an unmeasured generation must not
+    /// be mistaken for a supported one.
+    pub const fn has_native_fp8(self) -> bool {
+        matches!(self, Self::Mp31)
+    }
 }
 
 impl fmt::Display for MusaArchFamily {

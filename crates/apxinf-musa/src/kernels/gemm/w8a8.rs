@@ -1113,6 +1113,9 @@ mod tests {
     #[test]
     #[ignore = "needs MP22"]
     fn bias_gelu_quantization_graph_replays_changed_inputs() {
+        if !asm_tiles_built() {
+            return;
+        }
         use std::sync::Arc;
         let ctx = Arc::new(MusaContext::new(0).unwrap());
         let (rows, width) = (512, 4352);

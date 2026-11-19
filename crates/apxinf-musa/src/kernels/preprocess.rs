@@ -160,9 +160,9 @@ fn launch_rgb_u8_to_patches_bf16(
 /// Normalization, channel-first patch reordering, FP16 rounding and the static
 /// scale all happen in one stream-ordered step.
 ///
-/// Not ported, for a second reason on top of the one above: `scale` belongs to
-/// the FP8 precision route, which is not ported either. Every other FP8 entry in
-/// the facade answers the same way.
+/// Not ported: the static-FP8 route composes `rgb_u8_to_patches_bf16` with a
+/// separate `FixedScaleE4m3` quantization instead of fusing normalization,
+/// patch reordering and the E4M3 conversion into one pass.
 #[allow(clippy::too_many_arguments)]
 pub fn rgb_u8_to_patches_e4m3(
     ctx: &MusaContext,
@@ -472,7 +472,7 @@ mod tests {
         // carried.
         let message = error.to_string();
         assert!(
-            message.contains("expects BF16"),
+            message.contains("expects bf16"),
             "unhelpful refusal: {message}"
         );
         assert!(message.contains("got f32"), "unhelpful refusal: {message}");

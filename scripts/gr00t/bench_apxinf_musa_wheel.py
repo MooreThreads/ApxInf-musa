@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-missing-noise", action="store_true")
     parser.add_argument("--expect-model", default="nvidia/GR00T-N1.7-LIBERO")
     parser.add_argument("--output", type=Path,
-                        default=Path("devlocal/gr00t-n1d7/results/gr00t-musa-wheel.json"))
+                        default=Path("devlocal/gr00t/results/gr00t-musa-wheel.json"))
     args = parser.parse_args()
     if args.warmup < 1 or args.iterations <= 0:
         parser.error("--warmup must be at least 1 and --iterations must be positive")

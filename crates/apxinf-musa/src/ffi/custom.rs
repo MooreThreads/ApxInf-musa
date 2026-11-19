@@ -81,6 +81,48 @@ extern "C" {
         k: i32,
         stream: *mut c_void,
     ) -> i32;
+    /// muDNN FP8 GEMM: E4M3 x E4M3 with a BF16 result and one f32 `alpha`.
+    ///
+    /// The same status convention as the BF16 entry point. `libmudnn_xmma`
+    /// carries the E4M3/E4M3 -> BF16 MUTLASS instantiations; muDNN is the only
+    /// provider the static-FP8 route uses.
+    pub fn apxinf_musa_mudnn_fp8_gemm(
+        a: *const c_void,
+        w: *const c_void,
+        y: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// muDNN FP8 GEMM with the bias epilogue:
+    /// `y = alpha * a @ w + bias`. `bias` is BF16 `[n]`.
+    pub fn apxinf_musa_mudnn_fp8_gemm_bias(
+        a: *const c_void,
+        w: *const c_void,
+        y: *mut c_void,
+        bias: *const c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// muDNN FP8 GEMM with the bias and residual epilogue:
+    /// `y = alpha * a @ w + residual + bias`, both BF16.
+    pub fn apxinf_musa_mudnn_fp8_gemm_bias_residual(
+        a: *const c_void,
+        w: *const c_void,
+        y: *mut c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: *mut c_void,
+    ) -> i32;
     /// muDNN flash attention. Same status convention as the GEMM above.
     pub fn apxinf_musa_mudnn_flash_bf16(
         q: *const c_void,
@@ -151,10 +193,39 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// `silu(gate) * up` with the same BF16 product rounding followed by the
+    /// fixed per-tensor E4M3 conversion, in one launch.
+    pub fn apxinf_musa_silu_mul_bf16_e4m3(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     pub fn apxinf_musa_silu_bf16(
         input: *const c_void,
         output: *mut c_void,
         count: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// [`apxinf_musa_bias_activation_bf16`] writing E4M3.
+    ///
+    /// The BF16 rounding happens before `inverse_scale`, the clamp and the
+    /// conversion, so the bytes match materializing the BF16 result and
+    /// quantizing it. Only the eight-lane vector form is served; a width that
+    /// does not divide by eight returns `musaErrorInvalidValue` and the caller
+    /// composes.
+    pub fn apxinf_musa_bias_activation_bf16_e4m3(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        activation: i32,
+        inverse_scale: f32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -181,6 +252,25 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// [`apxinf_musa_ada_gate_residual_rms_norm_bf16`] writing E4M3.
+    ///
+    /// The second pass rounds to BF16 and then applies the static quantizer's
+    /// `inverse_scale`/clamp/conversion, so the bytes match materializing the
+    /// BF16 normalized tensor and quantizing it.
+    pub fn apxinf_musa_ada_gate_residual_rms_norm_bf16_e4m3(
+        projection: *const c_void,
+        residual: *const c_void,
+        gate_style: *const c_void,
+        norm_style: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// RMSNorm over `[rows, cols]` with a `[cols]` weight.
     pub fn apxinf_musa_rms_norm_bf16(
         input: *const c_void,
@@ -203,6 +293,20 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// [`apxinf_musa_rms_norm_bf16`] writing E4M3, with the same
+    /// BF16-rounding-then-quantize contract. Only the register-cached vector
+    /// widths are served; anything else returns `musaErrorInvalidValue`.
+    pub fn apxinf_musa_rms_norm_bf16_e4m3(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// adaLN RMSNorm: `style` is `[3 * cols]` and its first two segments are
     /// the scale and shift; the third belongs to the gated variant.
     pub fn apxinf_musa_ada_rms_norm_bf16(
@@ -212,6 +316,19 @@ extern "C" {
         rows: i32,
         cols: i32,
         eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// [`apxinf_musa_ada_rms_norm_bf16`] writing E4M3. Only the
+    /// register-cached vector width is served.
+    pub fn apxinf_musa_ada_rms_norm_bf16_e4m3(
+        input: *const c_void,
+        style: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -283,6 +400,22 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// [`apxinf_musa_bias_residual_rms_norm_bf16`] writing E4M3. Only the
+    /// register-cached eight-lane form is served.
+    pub fn apxinf_musa_bias_residual_rms_norm_bf16_e4m3(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        weight: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// `first`'s rows then `second`'s, both `cols` wide.
     pub fn apxinf_musa_concat_rows_bf16(
         first: *const c_void,
@@ -303,6 +436,18 @@ extern "C" {
         first_cols: i32,
         second_cols: i32,
         third_cols: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_split_qkv_uneven_bf16(
+        packed: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        rows: i32,
+        q_cols: i32,
+        k_cols: i32,
+        v_cols: i32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -524,6 +669,47 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// Adaptive LayerNorm writing both BF16 and static E4M3 in one launch.
+    pub fn apxinf_musa_adaptive_layer_norm_bf16_e4m3_dual(
+        input: *const c_void,
+        modulation: *const c_void,
+        normalized: *mut c_void,
+        quantized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// [`apxinf_musa_layer_norm_bf16`] writing E4M3. Only the barrier-free
+    /// warp-per-row width is served.
+    pub fn apxinf_musa_layer_norm_bf16_e4m3(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// LayerNorm writing both BF16 and static E4M3 in one launch.
+    pub fn apxinf_musa_layer_norm_bf16_e4m3_dual(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        normalized: *mut c_void,
+        quantized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// Projection plus an optional bias, added into the residual, then a
     /// LayerNorm with a weight and a shift, writing both outputs.
     ///
@@ -540,6 +726,43 @@ extern "C" {
         rows: i32,
         cols: i32,
         eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// [`apxinf_musa_bias_residual_layer_norm_bf16`] writing E4M3. Only the
+    /// barrier-free warp-per-row width is served.
+    pub fn apxinf_musa_bias_residual_layer_norm_bf16_e4m3(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Two-rounding sibling: the projection bias is rounded to BF16 before the
+    /// residual add, then the normalized value is written both as BF16 and as
+    /// static E4M3 in one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_musa_bias_then_residual_layer_norm_bf16_e4m3_dual(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        quantized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        inverse_scale: f32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -685,6 +908,21 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// [`apxinf_musa_geglu_bf16`] writing E4M3 with a static per-tensor scale.
+    ///
+    /// Byte-identical to materializing the BF16 GeGLU and passing it to
+    /// [`apxinf_musa_quantize_bf16_e4m3`]: the kernel rounds the product to
+    /// BF16 before the conversion, exactly as the composed pair does.
+    pub fn apxinf_musa_geglu_bf16_e4m3(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        inner: i32,
+        pair_width: i32,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// Raw `uint8` RGB frames -> BF16 patch rows, in one gather.
     ///
     /// `images` holds `views * 3 * image_size^2` bytes with no shape metadata of
@@ -731,6 +969,32 @@ extern "C" {
         inv_c: *const c_void,
         stream: *mut c_void,
     ) -> musaError_t;
+
+    /// Quantize `count` BF16 elements to E4M3 with one fixed scale.
+    ///
+    /// `inverse_scale` is `1 / scale`; the kernel clamps to the E4M3 finite
+    /// range and uses the architecture's saturating round-to-nearest-even
+    /// conversion. The launch is asynchronous on `stream`.
+    pub fn apxinf_musa_quantize_bf16_e4m3(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// The F16-input sibling of [`apxinf_musa_quantize_bf16_e4m3`].
+    ///
+    /// The static-FP8 weight packer rounds the checkpoint to F16 before
+    /// quantization, matching the CUDA route's documented preparation order;
+    /// activations use the BF16 entry point.
+    pub fn apxinf_musa_quantize_f16_e4m3(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        inverse_scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
 }
 
 /// Turn a muDNN status into the adapter's message, naming the operator.
@@ -756,5 +1020,7 @@ fn mudnn_detail(status: i32) -> String {
 /// Turn a status into the adapter's message; `operation` runs only on failure,
 /// so a successful launch does not format a string it would throw away.
 pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<(), String> {
-    crate::ffi::check_status(status, || format!("{}: {}", operation(), mudnn_detail(status)))
+    crate::ffi::check_status(status, || {
+        format!("{}: {}", operation(), mudnn_detail(status))
+    })
 }

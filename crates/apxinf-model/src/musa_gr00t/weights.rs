@@ -15,6 +15,8 @@ use super::backbone::{Qwen3VLConfig, Qwen3VLTextWeights, Qwen3VLVisionWeights};
 use super::Gr00tConfig;
 
 pub(super) mod bf16;
+pub(super) mod fp8;
+pub(super) mod fp8_calibration;
 
 const BACKBONE_PREFIX: &str = "backbone.model.";
 

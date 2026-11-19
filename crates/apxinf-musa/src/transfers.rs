@@ -62,6 +62,128 @@ pub fn copy_cpu_to_device(source: &Tensor, destination: &Tensor) -> Result<()> {
     copy_host_to_device(device_id, source, destination.ptr).map_err(musa_error)
 }
 
+/// A page-locked host staging buffer for the fixed-input upload path.
+///
+/// `musaMemcpy` from ordinary host memory makes the driver stage every byte
+/// through a bounce buffer. A pinned source can be DMA'd asynchronously on the
+/// context stream, so the prepared GR00T graph fills its four stable-address
+/// inputs through one of these and enqueues the uploads before the replay on
+/// the same stream.
+pub struct PinnedBuffer {
+    ptr: *mut std::ffi::c_void,
+    bytes: usize,
+}
+
+// SAFETY: the pointer owns a host allocation whose lifetime moves with the
+// struct, and the prepared-plan invariant keeps a single thread filling it.
+unsafe impl Send for PinnedBuffer {}
+
+impl PinnedBuffer {
+    /// Page-lock `bytes` of host memory.
+    pub fn alloc(bytes: usize) -> Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        unsafe {
+            ffi::check_runtime(ffi::musa::musaMallocHost(&mut ptr, bytes)).map_err(|error| {
+                Error::Other(format!(
+                    "MUSA pinned host allocation of {bytes} bytes failed: {error}"
+                ))
+            })?;
+        }
+        Ok(Self { ptr, bytes })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Copy `source` into the staging buffer and enqueue one asynchronous
+    /// host-to-device copy into `destination` on `stream`.
+    ///
+    /// The destination must belong to the device that owns `stream`. The
+    /// caller must not overwrite the staging bytes again until the copy has
+    /// completed on the stream; the prepared-input contract synchronizes
+    /// between calls.
+    pub fn stage_and_upload(
+        &self,
+        source: &[u8],
+        destination: *mut std::ffi::c_void,
+        stream: *mut std::ffi::c_void,
+    ) -> std::result::Result<(), String> {
+        if source.len() > self.bytes {
+            return Err(format!(
+                "source is {} bytes, pinned staging buffer is {}",
+                source.len(),
+                self.bytes
+            ));
+        }
+        if source.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(source.as_ptr(), self.ptr.cast::<u8>(), source.len());
+            ffi::check_runtime(ffi::musa::musaMemcpyAsync(
+                destination,
+                self.ptr,
+                source.len(),
+                ffi::musa::MUSA_MEMCPY_HOST_TO_DEVICE,
+                stream,
+            ))
+        }
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                ffi::musa::musaFreeHost(self.ptr);
+            }
+        }
+    }
+}
+
+/// Copy a CPU tensor into shape-identical device storage through a pinned
+/// staging buffer, asynchronously on `stream`.
+///
+/// The device pointer addresses must have been fixed before capture, which is
+/// the same requirement as [`copy_cpu_to_device`]. No synchronization happens
+/// here: the caller enqueues everything that reads the destination on
+/// `stream` after this call.
+pub fn copy_cpu_to_device_pinned(
+    source: &Tensor,
+    destination: &Tensor,
+    staging: &PinnedBuffer,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    if source.device() != Device::Cpu {
+        return Err(Error::Other("copy source must be a CPU tensor".into()));
+    }
+    let _device_id = match destination.device() {
+        Device::Musa(device_id) => device_id,
+        device => return Err(Error::UnsupportedDevice(device)),
+    };
+    if source.shape() != destination.shape() || source.dtype() != destination.dtype() {
+        return Err(Error::Other(format!(
+            "fixed MUSA input mismatch: source {:?} {}, destination {:?} {}",
+            source.shape().dims(),
+            source.dtype(),
+            destination.shape().dims(),
+            destination.dtype()
+        )));
+    }
+    let source = source
+        .storage()
+        .as_cpu()
+        .ok_or_else(|| Error::Other("expected CPU storage".into()))?;
+    let destination = destination
+        .storage()
+        .as_gpu()
+        .ok_or_else(|| Error::Other("expected MUSA storage".into()))?;
+    staging
+        .stage_and_upload(source, destination.ptr as *mut std::ffi::c_void, stream)
+        .map_err(musa_error)
+}
+
 /// Transfer a MUSA tensor back to CPU.
 pub fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     let handle = match tensor.storage() {

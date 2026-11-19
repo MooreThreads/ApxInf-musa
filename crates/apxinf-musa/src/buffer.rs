@@ -485,6 +485,27 @@ impl MusaBuffer {
         }
     }
 
+    /// Copy `src` into this buffer through a page-locked staging allocation and
+    /// enqueue the host-to-device copy on `stream`.
+    ///
+    /// The caller must not overwrite `staging` until the copy has completed;
+    /// the prepared-input contract synchronizes between calls.
+    pub fn copy_from_host_pinned(
+        &self,
+        src: &[u8],
+        staging: &crate::transfers::PinnedBuffer,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        if src.len() > self.len {
+            return Err(format!(
+                "source is {} bytes, buffer is {}",
+                src.len(),
+                self.len
+            ));
+        }
+        staging.stage_and_upload(src, self.ptr, stream)
+    }
+
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<(), String> {
         if dst.len() > self.len {

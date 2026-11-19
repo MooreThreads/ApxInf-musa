@@ -78,60 +78,245 @@ __global__ void build_vision_rotation_table_f32_kernel(
 // Split packed QKV, add projection bias, apply a prepared 2-D rotary table to
 // Q/K, and write V. Explicit BF16 rounding after bias preserves the arithmetic
 // boundary of the prior split-kernel followed by RoPE-kernel sequence.
+//
+// Four rotary pairs per thread: the q/k/v and bias columns are contiguous
+// 8-byte lanes and the rotation table is two float4s, so each thread issues
+// six 8-byte loads instead of twenty-four 2-byte ones. The per-element
+// arithmetic and rounding order are unchanged.
 __global__ void qkv_split_bias_vision_rope_precomputed_bf16_kernel(
     const __mt_bfloat16* qkv, const __mt_bfloat16* bias,
     __mt_bfloat16* q_out, __mt_bfloat16* k_out, __mt_bfloat16* v_out,
     const float* rotation_table, int tokens, int heads, int head_dim) {
+  constexpr int kPairs = 4;
   const int half_dim = head_dim / 2;
+  const int groups = half_dim / kPairs;
   const int64_t start =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = static_cast<int64_t>(tokens) * heads * half_dim;
+  const int64_t total = static_cast<int64_t>(tokens) * heads * groups;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t linear = start; linear < total; linear += stride) {
-    const int pair = static_cast<int>(linear % half_dim);
-    const int64_t token_head = linear / half_dim;
+    const int group = static_cast<int>(linear % groups);
+    const int64_t token_head = linear / groups;
     const int head = static_cast<int>(token_head % heads);
     const int token = static_cast<int>(token_head / heads);
     const int width = heads * head_dim;
     const int head_col = head * head_dim;
-    const int second = pair + half_dim;
+    const int pair0 = group * kPairs;
+    const int col0 = head_col + pair0;
+    const int second0 = col0 + half_dim;
     const int64_t qkv_row = static_cast<int64_t>(token) * 3 * width;
     const int64_t out_base = token_head * head_dim;
 
-    const __mt_bfloat16 rounded_q0 = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + head_col + pair]) +
-        __bfloat162float(bias[head_col + pair]));
-    const __mt_bfloat16 rounded_q1 = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + head_col + second]) +
-        __bfloat162float(bias[head_col + second]));
-    const __mt_bfloat16 rounded_k0 = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + width + head_col + pair]) +
-        __bfloat162float(bias[width + head_col + pair]));
-    const __mt_bfloat16 rounded_k1 = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + width + head_col + second]) +
-        __bfloat162float(bias[width + head_col + second]));
-    const int64_t rotation =
-        (static_cast<int64_t>(token) * half_dim + pair) * 2;
-    const float cosine = rotation_table[rotation];
-    const float sine = rotation_table[rotation + 1];
-    const float q0 = __bfloat162float(rounded_q0);
-    const float q1 = __bfloat162float(rounded_q1);
-    const float k0 = __bfloat162float(rounded_k0);
-    const float k1 = __bfloat162float(rounded_k1);
-    q_out[out_base + pair] = __float2bfloat16(
-        __fsub_rn(__fmul_rn(q0, cosine), __fmul_rn(q1, sine)));
-    q_out[out_base + second] = __float2bfloat16(
-        __fadd_rn(__fmul_rn(q1, cosine), __fmul_rn(q0, sine)));
-    k_out[out_base + pair] = __float2bfloat16(
-        __fsub_rn(__fmul_rn(k0, cosine), __fmul_rn(k1, sine)));
-    k_out[out_base + second] = __float2bfloat16(
-        __fadd_rn(__fmul_rn(k1, cosine), __fmul_rn(k0, sine)));
-    v_out[out_base + pair] = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + 2 * width + head_col + pair]) +
-        __bfloat162float(bias[2 * width + head_col + pair]));
-    v_out[out_base + second] = __float2bfloat16(
-        __bfloat162float(qkv[qkv_row + 2 * width + head_col + second]) +
-        __bfloat162float(bias[2 * width + head_col + second]));
+    const uint2 q0_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + col0);
+    const uint2 q1_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + second0);
+    const uint2 k0_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + width + col0);
+    const uint2 k1_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + width + second0);
+    const uint2 v0_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + 2 * width + col0);
+    const uint2 v1_raw =
+        *reinterpret_cast<const uint2*>(qkv + qkv_row + 2 * width + second0);
+    const uint2 bq0_raw = *reinterpret_cast<const uint2*>(bias + col0);
+    const uint2 bq1_raw = *reinterpret_cast<const uint2*>(bias + second0);
+    const uint2 bk0_raw =
+        *reinterpret_cast<const uint2*>(bias + width + col0);
+    const uint2 bk1_raw =
+        *reinterpret_cast<const uint2*>(bias + width + second0);
+    const uint2 bv0_raw =
+        *reinterpret_cast<const uint2*>(bias + 2 * width + col0);
+    const uint2 bv1_raw =
+        *reinterpret_cast<const uint2*>(bias + 2 * width + second0);
+    const float4 rot0 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * half_dim + pair0) * 2);
+    const float4 rot1 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * half_dim + pair0) * 2 +
+        4);
+    float cosines[kPairs] = {rot0.x, rot0.z, rot1.x, rot1.z};
+    float sines[kPairs] = {rot0.y, rot0.w, rot1.y, rot1.w};
+
+    const __mt_bfloat16* q0 = reinterpret_cast<const __mt_bfloat16*>(&q0_raw);
+    const __mt_bfloat16* q1 = reinterpret_cast<const __mt_bfloat16*>(&q1_raw);
+    const __mt_bfloat16* k0 = reinterpret_cast<const __mt_bfloat16*>(&k0_raw);
+    const __mt_bfloat16* k1 = reinterpret_cast<const __mt_bfloat16*>(&k1_raw);
+    const __mt_bfloat16* v0 = reinterpret_cast<const __mt_bfloat16*>(&v0_raw);
+    const __mt_bfloat16* v1 = reinterpret_cast<const __mt_bfloat16*>(&v1_raw);
+    const __mt_bfloat16* bq0 =
+        reinterpret_cast<const __mt_bfloat16*>(&bq0_raw);
+    const __mt_bfloat16* bq1 =
+        reinterpret_cast<const __mt_bfloat16*>(&bq1_raw);
+    const __mt_bfloat16* bk0 =
+        reinterpret_cast<const __mt_bfloat16*>(&bk0_raw);
+    const __mt_bfloat16* bk1 =
+        reinterpret_cast<const __mt_bfloat16*>(&bk1_raw);
+    const __mt_bfloat16* bv0 =
+        reinterpret_cast<const __mt_bfloat16*>(&bv0_raw);
+    const __mt_bfloat16* bv1 =
+        reinterpret_cast<const __mt_bfloat16*>(&bv1_raw);
+    uint2 qo0_raw, qo1_raw, ko0_raw, ko1_raw, vo0_raw, vo1_raw;
+    __mt_bfloat16* qo0 = reinterpret_cast<__mt_bfloat16*>(&qo0_raw);
+    __mt_bfloat16* qo1 = reinterpret_cast<__mt_bfloat16*>(&qo1_raw);
+    __mt_bfloat16* ko0 = reinterpret_cast<__mt_bfloat16*>(&ko0_raw);
+    __mt_bfloat16* ko1 = reinterpret_cast<__mt_bfloat16*>(&ko1_raw);
+    __mt_bfloat16* vo0 = reinterpret_cast<__mt_bfloat16*>(&vo0_raw);
+    __mt_bfloat16* vo1 = reinterpret_cast<__mt_bfloat16*>(&vo1_raw);
+#pragma unroll
+    for (int lane = 0; lane < kPairs; ++lane) {
+      const float cosine = cosines[lane];
+      const float sine = sines[lane];
+      const float q0f = __bfloat162float(
+          __float2bfloat16(__bfloat162float(q0[lane]) +
+                           __bfloat162float(bq0[lane])));
+      const float q1f = __bfloat162float(
+          __float2bfloat16(__bfloat162float(q1[lane]) +
+                           __bfloat162float(bq1[lane])));
+      const float k0f = __bfloat162float(
+          __float2bfloat16(__bfloat162float(k0[lane]) +
+                           __bfloat162float(bk0[lane])));
+      const float k1f = __bfloat162float(
+          __float2bfloat16(__bfloat162float(k1[lane]) +
+                           __bfloat162float(bk1[lane])));
+      qo0[lane] = __float2bfloat16(
+          __fsub_rn(__fmul_rn(q0f, cosine), __fmul_rn(q1f, sine)));
+      qo1[lane] = __float2bfloat16(
+          __fadd_rn(__fmul_rn(q1f, cosine), __fmul_rn(q0f, sine)));
+      ko0[lane] = __float2bfloat16(
+          __fsub_rn(__fmul_rn(k0f, cosine), __fmul_rn(k1f, sine)));
+      ko1[lane] = __float2bfloat16(
+          __fadd_rn(__fmul_rn(k1f, cosine), __fmul_rn(k0f, sine)));
+      vo0[lane] = __float2bfloat16(__bfloat162float(v0[lane]) +
+                                   __bfloat162float(bv0[lane]));
+      vo1[lane] = __float2bfloat16(__bfloat162float(v1[lane]) +
+                                   __bfloat162float(bv1[lane]));
+    }
+    *reinterpret_cast<uint2*>(q_out + out_base + pair0) = qo0_raw;
+    *reinterpret_cast<uint2*>(q_out + out_base + half_dim + pair0) = qo1_raw;
+    *reinterpret_cast<uint2*>(k_out + out_base + pair0) = ko0_raw;
+    *reinterpret_cast<uint2*>(k_out + out_base + half_dim + pair0) = ko1_raw;
+    *reinterpret_cast<uint2*>(v_out + out_base + pair0) = vo0_raw;
+    *reinterpret_cast<uint2*>(v_out + out_base + half_dim + pair0) = vo1_raw;
+  }
+}
+
+// Eight rotary pairs per thread, specialized to the vision tower's fixed
+// 16 heads x 64 dim (`groups = 4`, `heads = 16`, both powers of two).
+//
+// The generic kernel above decomposes its flat index with runtime `%` and `/`
+// on a 64-bit value; on this shape the specialized form replaces all four with
+// a mask and a shift, halves the thread count, and moves 16 bytes per lane.
+// Measured on an idle S5000: 7.22 us against 19.45 us for the generic form,
+// byte-identical q/k/v (0/524288 differing elements, probe_vision_rope).
+__global__ void qkv_split_bias_vision_rope_precomputed_bf16_16x64_kernel(
+    const __mt_bfloat16* qkv, const __mt_bfloat16* bias,
+    __mt_bfloat16* q_out, __mt_bfloat16* k_out, __mt_bfloat16* v_out,
+    const float* rotation_table, int tokens) {
+  constexpr int kHeads16 = 16;
+  constexpr int kHeadDim64 = 64;
+  constexpr int kHalf32 = kHeadDim64 / 2;
+  constexpr int kPairs8 = 8;
+  constexpr int kGroups4 = kHalf32 / kPairs8;
+  constexpr int kWidth1024 = kHeads16 * kHeadDim64;
+  const int32_t start = blockIdx.x * blockDim.x + threadIdx.x;
+  const int32_t total = tokens * kHeads16 * kGroups4;
+  const int32_t stride = gridDim.x * blockDim.x;
+  for (int32_t linear = start; linear < total; linear += stride) {
+    const int32_t group = linear & (kGroups4 - 1);
+    const int32_t token_head = linear >> 2;  // log2(kGroups4)
+    const int32_t head = token_head & (kHeads16 - 1);
+    const int32_t token = token_head >> 4;  // log2(kHeads16)
+    const int32_t head_col = head * kHeadDim64;
+    const int32_t pair0 = group * kPairs8;
+    const int32_t col0 = head_col + pair0;
+    const int32_t second0 = col0 + kHalf32;
+    const int64_t qkv_row = static_cast<int64_t>(token) * 3 * kWidth1024;
+    const int64_t out_base = static_cast<int64_t>(token_head) * kHeadDim64;
+
+    const uint4 q0_raw = *reinterpret_cast<const uint4*>(qkv + qkv_row + col0);
+    const uint4 q1_raw =
+        *reinterpret_cast<const uint4*>(qkv + qkv_row + second0);
+    const uint4 k0_raw =
+        *reinterpret_cast<const uint4*>(qkv + qkv_row + kWidth1024 + col0);
+    const uint4 k1_raw =
+        *reinterpret_cast<const uint4*>(qkv + qkv_row + kWidth1024 + second0);
+    const uint4 v0_raw =
+        *reinterpret_cast<const uint4*>(qkv + qkv_row + 2 * kWidth1024 + col0);
+    const uint4 v1_raw =
+        *reinterpret_cast<const uint4*>(qkv + qkv_row + 2 * kWidth1024 + second0);
+    const uint4 bq0_raw = *reinterpret_cast<const uint4*>(bias + col0);
+    const uint4 bq1_raw = *reinterpret_cast<const uint4*>(bias + second0);
+    const uint4 bk0_raw =
+        *reinterpret_cast<const uint4*>(bias + kWidth1024 + col0);
+    const uint4 bk1_raw =
+        *reinterpret_cast<const uint4*>(bias + kWidth1024 + second0);
+    const uint4 bv0_raw =
+        *reinterpret_cast<const uint4*>(bias + 2 * kWidth1024 + col0);
+    const uint4 bv1_raw =
+        *reinterpret_cast<const uint4*>(bias + 2 * kWidth1024 + second0);
+    const float4 rot0 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * kHalf32 + pair0) * 2);
+    const float4 rot1 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * kHalf32 + pair0) * 2 + 4);
+    const float4 rot2 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * kHalf32 + pair0) * 2 + 8);
+    const float4 rot3 = *reinterpret_cast<const float4*>(
+        rotation_table + (static_cast<int64_t>(token) * kHalf32 + pair0) * 2 + 12);
+    const float cosines[kPairs8] = {rot0.x,  rot0.z,  rot1.x, rot1.z,
+                                    rot2.x, rot2.z, rot3.x, rot3.z};
+    const float sines[kPairs8] = {rot0.y,  rot0.w,  rot1.y, rot1.w,
+                                  rot2.y, rot2.w, rot3.y, rot3.w};
+
+    const __mt_bfloat16* q0 = reinterpret_cast<const __mt_bfloat16*>(&q0_raw);
+    const __mt_bfloat16* q1 = reinterpret_cast<const __mt_bfloat16*>(&q1_raw);
+    const __mt_bfloat16* k0 = reinterpret_cast<const __mt_bfloat16*>(&k0_raw);
+    const __mt_bfloat16* k1 = reinterpret_cast<const __mt_bfloat16*>(&k1_raw);
+    const __mt_bfloat16* v0 = reinterpret_cast<const __mt_bfloat16*>(&v0_raw);
+    const __mt_bfloat16* v1 = reinterpret_cast<const __mt_bfloat16*>(&v1_raw);
+    const __mt_bfloat16* bq0 = reinterpret_cast<const __mt_bfloat16*>(&bq0_raw);
+    const __mt_bfloat16* bq1 = reinterpret_cast<const __mt_bfloat16*>(&bq1_raw);
+    const __mt_bfloat16* bk0 = reinterpret_cast<const __mt_bfloat16*>(&bk0_raw);
+    const __mt_bfloat16* bk1 = reinterpret_cast<const __mt_bfloat16*>(&bk1_raw);
+    const __mt_bfloat16* bv0 = reinterpret_cast<const __mt_bfloat16*>(&bv0_raw);
+    const __mt_bfloat16* bv1 = reinterpret_cast<const __mt_bfloat16*>(&bv1_raw);
+    uint4 qo0_raw, qo1_raw, ko0_raw, ko1_raw, vo0_raw, vo1_raw;
+    __mt_bfloat16* qo0 = reinterpret_cast<__mt_bfloat16*>(&qo0_raw);
+    __mt_bfloat16* qo1 = reinterpret_cast<__mt_bfloat16*>(&qo1_raw);
+    __mt_bfloat16* ko0 = reinterpret_cast<__mt_bfloat16*>(&ko0_raw);
+    __mt_bfloat16* ko1 = reinterpret_cast<__mt_bfloat16*>(&ko1_raw);
+    __mt_bfloat16* vo0 = reinterpret_cast<__mt_bfloat16*>(&vo0_raw);
+    __mt_bfloat16* vo1 = reinterpret_cast<__mt_bfloat16*>(&vo1_raw);
+#pragma unroll
+    for (int lane = 0; lane < kPairs8; ++lane) {
+      const float cosine = cosines[lane];
+      const float sine = sines[lane];
+      const float q0f = __bfloat162float(__float2bfloat16(
+          __bfloat162float(q0[lane]) + __bfloat162float(bq0[lane])));
+      const float q1f = __bfloat162float(__float2bfloat16(
+          __bfloat162float(q1[lane]) + __bfloat162float(bq1[lane])));
+      const float k0f = __bfloat162float(__float2bfloat16(
+          __bfloat162float(k0[lane]) + __bfloat162float(bk0[lane])));
+      const float k1f = __bfloat162float(__float2bfloat16(
+          __bfloat162float(k1[lane]) + __bfloat162float(bk1[lane])));
+      qo0[lane] = __float2bfloat16(
+          __fsub_rn(__fmul_rn(q0f, cosine), __fmul_rn(q1f, sine)));
+      qo1[lane] = __float2bfloat16(
+          __fadd_rn(__fmul_rn(q1f, cosine), __fmul_rn(q0f, sine)));
+      ko0[lane] = __float2bfloat16(
+          __fsub_rn(__fmul_rn(k0f, cosine), __fmul_rn(k1f, sine)));
+      ko1[lane] = __float2bfloat16(
+          __fadd_rn(__fmul_rn(k1f, cosine), __fmul_rn(k0f, sine)));
+      vo0[lane] = __float2bfloat16(__bfloat162float(v0[lane]) +
+                                   __bfloat162float(bv0[lane]));
+      vo1[lane] = __float2bfloat16(__bfloat162float(v1[lane]) +
+                                   __bfloat162float(bv1[lane]));
+    }
+    *reinterpret_cast<uint4*>(q_out + out_base + pair0) = qo0_raw;
+    *reinterpret_cast<uint4*>(q_out + out_base + kHalf32 + pair0) = qo1_raw;
+    *reinterpret_cast<uint4*>(k_out + out_base + pair0) = ko0_raw;
+    *reinterpret_cast<uint4*>(k_out + out_base + kHalf32 + pair0) = ko1_raw;
+    *reinterpret_cast<uint4*>(v_out + out_base + pair0) = vo0_raw;
+    *reinterpret_cast<uint4*>(v_out + out_base + kHalf32 + pair0) = vo1_raw;
   }
 }
 
@@ -205,57 +390,78 @@ __global__ void build_mrope_rotation_table_f32_kernel(
 }
 
 // Fuse Q/K RMSNorm and multimodal RoPE while reading a prepared FP32 rotation
-// table. One block owns one `(token, head)` row. The normalized row is rounded
-// to BF16 before rotation so this preserves the fallback's arithmetic boundary.
-__global__ void qk_rms_norm_mrope_precomputed_bf16_kernel(
+// table. One warp owns one `(token, head)` row, four rows per 128-thread block:
+// the sum of squares is a warp shuffle, the normalized row stays in registers,
+// and each lane owns two pairs from both halves so the rotation needs no
+// cross-lane exchange. The row is rounded to BF16 before rotation so this
+// preserves the fallback's arithmetic boundary: f32 squares,
+// `bf16(input * inv_rms * weight)`, f32 rotation, BF16 out.
+__global__ void qk_rms_norm_mrope_precomputed_bf16_warp_kernel(
     const __mt_bfloat16* query_input, const __mt_bfloat16* query_weight,
     __mt_bfloat16* query_output, const __mt_bfloat16* key_input,
     const __mt_bfloat16* key_weight, __mt_bfloat16* key_output,
     const float* rotation_table, int tokens, int query_heads, int key_heads,
     int head_dim, float eps) {
-  __shared__ float scratch[8];
-  __shared__ __mt_bfloat16 rounded[128];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int total_heads = query_heads + key_heads;
+  const int row = static_cast<int>(blockIdx.x) * (blockDim.x >> 5) + warp;
+  if (row >= tokens * total_heads) return;
 
-  const int token = blockIdx.x;
-  const int combined_head = blockIdx.y;
+  const int token = row / total_heads;
+  const int combined_head = row - token * total_heads;
   const bool is_query = combined_head < query_heads;
   const int heads = is_query ? query_heads : key_heads;
   const int head = is_query ? combined_head : combined_head - query_heads;
-  if (token >= tokens || head >= heads) return;
-
   const __mt_bfloat16* input = is_query ? query_input : key_input;
   const __mt_bfloat16* weight = is_query ? query_weight : key_weight;
   __mt_bfloat16* output = is_query ? query_output : key_output;
   const int64_t base =
       (static_cast<int64_t>(token) * heads + head) * head_dim;
-
-  float square_sum = 0.0f;
-  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
-    const float value = __bfloat162float(input[base + col]);
-    square_sum += value * value;
-  }
-  const float mean = block_sum_parallel_unsafe(square_sum, scratch) / head_dim;
-  const float inverse_rms = rsqrtf(__fadd_rn(mean, eps));
-  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
-    rounded[col] = __float2bfloat16(
-        __bfloat162float(input[base + col]) * inverse_rms *
-        __bfloat162float(weight[col]));
-  }
-  __syncthreads();
-
   const int half_dim = head_dim / 2;
-  for (int pair = threadIdx.x; pair < half_dim; pair += blockDim.x) {
-    const int64_t rotation =
-        (static_cast<int64_t>(token) * half_dim + pair) * 2;
-    const float cosine = rotation_table[rotation];
-    const float sine = rotation_table[rotation + 1];
-    const float first = __bfloat162float(rounded[pair]);
-    const float second = __bfloat162float(rounded[half_dim + pair]);
-    output[base + pair] = __float2bfloat16(__fsub_rn(
-        __fmul_rn(first, cosine), __fmul_rn(second, sine)));
-    output[base + half_dim + pair] = __float2bfloat16(__fadd_rn(
-        __fmul_rn(second, cosine), __fmul_rn(first, sine)));
-  }
+  const int first = 2 * lane;
+
+  const float a0 = __bfloat162float(input[base + first]);
+  const float a1 = __bfloat162float(input[base + first + 1]);
+  const float b0 = __bfloat162float(input[base + half_dim + first]);
+  const float b1 = __bfloat162float(input[base + half_dim + first + 1]);
+  // The weight and the rotation table are row-independent; reading them before
+  // the shuffle reduction overlaps those loads with it. The arithmetic is
+  // unchanged.
+  const float w0 = __bfloat162float(weight[first]);
+  const float w1 = __bfloat162float(weight[first + 1]);
+  const float w2 = __bfloat162float(weight[half_dim + first]);
+  const float w3 = __bfloat162float(weight[half_dim + first + 1]);
+  const int64_t rotation =
+      (static_cast<int64_t>(token) * half_dim + first) * 2;
+  const float cosine0 = rotation_table[rotation];
+  const float sine0 = rotation_table[rotation + 1];
+  const float cosine1 = rotation_table[rotation + 2];
+  const float sine1 = rotation_table[rotation + 3];
+  float sum = __fadd_rn(__fadd_rn(__fmul_rn(a0, a0), __fmul_rn(a1, a1)),
+                        __fadd_rn(__fmul_rn(b0, b0), __fmul_rn(b1, b1)));
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, offset));
+  sum = __shfl_sync(0xffffffffu, sum, 0);
+  const float inverse_rms = rsqrtf(__fadd_rn(sum / head_dim, eps));
+
+  const float r0a = __bfloat162float(
+      __float2bfloat16(__fmul_rn(__fmul_rn(a0, inverse_rms), w0)));
+  const float r1a = __bfloat162float(
+      __float2bfloat16(__fmul_rn(__fmul_rn(a1, inverse_rms), w1)));
+  const float r0b = __bfloat162float(
+      __float2bfloat16(__fmul_rn(__fmul_rn(b0, inverse_rms), w2)));
+  const float r1b = __bfloat162float(
+      __float2bfloat16(__fmul_rn(__fmul_rn(b1, inverse_rms), w3)));
+
+  output[base + first] = __float2bfloat16(__fsub_rn(
+      __fmul_rn(r0a, cosine0), __fmul_rn(r0b, sine0)));
+  output[base + first + 1] = __float2bfloat16(__fsub_rn(
+      __fmul_rn(r1a, cosine1), __fmul_rn(r1b, sine1)));
+  output[base + half_dim + first] = __float2bfloat16(__fadd_rn(
+      __fmul_rn(r0b, cosine0), __fmul_rn(r0a, sine0)));
+  output[base + half_dim + first + 1] = __float2bfloat16(__fadd_rn(
+      __fmul_rn(r1b, cosine1), __fmul_rn(r1a, sine1)));
 }
 
 

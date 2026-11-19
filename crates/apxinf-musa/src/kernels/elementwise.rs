@@ -271,6 +271,11 @@ fn launch_mul_channels(
     Err(native_unavailable("elementwise::mul_channels_bf16"))
 }
 
+/// Bias-add the three QKV projections.
+///
+/// GR00T's FP8 self-QKV path calls this when the three activation scales are
+/// equal; three [`bias_bf16`] passes are bit-identical to the fused kernel, so
+/// no separate device entry is needed.
 pub fn bias_qkv_in_place_bf16(
     ctx: &MusaContext,
     query: Tensor,
@@ -280,8 +285,11 @@ pub fn bias_qkv_in_place_bf16(
     key_bias: &Tensor,
     value_bias: &Tensor,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let _ = (ctx, query, key, value, query_bias, key_bias, value_bias);
-    Err(not_ported("elementwise::bias_qkv_in_place_bf16"))
+    Ok((
+        bias_bf16(ctx, &query, Some(query_bias))?,
+        bias_bf16(ctx, &key, Some(key_bias))?,
+        bias_bf16(ctx, &value, Some(value_bias))?,
+    ))
 }
 
 // ── FP16 elementwise (not ported) ────────────────────────────────────────
@@ -368,6 +376,55 @@ pub fn concat_columns_bf16(ctx: &MusaContext, tensors: &[&Tensor]) -> Result<Ten
     #[cfg(not(apxinf_musa_available))]
     return Err(native_unavailable("elementwise::concat_columns_bf16"));
     Ok(output)
+}
+
+/// Split a packed `[rows, q_cols + k_cols + v_cols]` BF16 matrix into
+/// contiguous `q | k | v` blocks.
+///
+/// The inverse of [`concat_columns_bf16`] for the text backbone's fused QKV,
+/// where `q` is wider than `k` and `v`. One launch instead of three strided
+/// copies; the widths are compile-time-unknown but row-uniform, so the kernel
+/// selects the destination by column.
+pub fn split_qkv_uneven_bf16(
+    ctx: &MusaContext,
+    packed: &Tensor,
+    q_cols: usize,
+    k_cols: usize,
+    v_cols: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (rows, total_cols) = require_matrix_bf16(ctx, packed, "qkv split", "packed")?;
+    let expected = q_cols
+        .checked_add(k_cols)
+        .and_then(|sum| sum.checked_add(v_cols))
+        .ok_or_else(|| Error::Other("MUSA qkv split width overflow".into()))?;
+    if q_cols == 0 || k_cols == 0 || v_cols == 0 || expected != total_cols {
+        return Err(Error::Other(format!(
+            "MUSA qkv split width mismatch: {q_cols}+{k_cols}+{v_cols} vs {total_cols}"
+        )));
+    }
+    let query = matrix_tensor(ctx, rows, q_cols, bf16_output(ctx, rows, q_cols)?);
+    let key = matrix_tensor(ctx, rows, k_cols, bf16_output(ctx, rows, k_cols)?);
+    let value = matrix_tensor(ctx, rows, v_cols, bf16_output(ctx, rows, v_cols)?);
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_split_qkv_uneven_bf16(
+                tensor_ptr(packed)?,
+                tensor_ptr(&query)?,
+                tensor_ptr(&key)?,
+                tensor_ptr(&value)?,
+                checked_i32("qkv split", "rows", rows)?,
+                checked_i32("qkv split", "q cols", q_cols)?,
+                checked_i32("qkv split", "k cols", k_cols)?,
+                checked_i32("qkv split", "v cols", v_cols)?,
+                ctx.stream().handle(),
+            ),
+            "split_qkv_uneven_bf16",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("elementwise::split_qkv_uneven_bf16"));
+    Ok((query, key, value))
 }
 
 fn binary_bf16(ctx: &MusaContext, op: &'static str, a: &Tensor, b: &Tensor) -> Result<Tensor> {

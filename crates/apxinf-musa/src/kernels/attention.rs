@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
-    bf16_tensor, f32_tensor, require_dtype_on, require_optional_vector_bf16,
+    bf16_tensor, e4m3_tensor, f32_tensor, require_dtype_on, require_optional_vector_bf16,
     require_output_tensor,
 };
 #[cfg(apxinf_musa_available)]
@@ -16,10 +16,10 @@ use crate::context::MusaContext;
 use crate::ffi;
 #[cfg(apxinf_musa_available)]
 use crate::ffi::mubin::{check_fa_d256, AsmFaVariant};
-#[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
-use crate::ffi::mutlass_fa::MutlassFaVariant;
 #[cfg(apxinf_musa_available)]
 use crate::ffi::mublas::check_mublas;
+#[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+use crate::ffi::mutlass_fa::MutlassFaVariant;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
@@ -86,6 +86,14 @@ fn require_3d_bf16(
         )));
     }
     Ok((*tokens, *heads, *head_dim))
+}
+
+/// [`require_3d_bf16`] as a predicate, for the `try_*` dispatch walkers that
+/// fall through to another provider instead of failing.
+fn is_3d_bf16_on(ctx: &MusaContext, tensor: &Tensor) -> bool {
+    tensor.shape().dims().len() == 3
+        && tensor.dtype() == DType::BF16
+        && tensor.device() == apxinf_core::Device::Musa(ctx.device_id())
 }
 
 /// The head geometry the MP22 D256 assembly is built for.
@@ -365,7 +373,7 @@ fn launch_mqa(
         D256Route::Assembly => {}
         D256Route::Mutlass => {
             require_mutlass_decode(tokens, capacity, tactic)?;
-            return launch_mqa_mutlass(ctx, q, k, v, output, tokens, key_tokens);
+            return launch_mqa_mutlass(ctx, q, k, v, output, tokens, key_tokens, tactic);
         }
         D256Route::Unsupported => {
             return Err(Error::Other(format!(
@@ -410,6 +418,18 @@ fn launch_mqa(
     }
 }
 
+/// Whether the unpacked decode render is selected for 9–16 query rows.
+///
+/// Default on: the packed render puts all eight heads in one TileM=128 tile and
+/// launches one CTA for PI0.5's ten-row decode. `APXINF_MUSA_FA_UNPACKED=0`
+/// keeps the packed kernel for an A/B.
+#[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+fn unpacked_decode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("APXINF_MUSA_FA_UNPACKED").map_or(true, |value| value != "0"))
+}
+
 /// Which D256 attention kernel this build runs.
 ///
 /// A property of the build, not of the call: the three assembly images are
@@ -449,29 +469,37 @@ fn d256_route() -> D256Route {
 /// The mp_31 instantiation to run for `tokens` query rows, or `None` when this
 /// build has no tile for that length.
 ///
-/// Mirrors `mate/jit/attention/fmha/fmha_utils.py::_get_fwd_kernel_config` for
-/// bf16 at head dimension 256 with `head_ratio` 8, which packs GQA up to 256
-/// query rows, buckets the packed row count onto a tile of
-/// 16/32/64/128/192/256, and caps the tile at 192. Three query lengths come out
-/// of that rule, not two:
+/// MATE's rule (`mate/jit/attention/fmha/fmha_utils.py::_get_fwd_kernel_config`,
+/// bf16 at head dimension 256 with `head_ratio` 8) packs GQA up to 256 query
+/// rows, buckets the packed row count onto a tile of 16/32/64/128/192/256, and
+/// caps the tile at 192. This port applies that rule with two overrides:
 ///
-/// * 9..=16 rows -- `rows * 8` lands in the 128 bucket, so MATE chooses the
-///   packed tile 128. Frozen, and returned here.
-/// * 17 rows and up -- the packed count lands in the 192 bucket. Frozen, but
-///   this build freezes only the *unpacked* tile 192, so these lengths run that
-///   instantiation in place of the one MATE would have chosen. The substitution
-///   is licensed by `mutlass_tile_choice_does_not_move_the_bits`, which runs
-///   both on the same input and requires bit-identical output; 257 and up is
-///   MATE's own choice of unpacked 192.
+/// * 9..=16 rows -- MATE chooses the packed tile 128. This build defaults to
+///   the unpacked tile 16 (one block per head instead of one CTA for all
+///   eight); `APXINF_MUSA_FA_UNPACKED=0` restores MATE's choice for an A/B.
+/// * 17 rows and up -- the packed count lands in the 192 bucket. This build
+///   freezes only the *unpacked* tile 192, so these lengths run that
+///   instantiation in place of the one MATE would have chosen; 257 and up is
+///   MATE's own choice.
 /// * 0..=8 rows -- `rows * 8` buckets below 128, where MATE's rule has no
 ///   answer this build has frozen. Those lengths get the named error rather
 ///   than a neighbouring tile.
 ///
+/// The 9-16 and 17-256 substitutions are licensed by
+/// `mutlass_tile_choice_does_not_move_the_bits`, which runs the variants on the
+/// same input and requires bit-identical output.
+///
 /// PI0.5 reaches only the first two: its query lengths are 10 and 522.
+///
+/// `RequireExact` keeps MATE's packed tile for 9..=16 rows: the unpacked
+/// default is a fallback, not the measured route.
 #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
-fn mp31_fa_variant(tokens: usize) -> Option<MutlassFaVariant> {
+fn mp31_fa_variant(tokens: usize, tactic: TacticDispatch) -> Option<MutlassFaVariant> {
     match tokens {
         0..=8 => None,
+        9..=16 if !tactic.requires_exact() && unpacked_decode_enabled() => {
+            Some(MutlassFaVariant::UnpackedDecodeTile16)
+        }
         9..=16 => Some(MutlassFaVariant::PackedDecodeTile128),
         _ => Some(MutlassFaVariant::GeneralTile192),
     }
@@ -492,8 +520,9 @@ fn launch_mqa_mutlass(
     output: &Tensor,
     tokens: usize,
     key_tokens: usize,
+    tactic: TacticDispatch,
 ) -> Result<()> {
-    let Some(variant) = mp31_fa_variant(tokens) else {
+    let Some(variant) = mp31_fa_variant(tokens, tactic) else {
         return Err(Error::Other(format!(
             "MUSA attention::mqa_bf16 has no {} kernel for {tokens} query rows: \
              the vendored FMHA is frozen at MATE's tile 128 (9..=16 rows) and tile 192 (17 rows \
@@ -542,6 +571,7 @@ fn launch_mqa_mutlass(
     _output: &Tensor,
     _tokens: usize,
     _key_tokens: usize,
+    _tactic: TacticDispatch,
 ) -> Result<()> {
     Err(Error::Other(format!(
         "MUSA attention::mqa_bf16 has no {} kernel in this build: the vendored \
@@ -1051,9 +1081,8 @@ fn launch_split(
 
 // ── FP16 attention (not ported) ──────────────────────────────────────────
 //
-// The FP16 paths serve the `int8_dynamic` and `fp8_static` variants, which are
-// outside this port's scope. Signatures mirror
-// `apxinf-cuda/src/kernels/attention.rs`; `mqa_cached_f16` in particular is a
+// Signatures mirror `apxinf-cuda/src/kernels/attention.rs`; `mqa_cached_f16` in
+// particular is a
 // pure mublas path on the CUDA side (no kernel launch), so a port should not
 // assume it needs a kernel.
 
@@ -1264,8 +1293,7 @@ pub fn try_noncausal_batched_equal(
     n_heads: usize,
     head_dim: usize,
 ) -> Result<Option<Tensor>> {
-    if crate::MUSA_ARCH != "mp_22"
-        || !batched_equal_flash_shape(batch, tokens, n_heads, head_dim)
+    if !batched_equal_flash_shape(batch, tokens, n_heads, head_dim)
         || bf16_sdpa_mode() == Bf16SdpaMode::Legacy
     {
         return Ok(None);
@@ -1275,7 +1303,9 @@ pub fn try_noncausal_batched_equal(
         || require_3d_bf16(ctx, k, "batched noncausal", "k")? != expected
         || require_3d_bf16(ctx, v, "batched noncausal", "v")? != expected
     {
-        return Err(Error::Other("MUSA batched noncausal attention shape mismatch".into()));
+        return Err(Error::Other(
+            "MUSA batched noncausal attention shape mismatch".into(),
+        ));
     }
     #[cfg(apxinf_musa_available)]
     {
@@ -1292,6 +1322,208 @@ pub fn try_noncausal_batched_equal(
     }
     #[cfg(not(apxinf_musa_available))]
     {
+        Ok(None)
+    }
+}
+
+/// Route GR00T's DiT attention to the vendored MATE D48 kernel with an E4M3
+/// output, folding the output projection's activation scale into the epilogue.
+///
+/// Returns `Ok(None)` for every build, shape, dtype, or precision the kernel
+/// does not own, so the caller keeps the muDNN SDPA path. `activation_scale` is
+/// the o-projection's input scale; the kernel receives `1/activation_scale`
+/// and its E4M3 output is byte-compatible with the separate quantize path.
+pub fn try_gr00t_dit_e4m3(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    heads: usize,
+    head_dim: usize,
+    activation_scale: f32,
+) -> Result<Option<Tensor>> {
+    #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+    {
+        if heads != 32
+            || head_dim != 48
+            || !(activation_scale.is_finite() && activation_scale > 0.0)
+        {
+            return Ok(None);
+        }
+        if !is_3d_bf16_on(ctx, q) || !is_3d_bf16_on(ctx, k) || !is_3d_bf16_on(ctx, v) {
+            return Ok(None);
+        }
+        let (query_tokens, q_heads, q_dim) = require_3d_bf16(ctx, q, "gr00t dit", "q")?;
+        let (key_tokens, k_heads, k_dim) = require_3d_bf16(ctx, k, "gr00t dit", "k")?;
+        let (value_tokens, v_heads, v_dim) = require_3d_bf16(ctx, v, "gr00t dit", "v")?;
+        if query_tokens != 41
+            || q_heads != 32
+            || q_dim != 48
+            || k_heads != 32
+            || k_dim != 48
+            || v_heads != 32
+            || v_dim != 48
+            || value_tokens != key_tokens
+            || !matches!(key_tokens, 17 | 41 | 128)
+        {
+            return Ok(None);
+        }
+        let output = e4m3_tensor(ctx, &[query_tokens, q_heads, q_dim])?;
+        let status = unsafe {
+            crate::ffi::mutlass_fa::apxinf_musa_mutlass_fa_gr00t_d48_e4m3(
+                tensor_ptr(q)?,
+                tensor_ptr(k)?,
+                tensor_ptr(v)?,
+                tensor_ptr(&output)?,
+                checked_i32("gr00t dit", "query tokens", query_tokens)?,
+                checked_i32("gr00t dit", "key tokens", key_tokens)?,
+                1.0 / activation_scale,
+                ctx.stream().handle(),
+            )
+        };
+        crate::ffi::mutlass_fa::check_gr00t_fa(status, "GR00T DiT D48 attention")
+            .map_err(crate::error::musa_error)?;
+        Ok(Some(output))
+    }
+    #[cfg(not(all(apxinf_musa_available, apxinf_musa_mutlass_fmha)))]
+    {
+        let _ = (ctx, q, k, v, heads, head_dim, activation_scale);
+        Ok(None)
+    }
+}
+
+/// Packed-QKV sibling of [`try_gr00t_dit_e4m3`] for the self-attention's fused
+/// QKV projection. `qkv` is `[41, 3*heads*head_dim]` BF16; Q, K and V are
+/// columns 0/1536/3072 of the same 4608-wide row, so the kernel reads them
+/// with a `3 * heads * head_dim` row stride and no split kernel.
+pub fn try_gr00t_dit_e4m3_packed(
+    ctx: &MusaContext,
+    qkv: &Tensor,
+    heads: usize,
+    head_dim: usize,
+    activation_scale: f32,
+) -> Result<Option<Tensor>> {
+    #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+    {
+        if heads != 32
+            || head_dim != 48
+            || !(activation_scale.is_finite() && activation_scale > 0.0)
+        {
+            return Ok(None);
+        }
+        let [tokens, columns] = qkv.shape().dims() else {
+            return Ok(None);
+        };
+        if *tokens != 41
+            || *columns != 3 * heads * head_dim
+            || qkv.dtype() != DType::BF16
+            || qkv.device() != apxinf_core::Device::Musa(ctx.device_id())
+        {
+            return Ok(None);
+        }
+        let base = tensor_ptr(qkv)? as *const u8;
+        let row_bytes = heads * head_dim * std::mem::size_of::<u16>();
+        // SAFETY: the tensor is a contiguous `[41, 3*heads*head_dim]` BF16 row,
+        // so columns 1536 and 3072 are in-bounds at these byte offsets.
+        let key = unsafe { base.add(row_bytes) };
+        let value = unsafe { base.add(2 * row_bytes) };
+        let output = e4m3_tensor(ctx, &[*tokens, heads, head_dim])?;
+        let status = unsafe {
+            crate::ffi::mutlass_fa::apxinf_musa_mutlass_fa_gr00t_d48_e4m3_packed(
+                base as *const c_void,
+                key as *const c_void,
+                value as *const c_void,
+                tensor_ptr(&output)?,
+                checked_i32("gr00t dit packed", "query tokens", *tokens)?,
+                checked_i32("gr00t dit packed", "key tokens", *tokens)?,
+                1.0 / activation_scale,
+                ctx.stream().handle(),
+            )
+        };
+        crate::ffi::mutlass_fa::check_gr00t_fa(status, "GR00T DiT D48 packed attention")
+            .map_err(crate::error::musa_error)?;
+        Ok(Some(output))
+    }
+    #[cfg(not(all(apxinf_musa_available, apxinf_musa_mutlass_fmha)))]
+    {
+        let _ = (ctx, qkv, heads, head_dim, activation_scale);
+        Ok(None)
+    }
+}
+
+/// Vision sibling of [`try_gr00t_dit_e4m3`]: batch=2 x 256 tokens, 16 heads,
+/// D=64, non-causal, with the vision output projection's activation scale
+/// folded into the E4M3 epilogue.
+pub fn try_gr00t_vision_e4m3(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batch: usize,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    activation_scale: f32,
+) -> Result<Option<Tensor>> {
+    #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+    {
+        if batch != 2
+            || tokens != 256
+            || heads != 16
+            || head_dim != 64
+            || !(activation_scale.is_finite() && activation_scale > 0.0)
+        {
+            return Ok(None);
+        }
+        if !is_3d_bf16_on(ctx, q) || !is_3d_bf16_on(ctx, k) || !is_3d_bf16_on(ctx, v) {
+            return Ok(None);
+        }
+        let (qt, qh, qd) = require_3d_bf16(ctx, q, "gr00t vision", "q")?;
+        let (kt, kh, kd) = require_3d_bf16(ctx, k, "gr00t vision", "k")?;
+        let (vt, vh, vd) = require_3d_bf16(ctx, v, "gr00t vision", "v")?;
+        let total = batch * tokens;
+        if qt != total
+            || qh != 16
+            || qd != 64
+            || kt != total
+            || kh != 16
+            || kd != 64
+            || vt != total
+            || vh != 16
+            || vd != 64
+        {
+            return Ok(None);
+        }
+        let output = e4m3_tensor(ctx, &[total, heads, head_dim])?;
+        let status = unsafe {
+            crate::ffi::mutlass_fa::apxinf_musa_mutlass_fa_gr00t_vision_d64_e4m3(
+                tensor_ptr(q)?,
+                tensor_ptr(k)?,
+                tensor_ptr(v)?,
+                tensor_ptr(&output)?,
+                checked_i32("gr00t vision", "tokens", total)?,
+                checked_i32("gr00t vision", "key tokens", total)?,
+                1.0 / activation_scale,
+                ctx.stream().handle(),
+            )
+        };
+        crate::ffi::mutlass_fa::check_gr00t_fa(status, "GR00T vision D64 attention")
+            .map_err(crate::error::musa_error)?;
+        Ok(Some(output))
+    }
+    #[cfg(not(all(apxinf_musa_available, apxinf_musa_mutlass_fmha)))]
+    {
+        let _ = (
+            ctx,
+            q,
+            k,
+            v,
+            batch,
+            tokens,
+            heads,
+            head_dim,
+            activation_scale,
+        );
         Ok(None)
     }
 }
@@ -1637,18 +1869,8 @@ pub fn noncausal_strided_qkv(
             } else {
                 let parts = split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?;
                 match launch_general_flash_bf16(
-                    ctx,
-                    &parts.q,
-                    &parts.k,
-                    &parts.v,
-                    1,
-                    n_heads,
-                    n_heads,
-                    dims[0],
-                    dims[0],
-                    head_dim,
-                    false,
-                    &output,
+                    ctx, &parts.q, &parts.k, &parts.v, 1, n_heads, n_heads, dims[0], dims[0],
+                    head_dim, false, &output,
                 ) {
                     Ok(()) => return Ok(output),
                     Err(error) => {
@@ -1897,13 +2119,15 @@ pub fn causal_gqa_prefill_bf16(
                 Ok(()) => {}
                 Err(error) => {
                     note_flash_fallback("causal GQA", &error);
-                    launch_causal_gqa_gemm(ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim)
-                        .map_err(|gemm| {
-                            Error::Other(format!(
-                                "MUSA causal GQA attention: flash failed ({error}); \
+                    launch_causal_gqa_gemm(
+                        ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim,
+                    )
+                    .map_err(|gemm| {
+                        Error::Other(format!(
+                            "MUSA causal GQA attention: flash failed ({error}); \
                                  GEMM fallback failed ({gemm})"
-                            ))
-                        })?;
+                        ))
+                    })?;
                 }
             }
         } else {
@@ -1949,7 +2173,9 @@ pub fn noncausal_strided_qkv_hdim96_bm64(
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{batched_equal_flash_shape, general_causal_gqa_flash_shape, general_noncausal_flash_shape};
+    use super::{
+        batched_equal_flash_shape, general_causal_gqa_flash_shape, general_noncausal_flash_shape,
+    };
 
     #[test]
     fn batched_flash_routes_only_measured_shape() {
@@ -1994,7 +2220,9 @@ mod tests {
     use apxinf_core::{DType, Shape};
 
     use crate::context::MusaContext;
-    use crate::kernels::attention::{mha_bf16, mqa_bf16, mqa_bf16_into_with, split_qkv_bias_bf16};
+    use crate::kernels::attention::{
+        mha_bf16, mqa_bf16, mqa_bf16_into, mqa_bf16_into_with, split_qkv_bias_bf16,
+    };
     use crate::kernels::attention::{ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM, VISION_HEAD_DIM};
     use crate::kernels::test_support::{
         from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values, zeros_as,
@@ -2152,11 +2380,11 @@ mod tests {
     #[ignore = "needs a MUSA device"]
     fn mqa_covers_all_three_assembly_variants() {
         let ctx = MusaContext::new(0).expect("MUSA device 0");
-        // General: a query length the packed decode layouts are not built for.
+        // MP22 general: a query length the packed decode layouts are not built for.
         check_mqa(&ctx, 33, 33, 33);
-        // Packed decode: ten rows, with a capacity outside the split-KV range.
+        // MP22 packed decode: ten rows, with a capacity outside the split-KV range.
         check_mqa(&ctx, 10, 20, 20);
-        // Split-KV: ten rows and the capacity the model actually presents.
+        // MP22 split-KV: ten rows and the capacity the model actually presents.
         check_mqa(&ctx, 10, 532, 532);
         // A key_tokens short of capacity is the reserved-prefix case: the tail
         // is poisoned and must not reach the softmax.
@@ -2179,7 +2407,11 @@ mod tests {
         ///
         /// The seeds are `check_mqa`'s, so a shape exercised there and here sees
         /// the same data and the two tests are looking at the same problem.
-        fn mqa_inputs(ctx: &MusaContext, tokens: usize, capacity: usize) -> (Tensor, Tensor, Tensor) {
+        fn mqa_inputs(
+            ctx: &MusaContext,
+            tokens: usize,
+            capacity: usize,
+        ) -> (Tensor, Tensor, Tensor) {
             let width = ASSEMBLY_HEADS * ASSEMBLY_HEAD_DIM;
             (
                 upload(
@@ -2238,7 +2470,10 @@ mod tests {
         /// The output's bits, after the stream has drained.
         fn output_bits(ctx: &MusaContext, output: &Tensor) -> Vec<u16> {
             ctx.stream().synchronize().expect("synchronise");
-            read_back(output).iter().map(|value| to_bf16_bits(*value)).collect()
+            read_back(output)
+                .iter()
+                .map(|value| to_bf16_bits(*value))
+                .collect()
         }
 
         /// Read a little-endian bf16 file as f32. Every one of these values is
@@ -2249,50 +2484,80 @@ mod tests {
             assert_eq!(bytes.len() % 2, 0, "{} is not a bf16 file", path.display());
             bytes
                 .chunks_exact(2)
-                .map(|pair| crate::kernels::test_support::from_bf16_bits(u16::from_le_bytes([pair[0], pair[1]])))
+                .map(|pair| {
+                    crate::kernels::test_support::from_bf16_bits(u16::from_le_bytes([
+                        pair[0], pair[1],
+                    ]))
+                })
                 .collect()
         }
 
-        /// The two vendored instantiations must agree bit for bit.
+        /// The instantiations the rule can select must agree bit for bit.
         ///
-        /// They tile the same arithmetic differently — tile 128 packed against
-        /// tile 192 unpacked — and `mp31_fa_variant` substitutes between them
-        /// for lengths MATE's own rule would have tiled another way. That
-        /// substitution is only defensible if the tiling moves no bits at all,
-        /// which is what this measures: at both of PI0.5's query lengths, and at
-        /// the lengths around the boundary the rule divides on.
+        /// They tile the same arithmetic differently, and `mp31_fa_variant`
+        /// substitutes between them: the unpacked tile 16 replaces the packed
+        /// tile for 9-16 rows, and the unpacked tile 192 stands in where MATE
+        /// would have packed. A substitution is only defensible if the tiling
+        /// moves no bits at all, which is what this measures.
         ///
-        /// If this fails, `mp31_fa_variant` must shrink to MATE's exact set and
-        /// a third instantiation must be frozen. Do not ship the substitution.
+        /// If a decode comparison fails, the tile-16 default must be withdrawn;
+        /// if a 17-and-up comparison fails, the tile-192 substitution must be.
         #[test]
         #[ignore = "needs a MUSA device"]
         fn mutlass_tile_choice_does_not_move_the_bits() {
             let ctx = MusaContext::new(0).expect("MUSA device 0");
-            // The shapes PI0.5 presents, then one on each side of the boundary
-            // between the two kernels: 16 is the last packed length, 17 the
-            // first the rule would have packed at 192, and 522 the first it
-            // leaves unpacked.
-            let shapes = [(10usize, 532usize), (10, 10), (16, 16), (17, 17), (33, 33), (522, 522)];
+            // The shapes PI0.5 presents, then one on each side of the boundaries
+            // the rule divides on: 16 is the last tile-16 length, 17 the first
+            // the rule would have packed at 192, and 522 the first it leaves
+            // unpacked.
+            let shapes = [
+                (10usize, 532usize),
+                (10, 10),
+                (16, 16),
+                (17, 17),
+                (33, 33),
+                (522, 522),
+            ];
             let mut first = None;
             for (tokens, key_tokens) in shapes {
                 let (q, k, v) = mqa_inputs(&ctx, tokens, key_tokens);
+                // Tile 16 is only a candidate where the rule can select it.
+                let variants: &[MutlassFaVariant] = if tokens <= 16 {
+                    &[
+                        MutlassFaVariant::PackedDecodeTile128,
+                        MutlassFaVariant::UnpackedDecodeTile16,
+                        MutlassFaVariant::GeneralTile192,
+                    ]
+                } else {
+                    &[
+                        MutlassFaVariant::PackedDecodeTile128,
+                        MutlassFaVariant::GeneralTile192,
+                    ]
+                };
                 let mut bits = Vec::new();
-                for variant in [MutlassFaVariant::PackedDecodeTile128, MutlassFaVariant::GeneralTile192] {
-                    let output = mqa_bf16_with_variant(&ctx, &q, &k, &v, tokens, key_tokens, variant);
+                for &variant in variants {
+                    let output =
+                        mqa_bf16_with_variant(&ctx, &q, &k, &v, tokens, key_tokens, variant);
                     bits.push(output_bits(&ctx, &output));
                 }
-                let differing = bits[0].iter().zip(&bits[1]).filter(|(a, b)| a != b).count();
-                println!(
-                    "  tile agreement [{tokens}x{key_tokens}]  {differing} of {} elements differ",
-                    bits[0].len()
-                );
-                assert_eq!(
-                    differing, 0,
-                    "the two mp_31 instantiations disagree on {differing} of {} elements at \
-                     [{tokens}x{key_tokens}]; mp31_fa_variant may not substitute between them",
-                    bits[0].len()
-                );
-                // A shape whose two variants agree because both wrote the same
+                for (index, other) in bits.iter().enumerate().skip(1) {
+                    let differing = bits[0].iter().zip(other).filter(|(a, b)| a != b).count();
+                    println!(
+                        "  tile agreement [{tokens}x{key_tokens}] packed vs {:?}: \
+                         {differing} of {} elements differ",
+                        variants[index],
+                        bits[0].len()
+                    );
+                    assert_eq!(
+                        differing,
+                        0,
+                        "packed and {:?} disagree on {differing} of {} elements at \
+                         [{tokens}x{key_tokens}]; mp31_fa_variant may not substitute between them",
+                        variants[index],
+                        bits[0].len()
+                    );
+                }
+                // A shape whose variants agree because all wrote the same
                 // thing -- zeros, say -- would pass vacuously. Keep the first
                 // output to check against a different shape below.
                 first.get_or_insert(bits[0].clone());
@@ -2305,14 +2570,21 @@ mod tests {
                 &ctx,
                 &mqa_bf16_with_variant(&ctx, &q, &k, &v, 17, 17, MutlassFaVariant::GeneralTile192),
             );
-            let shared = first.as_ref().expect("a first shape").len().min(other.len());
+            let shared = first
+                .as_ref()
+                .expect("a first shape")
+                .len()
+                .min(other.len());
             let shared_differing = first.as_ref().unwrap()[..shared]
                 .iter()
                 .zip(&other[..shared])
                 .filter(|(a, b)| a != b)
                 .count();
             let ratio = shared_differing as f64 / shared as f64;
-            println!("  negative control: {:.1}% of the shared prefix differs", 100.0 * ratio);
+            println!(
+                "  negative control: {:.1}% of the shared prefix differs",
+                100.0 * ratio
+            );
             assert!(
                 ratio > 0.5,
                 "two different shapes agree on {:.1}% of their shared prefix, so this test \
@@ -2351,7 +2623,11 @@ mod tests {
                 if !shape_dir.is_dir() {
                     continue;
                 }
-                let name = shape_dir.file_name().unwrap().to_string_lossy().into_owned();
+                let name = shape_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 let Some((tokens, key_tokens)) = name
                     .trim_start_matches("shape-")
                     .split_once('x')
@@ -2405,7 +2681,8 @@ mod tests {
                     got.len()
                 );
                 assert_eq!(
-                    differing, 0,
+                    differing,
+                    0,
                     "{name}: {differing} of {} elements differ from MATE's own output, \
                      max_abs {max_abs:.3e}, cosine {cosine:.9}. This is the same kernel source \
                      compiled with the same flags, so a difference here is a fact about this \
@@ -2414,7 +2691,11 @@ mod tests {
                 );
                 compared += 1;
             }
-            assert!(compared > 0, "no shape-<tokens>x<key_tokens> directories in {}", directory.display());
+            assert!(
+                compared > 0,
+                "no shape-<tokens>x<key_tokens> directories in {}",
+                directory.display()
+            );
             println!("  replayed {compared} shapes bit for bit");
         }
     }
@@ -2605,7 +2886,72 @@ mod tests {
             TacticDispatch::RequireExact,
         )
         .expect_err("the general D256 assembly is a substitute");
-        assert!(error.to_string().contains("packed decode"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("packed decode") || message.contains("query rows"),
+            "{message}"
+        );
+    }
+    /// Per-call latency of the two attention shapes PI0.5 reaches.
+    ///
+    /// Host-timed over back-to-back launches on one stream. The launches are
+    /// asynchronous, so the per-iteration number is the device cost once the
+    /// loop is long enough to hide host dispatch. `mqa_bf16_into` is used so
+    /// the loop does not pay a driver allocation per call.
+    ///
+    /// `APXINF_MUSA_BENCH_DEVICE=1 cargo test -p apxinf-musa --release --lib \
+    ///  -- --ignored --nocapture bench_mqa_shapes`
+    #[test]
+    #[ignore = "needs a MUSA device; set APXINF_MUSA_BENCH_DEVICE"]
+    fn bench_mqa_shapes() {
+        let device = std::env::var("APXINF_MUSA_BENCH_DEVICE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let ctx = MusaContext::new(device).expect("MUSA device");
+        let iterations = 200usize;
+        for (tokens, capacity, key_tokens) in [
+            (10usize, 532usize, 532usize),
+            (10, 640, 640),
+            (10, 532, 500),
+            (522, 522, 522),
+        ] {
+            let width = ASSEMBLY_HEADS * ASSEMBLY_HEAD_DIM;
+            let q = upload(
+                &ctx,
+                &values(tokens * width, 0x9e37_79b9),
+                Shape::new(vec![tokens, ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM]),
+            );
+            let k = upload(
+                &ctx,
+                &values(capacity * ASSEMBLY_HEAD_DIM, 0x85eb_ca6b),
+                Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+            );
+            let v = upload(
+                &ctx,
+                &values(capacity * ASSEMBLY_HEAD_DIM, 0xc2b2_ae35),
+                Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+            );
+            let mut out = zeros_as(
+                &ctx,
+                Shape::new(vec![tokens, ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM]),
+                DType::BF16,
+            );
+            for _ in 0..5 {
+                mqa_bf16_into(&ctx, &q, &k, &v, &mut out, key_tokens).expect("mqa warm");
+            }
+            ctx.synchronize().expect("synchronise");
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                mqa_bf16_into(&ctx, &q, &k, &v, &mut out, key_tokens).expect("mqa");
+            }
+            ctx.synchronize().expect("synchronise");
+            let per_call = start.elapsed().as_secs_f64() * 1.0e6 / iterations as f64;
+            println!(
+                "  mqa tokens={tokens} capacity={capacity} keys={key_tokens}: \
+                 {per_call:.2} us/call"
+            );
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
     bf16_output, matrix_tensor, require_matrix_bf16, require_optional_vector_bf16,
-    require_output_matrix, output_tensor, require_dtype_on,
+    output_tensor, require_dtype_on, require_output_dtype_tensor, require_output_matrix,
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
@@ -138,6 +138,124 @@ pub fn bias_gelu_bf16_into(
     output: &mut Tensor,
 ) -> Result<()> {
     bias_activation_into(ctx, input, value, output, ACTIVATION_GELU)
+}
+
+/// Whether the fused E4M3 bias+GELU epilogue serves this width.
+///
+/// Mirrors the adapter's `cols % 8 == 0` vector check. Every device allocation
+/// from `MusaContext::allocate_output` is 256-byte aligned, so the pointer
+/// alignment the adapter also checks cannot fail on a model-path call.
+pub fn bias_gelu_e4m3_supported(cols: usize) -> bool {
+    cols % 8 == 0
+}
+
+/// Bias plus GELU writing E4M3, as one launch.
+///
+/// The kernel rounds to BF16 before applying `scale`'s reciprocal, so the bytes
+/// match `bias_gelu_bf16_into` followed by `quantize_fixed_e4m3`.
+pub fn bias_gelu_bf16_e4m3_into(
+    ctx: &MusaContext,
+    input: &Tensor,
+    value: Option<&Tensor>,
+    output: &mut Tensor,
+    scale: f32,
+) -> Result<()> {
+    let (rows, cols) = require_matrix_bf16(ctx, input, "bias gelu", "input")?;
+    require_optional_vector_bf16(ctx, value, cols, "bias gelu", "bias")?;
+    require_output_dtype_tensor(
+        ctx,
+        output,
+        &[rows, cols],
+        DType::F8E4M3,
+        "bias gelu",
+        "out",
+    )?;
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    if !bias_gelu_e4m3_supported(cols) {
+        return Err(Error::Other(format!(
+            "MUSA bias_gelu_e4m3: no fused kernel for width {cols}"
+        )));
+    }
+    launch_e4m3(
+        ctx,
+        input,
+        value,
+        output,
+        rows,
+        cols,
+        ACTIVATION_GELU,
+        inverse_scale,
+    )
+}
+
+/// Bias plus GELU writing E4M3, as one launch, returning a new tensor.
+///
+/// The consumer (the following FC2 projection) then takes the E4M3 tensor
+/// directly, so the vision block drops both the BF16 round trip of the
+/// `[512,4096]` FC1 output and the separate quantize launch.
+pub fn bias_gelu_bf16_e4m3(
+    ctx: &MusaContext,
+    input: &Tensor,
+    value: Option<&Tensor>,
+    scale: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = require_matrix_bf16(ctx, input, "bias gelu", "input")?;
+    let mut output = output_tensor(
+        ctx,
+        input.shape().clone(),
+        DType::F8E4M3,
+        crate::workspace::output_buffer(ctx, rows * cols)?,
+    );
+    bias_gelu_bf16_e4m3_into(ctx, input, value, &mut output, scale)?;
+    Ok(output)
+}
+
+/// The fused E4M3 launch, split by whether this build has a MUSA toolkit.
+#[cfg(apxinf_musa_available)]
+fn launch_e4m3(
+    ctx: &MusaContext,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    output: &Tensor,
+    rows: usize,
+    cols: usize,
+    activation: i32,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("bias_activation_e4m3", "rows", rows)?;
+    let cols = checked_i32("bias_activation_e4m3", "cols", cols)?;
+    let bias_pointer = optional_tensor_ptr(bias)?;
+    // SAFETY: the checks above established a BF16 `[rows, cols]` input, an
+    // optional BF16 bias of `cols` and an E4M3 `[rows, cols]` output, all on
+    // this context's device and alive across the asynchronous launch.
+    unsafe {
+        ffi::check_runtime(ffi::custom::apxinf_musa_bias_activation_bf16_e4m3(
+            tensor_ptr(input)?,
+            bias_pointer,
+            tensor_ptr(output)?,
+            rows,
+            cols,
+            activation,
+            inverse_scale,
+            ctx.stream().handle(),
+        ))
+        .map_err(musa_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(apxinf_musa_available))]
+fn launch_e4m3(
+    _ctx: &MusaContext,
+    _input: &Tensor,
+    _bias: Option<&Tensor>,
+    _output: &Tensor,
+    _rows: usize,
+    _cols: usize,
+    _activation: i32,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable("activation::bias_gelu_bf16_e4m3_into"))
 }
 
 /// Bias plus SiLU.
@@ -304,7 +422,98 @@ fn launch_geglu(
     Err(native_unavailable("activation::geglu_bf16"))
 }
 
-// ── FP16 and FP8-output activation (not ported) ──────────────────────────
+/// Gated GELU written directly as static E4M3.
+///
+/// Same arithmetic as [`geglu_bf16_into`] followed by
+/// [`crate::kernels::quantization::quantize_fixed_e4m3`]. The fused kernel
+/// rounds the product to BF16 before converting, which is the composed pair's
+/// contract, so enabling the fusion cannot move the model's bytes.
+pub fn geglu_bf16_e4m3_into(
+    ctx: &MusaContext,
+    gate_up: &Tensor,
+    output: &mut Tensor,
+    scale: f32,
+    pair_width: usize,
+) -> Result<()> {
+    let (rows, cols) = require_matrix_bf16(ctx, gate_up, "geglu", "gate_up")?;
+    if cols % 2 != 0 {
+        return Err(Error::Other(format!(
+            "MUSA geglu expects an even inner dimension, got {cols}"
+        )));
+    }
+    let half = cols / 2;
+    if pair_width != 0
+        && (pair_width % 4 != 0 || pair_width > half || half % pair_width != 0)
+    {
+        return Err(Error::Other(format!(
+            "MUSA geglu pair width {pair_width} must divide {half}, be a multiple of 4, and not exceed it"
+        )));
+    }
+    require_output_dtype_tensor(
+        ctx,
+        output,
+        &[rows, half],
+        DType::F8E4M3,
+        "geglu",
+        "out",
+    )?;
+    let inverse_scale = super::quantization::checked_inverse_scale(scale)?;
+    launch_geglu_e4m3(
+        ctx,
+        gate_up,
+        output,
+        rows,
+        half,
+        pair_width,
+        inverse_scale,
+    )
+}
+
+#[cfg(apxinf_musa_available)]
+fn launch_geglu_e4m3(
+    ctx: &MusaContext,
+    gate_up: &Tensor,
+    output: &Tensor,
+    rows: usize,
+    inner: usize,
+    pair_width: usize,
+    inverse_scale: f32,
+) -> Result<()> {
+    let rows = checked_i32("geglu", "rows", rows)?;
+    let inner = checked_i32("geglu", "inner", inner)?;
+    let pair_width = checked_i32("geglu", "pair_width", pair_width)?;
+    // SAFETY: the shapes, dtype and device are established by the checks
+    // above, and both tensors outlive the asynchronous launch.
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_geglu_bf16_e4m3(
+                tensor_ptr(gate_up)?,
+                tensor_ptr(output)?,
+                rows,
+                inner,
+                pair_width,
+                inverse_scale,
+                ctx.stream().handle(),
+            ),
+            "geglu",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+fn launch_geglu_e4m3(
+    _ctx: &MusaContext,
+    _gate_up: &Tensor,
+    _output: &Tensor,
+    _rows: usize,
+    _inner: usize,
+    _pair_width: usize,
+    _inverse_scale: f32,
+) -> Result<()> {
+    Err(native_unavailable("activation::geglu_bf16_e4m3"))
+}
+
+// ── FP16 activation (not ported) ─────────────────────────────────────────
 
 pub fn bias_gelu_bf16_packed8(
     _ctx: &MusaContext,
@@ -323,13 +532,56 @@ pub fn bias_gelu_quant_bf16_e4m3(
     Err(not_ported("activation::bias_gelu_quant_bf16_e4m3"))
 }
 
+/// `silu(gate) * up`, written as static E4M3.
+///
+/// The BF16 product is rounded first and then converted with the same
+/// fixed-scale arithmetic [`super::quantization::quantize_fixed_e4m3`] uses,
+/// in one launch. The composed pair (`silu_mul_bf16` + `quantize_fixed_e4m3`)
+/// measured ~11.9 us/call for the text widths and paid a `[145,6144]` BF16
+/// round trip per layer.
 pub fn silu_mul_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _gate: &Tensor,
-    _up: &Tensor,
-    _scale: f32,
+    ctx: &MusaContext,
+    gate: &Tensor,
+    up: &Tensor,
+    scale: f32,
 ) -> Result<Tensor> {
-    Err(not_ported("activation::silu_mul_quant_bf16_e4m3"))
+    require_dtype_on(ctx, gate, DType::BF16, "silu multiply", "gate")?;
+    require_dtype_on(ctx, up, DType::BF16, "silu multiply", "up")?;
+    if gate.shape() != up.shape() || gate.numel() == 0 {
+        return Err(Error::Other(
+            "MUSA SiLU multiply requires equal non-empty input shapes".into(),
+        ));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other(format!(
+            "MUSA SiLU multiply E4M3 scale must be finite and positive, got {scale}"
+        )));
+    }
+    let output = output_tensor(
+        ctx,
+        gate.shape().clone(),
+        DType::F8E4M3,
+        crate::workspace::output_buffer(ctx, gate.numel())?,
+    );
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_silu_mul_bf16_e4m3(
+                tensor_ptr(gate)?,
+                tensor_ptr(up)?,
+                tensor_ptr(&output)?,
+                i64::try_from(gate.numel()).map_err(|_| {
+                    Error::Other("MUSA SiLU multiply element count overflow".into())
+                })?,
+                1.0f32 / scale,
+                ctx.stream().handle(),
+            ),
+            "silu_mul_quant_bf16_e4m3",
+        )?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("activation::silu_mul_quant_bf16_e4m3"));
+    Ok(output)
 }
 
 /// Bias plus SiLU in FP16.
@@ -375,12 +627,17 @@ mod tests {
     //! Needs a MUSA device, so it is `#[ignore]`d:
     //! `cargo test -p apxinf-musa --lib -- --ignored --nocapture`.
 
-    use apxinf_core::Shape;
+    use apxinf_core::{DType, Shape};
 
     use crate::context::MusaContext;
-    use crate::kernels::activation::{bias_gelu_bf16, bias_relu_bf16, bias_silu_bf16, geglu_bf16};
+    use crate::kernels::activation::{
+        bias_gelu_bf16, bias_gelu_bf16_e4m3_into, bias_gelu_bf16_into, bias_relu_bf16,
+        bias_silu_bf16, geglu_bf16, geglu_bf16_e4m3_into, geglu_bf16_into,
+    };
     use crate::kernels::elementwise::bias_bf16;
-    use crate::kernels::test_support::{from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values};
+    use crate::kernels::test_support::{
+        from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values, zeros_as,
+    };
 
     /// The kernel's own spellings, in f32, so the reference differs only where
     /// `tanhf`/`expf` differ between the host libm and the device.
@@ -582,5 +839,150 @@ mod tests {
         let error = geglu_bf16(&ctx, &gate_up).expect_err("an odd width has no gate/up split");
         assert!(error.to_string().contains("even inner dimension"), "{error}");
         println!("  geglu refused: {error}");
+    }
+
+    /// The fused E4M3 producer must be the composed pair's bytes, not merely
+    /// close: the FP8 calibration and every gold cosine were recorded against
+    /// the quantizer reading a materialized BF16 GeGLU.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn geglu_e4m3_matches_the_composed_pair_byte_for_byte() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let scale = 0.0721f32;
+        for (rows, inner) in [(3usize, 10usize), (10, 4096), (522, 32768)] {
+            let gate_up = upload(
+                &ctx,
+                &values(rows * 2 * inner, 0x51ed_270b),
+                Shape::new(vec![rows, 2 * inner]),
+            );
+            let mut activated = zeros_as(&ctx, Shape::new(vec![rows, inner]), DType::BF16);
+            geglu_bf16_into(&ctx, &gate_up, &mut activated).expect("bf16 geglu");
+            let mut composed = zeros_as(&ctx, Shape::new(vec![rows, inner]), DType::F8E4M3);
+            crate::kernels::quantization::quantize_fixed_e4m3(
+                &ctx,
+                &activated,
+                &mut composed,
+                scale,
+            )
+            .expect("standalone quantizer");
+
+            let mut fused = zeros_as(&ctx, Shape::new(vec![rows, inner]), DType::F8E4M3);
+            geglu_bf16_e4m3_into(&ctx, &gate_up, &mut fused, scale, 0).expect("fused geglu");
+            ctx.stream().synchronize().expect("synchronise");
+
+            let expected = crate::transfers::to_cpu(&composed)
+                .expect("composed back")
+                .as_f8_e4m3()
+                .expect("composed e4m3")
+                .to_vec();
+            let got = crate::transfers::to_cpu(&fused)
+                .expect("fused back")
+                .as_f8_e4m3()
+                .expect("fused e4m3")
+                .to_vec();
+            assert_eq!(
+                got, expected,
+                "geglu e4m3 [{rows} x {inner}] differs from the composed pair"
+            );
+            println!("  geglu e4m3 [{rows} x {inner}] byte-identical");
+        }
+    }
+
+    /// The pair-interleaved weight layout must be a permutation, not a
+    /// different computation: `pair_width = 64` over a permuted gate/up buffer
+    /// has to produce the half-split path's bytes.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn geglu_e4m3_pairs_match_the_half_split_byte_for_byte() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let scale = 0.0721f32;
+        let pair_width = 64usize;
+        for (rows, inner) in [(10usize, 4096usize), (3, 512)] {
+            let half = values(rows * 2 * inner, 0x0bad_c0de);
+            let half_up = upload(&ctx, &half, Shape::new(vec![rows, 2 * inner]));
+
+            // Permute [gate | up] into [g0..g63, u0..u63, g64..u64, ...].
+            let mut interleaved = vec![0.0f32; rows * 2 * inner];
+            for row in 0..rows {
+                let base = row * 2 * inner;
+                for col in 0..inner {
+                    let block = col / pair_width;
+                    let within = col % pair_width;
+                    let dst = 2 * pair_width * block + within;
+                    interleaved[base + dst] = half[base + col];
+                    interleaved[base + dst + pair_width] = half[base + inner + col];
+                }
+            }
+            let pairs = upload(&ctx, &interleaved, Shape::new(vec![rows, 2 * inner]));
+
+            let mut expected = zeros_as(&ctx, Shape::new(vec![rows, inner]), DType::F8E4M3);
+            geglu_bf16_e4m3_into(&ctx, &half_up, &mut expected, scale, 0).expect("half split");
+            let mut got = zeros_as(&ctx, Shape::new(vec![rows, inner]), DType::F8E4M3);
+            geglu_bf16_e4m3_into(&ctx, &pairs, &mut got, scale, pair_width)
+                .expect("pair interleaved");
+            ctx.stream().synchronize().expect("synchronise");
+
+            let expected = crate::transfers::to_cpu(&expected)
+                .expect("half split back")
+                .as_f8_e4m3()
+                .expect("half split e4m3")
+                .to_vec();
+            let got = crate::transfers::to_cpu(&got)
+                .expect("pairs back")
+                .as_f8_e4m3()
+                .expect("pairs e4m3")
+                .to_vec();
+            assert_eq!(
+                got, expected,
+                "pair-aware geglu [{rows} x {inner}] differs from the half split"
+            );
+            println!("  geglu pairs [{rows} x {inner}] byte-identical");
+        }
+    }
+
+    /// The fused E4M3 bias+GELU must be byte-identical to materializing the
+    /// BF16 activation and running the standalone quantizer.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn bias_gelu_e4m3_matches_the_composed_pair_byte_for_byte() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let scale = 0.0721f32;
+        for (rows, cols) in [(8usize, 16usize), (512, 4304)] {
+            let input = upload(
+                &ctx,
+                &values(rows * cols, 0x5eed_1234),
+                Shape::new(vec![rows, cols]),
+            );
+            let bias = upload(&ctx, &values(cols, 0x0bad_c0de), Shape::new(vec![cols]));
+            let mut bf16 = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::BF16);
+            bias_gelu_bf16_into(&ctx, &input, Some(&bias), &mut bf16).expect("bf16 gelu");
+            let mut composed = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F8E4M3);
+            crate::kernels::quantization::quantize_fixed_e4m3(
+                &ctx,
+                &bf16,
+                &mut composed,
+                scale,
+            )
+            .expect("standalone quantizer");
+            let mut fused = zeros_as(&ctx, Shape::new(vec![rows, cols]), DType::F8E4M3);
+            bias_gelu_bf16_e4m3_into(&ctx, &input, Some(&bias), &mut fused, scale)
+                .expect("fused bias gelu");
+            ctx.stream().synchronize().expect("synchronise");
+            let expected = crate::transfers::to_cpu(&composed)
+                .expect("composed back")
+                .as_f8_e4m3()
+                .expect("composed e4m3")
+                .to_vec();
+            let got = crate::transfers::to_cpu(&fused)
+                .expect("fused back")
+                .as_f8_e4m3()
+                .expect("fused e4m3")
+                .to_vec();
+            assert_eq!(
+                got, expected,
+                "bias_gelu e4m3 [{rows} x {cols}] differs from the composed pair"
+            );
+            println!("  bias_gelu e4m3 [{rows} x {cols}] byte-identical");
+        }
     }
 }

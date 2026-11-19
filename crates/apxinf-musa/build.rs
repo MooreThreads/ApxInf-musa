@@ -68,7 +68,10 @@ const KERNEL_INPUT_TREES: &[KernelTree] = &[
         path: "adapters",
         recursive: false,
         compiled: &["mu"],
-        includes: &["kernels/mutlass_fmha/tools"],
+        includes: &[
+            "kernels/mutlass_fmha/tools",
+            "kernels/mutlass_fmha/mate/data/mutlass/include",
+        ],
         vendor_flags: false,
         only_with_vendor_fmha: &["mutlass_fa_adapter.mu"],
     },
@@ -242,8 +245,8 @@ fn hash_bytes(hash: &mut u128, bytes: &[u8]) {
 /// edit retires a build it could not have changed — which costs a rebuild and
 /// nothing else.
 const NON_CODE_EXTENSIONS: &[&str] = &[
-    "md", "rst", "txt", "json", "toml", "ini", "cfg", "yaml", "yml", "csv", "log", "patch",
-    "diff", "py", "sh", "bash", "png", "jpg", "jpeg", "svg", "pdf",
+    "md", "rst", "txt", "json", "toml", "ini", "cfg", "yaml", "yml", "csv", "log", "patch", "diff",
+    "py", "sh", "bash", "png", "jpg", "jpeg", "svg", "pdf",
 ];
 
 /// Whether a file can reach code generation, and so whether its bytes belong in
@@ -445,8 +448,7 @@ fn main() {
     let library_directories = musa_library_directories(&musa_path);
     let mcc = musa_path.join("bin/mcc");
 
-    let toolkit_found =
-        include_dir.is_dir() && !library_directories.is_empty() && mcc.is_file();
+    let toolkit_found = include_dir.is_dir() && !library_directories.is_empty() && mcc.is_file();
 
     // The arch and the vendor decision are resolved before the build id, because
     // both are inputs to it. `select_musa_arch` only needs the compiler, so it is
@@ -522,6 +524,19 @@ fn main() {
             musa_arch::d256_route(&arch.mcc_arch, mutlass_fmha)
         });
     println!("cargo:rustc-env=APXINF_MUSA_D256_ROUTE={}", route.as_str());
+
+    // The FP8 route is arch-only: the vendor library the target links either
+    // has the E4M3 GEMM kernels or does not. Published here, before the
+    // no-toolkit return, so `lib.rs` can always read it.
+    let fp8_route = arch
+        .as_ref()
+        .map_or(musa_arch::Fp8Route::Unsupported, |arch| {
+            musa_arch::fp8_route(&arch.mcc_arch)
+        });
+    println!(
+        "cargo:rustc-env=APXINF_MUSA_FP8_ROUTE={}",
+        fp8_route.as_str()
+    );
 
     let Some(arch) = arch else {
         println!(

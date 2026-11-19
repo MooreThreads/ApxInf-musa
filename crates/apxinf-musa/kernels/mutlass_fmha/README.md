@@ -1,6 +1,6 @@
 # mp_31 D256 flash attention, vendored from MATE
 
-Two frozen instantiations of MATE's MUTLASS FMHA, plus the header subtrees they
+Three frozen instantiations of MATE's MUTLASS FMHA, plus the header subtrees they
 compile against. They are the whole of `attention::mqa_bf16` on mp_31, and they
 are what replaced the torch eager bridge on that target.
 
@@ -43,7 +43,7 @@ The headers were originally lifted from the MATE 0.2.7 **wheel**
 (the MATE release wheel, build commit
 `f4342ab7…`), and the wheel's `mate/data/` holds the same content as the public
 tag. Either reproduces this tree; the tag is the one a reader without a wheel
-can audit. The two `.mu` renders below still come from the wheel, because they
+can audit. The three `.mu` renders below still come from the wheel, because they
 are JIT output and no checkout carries them.
 
 Pin the tag, not a branch. Neither MATE 0.2.5 nor 0.3.0 vendors the same
@@ -73,17 +73,19 @@ equal the wheel's `mate/data` count (226 for 0.2.7 as checked in), and
 |---|---|---|---|
 | `fmha_fwd/mp31_decode_packed_tile128.mu` | `e016a4cf11909883a83cf16088bc2c0cb60b22782fa7c0d78f4cb731aa5c42bb` | `466886471796fde6752a09cf11dc7acf4fb8f3b01be562120a2c538543c978e4` | `fmha_fwd_4386cd8f…` |
 | `fmha_fwd/mp31_general_unpacked_tile192.mu` | `946c354ecb826ee8cba7660f38d347f7c30618a93215c23827f4253c02525c6f` | `41ea5a8739c9500a942359840ce36af0850b94ed50784c7d797c9d4e2bc61051` | `fmha_fwd_be3f5142…` |
+| `fmha_fwd/mp31_decode_unpacked_tile16.mu` | `b3e092613ee583f8cf7c7da4e0f9ed645d224d393ff9278c78d0d364ed583385` | `af93965b8c4e219af6e807e259d43c6854a2d4c53b83d6d4763e9007a0369db1` | `fmha_fwd_c225fad4…` |
 
-The rendered originals are the two files under `~/.cache/mate/0.2.7/mp31/generated/`.
+The rendered originals are the three files under `~/.cache/mate/0.2.7/mp31/generated/`.
 `tools/freeze_kernel.py` produced the checked-in files from them and is the only
 transform; run it again rather than editing a `.mu` by hand.
 
-## The two instantiations
+## The instantiations
 
-| | `TileM` | consumers | `IsPackGQA` | PI0.5 shape | where |
+| | `TileM` | warpgroups | `IsPackGQA` | PI0.5 shape | where |
 |---|---:|---:|---|---|---|
-| `mp31_decode_packed_tile128` | 128 | 2 | true | decode `10/532` | `crates/apxinf-model/src/pi05/model/blocks/bf16.rs` decode |
-| `mp31_general_unpacked_tile192` | 192 | 3 | false | prefill `522/522` | same file, prefix pass |
+| `mp31_decode_packed_tile128` | 128 | 2 | true | decode `10/532` | `mp31_fa_variant`; only with `APXINF_MUSA_FA_UNPACKED=0` |
+| `mp31_decode_unpacked_tile16` | 16 | 1 | false | decode `10/532` on mp_31 | `mp31_fa_variant`, default for 9-16 rows |
+| `mp31_general_unpacked_tile192` | 192 | 3 | false | prefill `522/522` | `mp31_fa_variant`, 17+ rows |
 
 MATE's tile rule (`fmha_utils.py::_get_fwd_kernel_config`, bf16, head dimension
 256/256, `head_ratio` 8) packs GQA up to 256 query rows, buckets the packed row
@@ -92,11 +94,21 @@ both are load-bearing:
 
 * Every query length from 257 up lands on the **same** config, so the frozen
   prefill kernel covers any prompt length the model can produce.
-* Only two of the instantiations that rule can express are frozen, so
+* Only the instantiations this tree freezes are reachable, so
   `kernels::attention::mp31_fa_variant` substitutes the unpacked tile for the
   packed one between 17 and 256 rows. PI0.5 never reaches that range; the
   substitution is licensed by `mutlass_tile_choice_does_not_move_the_bits`,
   which runs both variants on the same input and requires bit-identical output.
+
+The unpacked decode is the mp_31 port's answer to the packed tile's grid: with
+`IsPackGQA=true`, `SingleTileScheduler` launches `(num_blocks, num_head, batch)
+= (1, 1, 1)` for the model's ten-query pass, so one CTA walks all 532 keys and
+47 SMs idle. `pack_gqa=False` buckets `TileM` to 16 and the scheduler's head
+axis to `params.h = 8`, giving `(1, 8, 1)` — eight CTAs, no split, no combine,
+no metadata. Measured on an idle S5000: 22.28 µs vs 32.47 µs per call, with the
+same f32-reference error (6.1e-4, 37% of the test gate). `kernels::attention`
+selects it for 9–16 rows on mp_31 and keeps the packed kernel behind
+`APXINF_MUSA_FA_UNPACKED=0` for an A/B.
 
 ## What was changed, and what was not
 
@@ -168,7 +180,7 @@ never reaches the softmax.
 
 The scale is `1/sqrt(256)`. It is not a parameter: the tile shape and head
 dimension are compile-time constants of the instantiation, and 256 is the only
-head dimension these two kernels have.
+head dimension these kernels have.
 
 Grid, block and shared memory all come from the instantiation:
 `SingleTileScheduler::get_grid_shape` (a pure function of the scheduler
@@ -241,11 +253,35 @@ and `diff -r` is the audit.
 
 ## Measured
 
-The device payload of each checked-in `.mu` is **bit-identical** to the object
-MATE itself compiled — `.mt_fatbin` 68321 bytes `2a19cea5…` and 51945 bytes
-`3ac6039f…` respectively.
+The device payload of the two pre-existing checked-in `.mu` renders is
+**bit-identical** to the object MATE itself compiled — `.mt_fatbin` 68321 bytes
+`2a19cea5…` and 51945 bytes `3ac6039f…` respectively. No comparison is
+recorded for the tile-16 render, which was frozen without a MATE-built object.
 
 | | |
 |---|---|
-| object size | 105184 / 88320 bytes (MATE's own: 751536 / 768408 — the difference is `tvm_ffi` and the `MATE_CHECK` error machinery) |
-| device payload | identical to MATE's, both variants |
+| object size | 105184 / 88320 bytes (both originals; MATE's own: 751536 / 768408 — the difference is `tvm_ffi` and the `MATE_CHECK` error machinery) |
+| device payload | identical to MATE's for the two compared renders; tile 16 not compared |
+
+## GR00T attention variants
+
+Three hand-specialized copies cover GR00T N1.7's attention shapes. They are
+derived from `mp31_decode_unpacked_tile16.mu` (the checked-in render, itself
+frozen from MATE 0.2.7), not from the MATE wheel and not by
+`tools/freeze_kernel.py`: the `constexpr` config block and the host entry were
+edited, while the four `using` aliases and the launch contract are unchanged.
+Each file's header lists its own config and host-entry edits.
+
+| file | heads | head dim | tile / stages | rows | use |
+|---|---:|---:|---|---:|---|
+| `mp31_gr00t_dit_d48_e4m3` | 32 | 48 (tile 64) | 64x64, 2/2 | 41 vs 41/17/128 | DiT cross attention |
+| `mp31_gr00t_dit_d48_e4m3_packed` | 32 | 48 (tile 64) | 64x64, 2/2 | 41 | DiT self attention (packed QKV, 3x row stride) |
+| `mp31_gr00t_vision_d64_e4m3` | 16 | 64 | 256x64, 2/2 | 2x256 | vision tower |
+
+All three set `ElementOut = mutlass::float_e4m3_t` and take an `output_scale`
+argument; `epilogue_fwd.hpp` multiplies the FP32 accumulator by it before the
+E4M3 conversion, folding the output projection's activation scale into the
+attention epilogue. `1.0f` is an exact no-op for the D256/BF16 paths, which is
+why the existing instantiations are untouched. `kernels::attention::try_gr00t_*`
+dispatches them unconditionally when the shape and precision match; every other
+case stays on the muDNN SDPA.

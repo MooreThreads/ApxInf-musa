@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("devlocal/gr00t-n1d7/results/gr00t-bench.json"),
+        default=Path("devlocal/gr00t/results/gr00t-bench.json"),
     )
     parser.add_argument(
         "--binary",

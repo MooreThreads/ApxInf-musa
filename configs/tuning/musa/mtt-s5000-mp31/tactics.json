@@ -1,0 +1,281 @@
+{
+  "device_name": "MTT S5000",
+  "mp": 31,
+  "kernel_build_id": "musa-kb2-2c569d71b94009af9511c08f2f3ae68b",
+  "library_versions": {
+    "musa": 50200,
+    "mublas_lt": 101300,
+    "binaries": {
+      "libmublas.so.1.13.0": "file-v1:468825768:1783606185000000000",
+      "libmublasLt.so.1.13.0": "file-v1:9898472:1783606185000000000",
+      "libmudnn_base.so": "file-v1:201672:1783606226000000000",
+      "libmudnn_ops.so": "file-v1:373972784:1783606226000000000",
+      "libmudnn_tensor.so": "file-v1:278190192:1783606226000000000",
+      "libmudnn_tensor_binary.so": "file-v1:533894832:1783606227000000000",
+      "libmudnn_tensor_reduce.so": "file-v1:1086955128:1783606227000000000",
+      "libmudnn_tensor_unary.so": "file-v1:318801208:1783606226000000000",
+      "libmudnn_xmma.so": "file-v1:1532424696:1783606228000000000",
+      "libmudnncxx.so.3.4.0.0": "file-v1:739728:1783606226000000000",
+      "libmusa.so.5.3.0": "file-v1:16421136:1790239943000000000",
+      "libmusart.so.5.2.0": "file-v1:1456648:1783606184000000000"
+    }
+  },
+  "records": [
+    {
+      "backend": "mudnn",
+      "k": 256,
+      "layout": "kn",
+      "m": 1,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 1,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 1,
+      "n": 3072,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 512,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 512,
+      "n": 3072,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 512,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 512,
+      "n": 4096,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 4096,
+      "layout": "kn",
+      "m": 512,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 4096,
+      "layout": "kn",
+      "m": 128,
+      "n": 4096,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 4096,
+      "layout": "kn",
+      "m": 128,
+      "n": 2048,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 145,
+      "n": 2048,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 145,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 145,
+      "n": 6144,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 6144,
+      "layout": "kn",
+      "m": 145,
+      "n": 2048,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 145,
+      "n": 8192,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 8192,
+      "layout": "kn",
+      "m": 145,
+      "n": 2048,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 132,
+      "layout": "kn",
+      "m": 1,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 1,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 17,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 2048,
+      "layout": "kn",
+      "m": 128,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 132,
+      "layout": "kn",
+      "m": 40,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 3072,
+      "layout": "kn",
+      "m": 40,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 40,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 41,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 41,
+      "n": 6144,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 6144,
+      "layout": "kn",
+      "m": 41,
+      "n": 1536,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 41,
+      "n": 4608,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1536,
+      "layout": "kn",
+      "m": 41,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 41,
+      "n": 1024,
+      "op": "bf16_gemm"
+    },
+    {
+      "backend": "mudnn",
+      "k": 1024,
+      "layout": "kn",
+      "m": 41,
+      "n": 132,
+      "op": "bf16_gemm"
+    },
+    {
+      "op": "bf16_gemm",
+      "m": 1,
+      "n": 1024,
+      "k": 1024,
+      "layout": "kn",
+      "backend": "mudnn"
+    },
+    {
+      "op": "bf16_gemm",
+      "m": 1,
+      "n": 3072,
+      "k": 1024,
+      "layout": "kn",
+      "backend": "mudnn"
+    }
+  ]
+}

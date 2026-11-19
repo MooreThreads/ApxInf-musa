@@ -145,16 +145,19 @@ removed legacy CUDA allocation switches are not MUSA counterparts.
 
 ## PI0.5 on MUSA
 
-`crates/apxinf-model/src/musa_pi05/` is self-contained: 18 files, no import of
+`crates/apxinf-model/src/musa_pi05/` is self-contained: 22 files, no import of
 `crate::pi05`. `scripts/check_model_family_boundaries.sh` enforces that in both
 directions. Differences from the upstream file a copy came from belong to the
 port; upstream changes to `pi05/` are audited against each copy's import
 watermark with [copy-drift-audit](../skills/copy-drift-audit/SKILL.md), so a fix
 upstream cannot pass the port by unnoticed.
 
-The layers follow `pi05/model/blocks/bf16.rs` operator for operator, with the
-same rounding points, so a stage-by-stage comparison is meaningful. Differences
-that do not change a value:
+The BF16 layers follow `pi05/model/blocks/bf16.rs` operator for operator, with
+the same rounding points, so a stage-by-stage comparison is meaningful. The
+static-FP8 route follows `pi05/model/blocks/fp8_static.rs` in operator order
+but keeps BF16 runtime intermediates (see the FP8 section below), so compare
+it within its own route rather than against `bf16.rs`. Differences that do not
+change a value:
 
 - Per-step modulation is a constant of the model (the flow schedule comes from
   config, the projections from the checkpoint), so it is built once at load and
@@ -171,9 +174,12 @@ that do not change a value:
 ### INT8 (W8A8)
 
 `model_variant=int8_dynamic` and `int8_dynamic_no_encode` run the route upstream
-and the integration branch define. `auto` still resolves to BF16 here: whether a projection
-can be quantized is a per-shape question, and MP22's `mp` number is not a compute
-capability. What the port adds to the device path:
+and the integration branch define. `auto` never selects INT8: whether a
+projection can be quantized is a per-shape question, and MP22's `mp` number is
+not a compute capability. On `mp_22` it stays BF16; on `mp_31` it selects
+`fp8_static` only when FP8 activation scales were supplied (a calibration
+profile or a `uniform:<scale>` bring-up scale). What the port adds to the
+device path:
 
 - The tiles read their dequantization scales as **FP16 with a 512-entry zero
   pad**, not f32, so the weight packer renders that vector once at load and the
@@ -269,17 +275,313 @@ not speed. The capture's arena is not CUDA's either — a measured INT8 capture
 touches 3.84 GB, so the reservation is the BF16 one rather than the doubled one
 upstream keeps for its INT32 accumulator and verifier.
 
-FP8 is **not ported**, and the port says so rather than silently degrading: an
-FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
-`fp8_static`.
+### FP8 (static E4M3)
+
+`model_variant=fp8_static` is the `mp_31` route. `mp_22` refuses it before
+weights load: its 8-bit tensor-core path is the INT8 `s8mma` assembly, it has no
+E4M3 MMA, and the port has no emulation fallback. The build publishes
+`FP8_ROUTE` (`mudnn` on `mp_31`, `unsupported` elsewhere). The model loader
+rejects `fp8_static` when that route is `unsupported` and when the device
+family is not `mp_31`; the FP8 kernel additionally requires
+`MusaArchFamily::has_native_fp8`.
+
+The GEMM is muDNN's FP8 MatMul: E4M3 operands, f32 accumulation, one `alpha`
+(`input_scale * weight_scale`) and a BF16 result. `libmudnn_xmma.so` carries the
+`MutlassKernelGemm<float_e4m3_t, float_e4m3_t, bfloat16_t>` instantiations.
+On S5000, muDNN measured 1.6-2.7x the muBLAS FP8 time on qkv, o and down,
+equal on up, and matched at the test's cosine 0.9999 gate (not byte equality);
+muBLAS is not part of the route.
+
+Static-FP8 preparation keeps the CUDA artifact contract:
+
+- weights: one per-tensor absmax scale, host F32 amax -> F16 rounding ->
+  `FixedScaleE4m3` on device;
+- activations: one calibrated per-tensor scale per site from `calibration.json`;
+  `uniform:<scale>` is accepted for bring-up but does not clear the accuracy
+  gate;
+- runtime intermediates stay **BF16** (the rest of this port), so the GEMM's one
+  rounding is BF16 rather than CUDA's F16. This is the deliberate numerical
+  difference; the calibration schema and site names are copied unchanged, so a
+  CUDA-generated profile is readable here.
+
+The producer quantizers are fused where the profile showed the extra pass
+mattered: GeGLU and the adaptive-gate residual RMSNorm write E4M3 directly
+(`kernels/custom/activation.cuh`, `fused.cuh`), rounding to BF16 before the
+conversion so the bytes match the composed pair. That removes 557 of the 919
+per-GEMM quantize launches. The attention-output quantize and the prefix/vision
+norm producers still compose.
+
+Decode attention on `mp_31` uses the unpacked `TileM=16` render of the vendored
+MATE kernel for 9–16 query rows (`mp31_decode_unpacked_tile16`). The packed
+render launches `(1, 1, 1)` for the model's ten-query pass — one CTA over all
+532 keys — while the unpacked one gives each of the eight heads a block,
+`(1, 8, 1)`. Measured on an idle S5000: 22.3 µs vs 32.5 µs per call.
+`APXINF_MUSA_FA_UNPACKED=0` keeps the packed kernel for an A/B.
+
+The end-to-end measurement on S5000 (L0, `require-graph`, 2 views, T=10) is
+**29.45 ms** against **34.71 ms** for tuned BF16 on the same idle card
+(1.18x), with the muDNN FP8 route and a one-observation calibration profile
+(cosine 0.999295 against the Orin reference; the accuracy gate is 0.999). The
+pre-optimization FP8 build measured 33.36 ms against the then-current 37.45 ms
+tuned BF16 (1.12x); the BF16 baseline also moved because the unpacked decode
+attention is shared by both routes. The measurement uses a one-observation
+profile for bring-up; a deployment should generate its profile from its own
+data:
+
+```bash
+python3 scripts/calibrate_pi05.py --model-dir <checkpoint> --device musa:0 \
+  --input-dir <observation-npz-dir> --output <checkpoint>/calibration.json
+```
+
+`scripts/bench_pi05_musa.py --model-variant fp8_static --calibration <json> \
+  --reference <gold-bundle>`
+runs the same L0 call the gate scores.
 
 ## GR00T N1.7 on MUSA
 
 `crates/apxinf-model/src/musa_gr00t/` is the independent MUSA port of the
-GR00T N1.7 model core. Its currently validated slice is BF16 on MP22/M1000 with
-batch 1, two camera grids, official preprocessed tensors, explicit initial
-noise, and dynamic text sequence lengths. The loader rejects FP8 and INT8
-instead of selecting another precision.
+GR00T N1.7 model core. Its validated slice is BF16 on MP22/M1000 and
+MP31/S5000, and calibrated static FP8 on MP31/S5000, with batch 1, two camera
+grids, official preprocessed tensors, explicit initial noise, and dynamic text
+sequence lengths. FP8 needs native E4M3 hardware and the muDNN route
+(`FP8_ROUTE == "mudnn"`); MP22 and route-less builds reject it at load instead
+of selecting another precision. INT8 is rejected on MUSA.
+
+The FP8 executor mirrors the CUDA static-FP8 boundaries: each backbone,
+vision and action-head linear gets a per-tensor E4M3 weight scale
+(`max_abs / 448`) and a per-consumer activation scale from the shared
+`apxinf.fp8-calibration.v1` profile, the GEMM's single `alpha` is
+`activation_scale * weight_scale`, and biases, normalization, attention and
+all intermediates stay BF16. The profile is produced on the target by the
+model-neutral Python `CalibrationRunner` through
+`ModelRunner._calibrate_preprocessed`; its checkpoint identity is the same
+versioned value the Rust loader recomputes. The MUSA E4M3 producers
+(`rms`/`layer`/`adaptive` norm, bias+GELU, SiLU-mul) are used where the
+executor's shape predicates admit them; the rest compose the BF16 producer
+with `quantize_fixed_e4m3`, which is byte-identical by construction.
+
+Measured on an idle S5000 (GPU 4, two views, 145 tokens, `require-graph`,
+Orin gold fixture): BF16 p50 **23.1 ms** (warmup 10 / 100 samples; cosine
+0.9999960, after regenerating the shipped `mtt-s5000-mp31` tactics database
+for the current kernel build) and static FP8 p50 **18.7 ms** (warmup 10 / 100
+samples; cosine 0.9999611, relative L2 0.008815, max_abs 0.0469;
+gates 0.997 / 0.10 / 0.125) after the 2026-11-17 fourth pass. FP8 started at
+29.36 ms; the first pass reached 24.36 ms with the duplicated-bias fix, the
+FFN `bias_gelu_bf16_e4m3_into` producer, concatenated DiT/vl QKV, E4M3
+LayerNorm widths 1024/1536/2048, and the dual-output adaptive LayerNorm. The
+second pass added:
+
+- a dual-output `layer_bf16_e4m3` producer: the FF input's BF16 and E4M3
+  values in one pass, removing the discarded second LayerNorm (1.35 ms);
+- `uses_quantized_output` so the FFN consumes that E4M3 tensor directly
+  instead of re-quantizing the BF16 producer;
+- a `[41,1536]` bias + residual + LayerNorm + E4M3 producer for the attention
+  output, using the same two BF16 roundings as `bias_bf16` followed by `add`;
+- a register-cached adaptive LayerNorm that loads the 41x1536 row once
+  (11.3 -> 6.7 us per block-step);
+- a four-pair vectorized weight+bias+RoPE producer for the vision QKV
+  (the pre-vectorization kernel measured 49.4 us per call; the vectorized
+  version removed about 0.3 ms end-to-end).
+
+The third pass added:
+
+- MP31 batched vision attention: `try_noncausal_batched_equal` no longer
+  refuses `mp_31`, and the FP8 execution enables
+  `USE_BATCHED_VISION_ATTENTION`. Each vision block's attention is one
+  `[2,256,16,64]` call instead of six row gathers, two segmented calls and a
+  concat (FP8 21.1-21.6 -> 20.7 ms; BF16 also benefits, 24.2-24.8 -> 23.7 ms);
+- muDNN's bias epilogue (`MatMul::RunWithBiasAdd`) for the fused self-QKV
+  projection: one GEMM + bias call instead of GEMM + `bias_bf16` (0.70 ms);
+- muDNN's bias + residual epilogue for the DiT FF down projection: one
+  GEMM + bias + residual call instead of GEMM + `bias_then_residual_bf16`
+  (0.39 ms);
+- a warp-per-row `qk_rms_norm_mrope_precomputed_bf16_warp_kernel`: one warp
+  owns one `(token, head)` row, the reduction is a warp shuffle and the
+  normalized row stays in registers (29.4 -> ~15 us per text layer, 0.26 ms);
+- the width-1024 vision residual+LayerNorm reuses the existing
+  `bias_residual_layer_norm_bf16_warp_kernel` template instead of the
+  block-per-row kernel (21.9 -> ~7 us per vision block, 0.32 ms).
+
+The fourth pass added four producer/launch fusions (FP8 19.48 -> 18.70 ms,
+p50, warmup 10 / 100; accuracy unchanged at cosine 0.9999611, relative L2
+0.008815, max_abs 0.0469):
+
+- the DiT cross-attention query projection uses the fused bias epilogue
+  (`forward_reusable_quantized_bias`) instead of a separate `bias_bf16`
+  launch (64 launches removed, 0.31 ms);
+- the text Qwen gated-MLP epilogue is one `silu_mul_bf16_e4m3` producer
+  instead of `silu_mul_bf16` + `quantize_fixed_e4m3`, removing the
+  `[145,6144]` BF16 round trip per text layer (16 launches);
+- the vision FC1 bias+GELU is written directly as E4M3 and the following
+  FC2 consumes it through `forward_quantized_tensor`, removing the
+  `[512,4096]` BF16 round trip and 28 quantize launches (0.35 ms);
+- the fixed-scale E4M3 quantizer processes eight BF16 per thread (16-byte
+  load / 8-byte store) when the buffers allow it, byte-identical to the
+  scalar form, which covers the remaining quantize calls.
+
+A BM64 small-M native FP8 GEMM (BM64, BN in {16,32,64,128}, BK256,
+SQMMA/TME) was implemented and measured during this pass and rejected: its
+output is bit-identical to muDNN, but it is slower on all four DiT M=41
+shapes (native/muDNN 1.10-1.20x against the 0.66x acceptance gate), and an
+e2e check with the plain `o`+`up` routes enabled measured 20.22 ms against
+18.71 ms. The measurement ledger is in `devlocal/gr00t/reports/`.
+
+FP8 is now about 23% faster than tuned BF16.
+
+The 2026-11-17 second pass moved FP8 18.743 -> 18.541 ms (p50, same fixture;
+cosine 0.9999610, relative L2 0.008837, max_abs 0.0469) with two changes: the
+adaptive LayerNorm's 1536-column form switched from `<128,3>` to `<384,1>`
+(probe 5.81 -> 4.45 us/call; E4M3 output byte-identical, BF16 within one ulp),
+and the text backbone's
+attention residual add and FF-input RMSNorm+E4M3 producer collapsed into
+`bias_residual_rms_e4m3_into` with `bias = None` (the fused kernel writes the
+same `bf16(projection + residual)` bytes the composed `add` did; the FP8
+weights expose it as `residual_rms_norm_quantized`). A native DiT noncausal
+attention kernel was written and rejected on measurement: three layouts ran
+85-95 us/call warm against muDNN's 12.02 us at (41 rows, 41/17/128 keys, 32
+heads, 48 dims), with the phase probe attributing 35 us to QK and 39 us to PV
+-- a SIMT implementation cannot approach the vendor's tensor-core SDPA (the
+gate was 8.4 us), so the attention route stops there. The text QKV wide-GEMM
+path (one `[145,4096,2048]` projection plus a one-launch Q|K|V split, with a
+group-max weight scale and no recalibration) replaced the three per-projection
+GEMMs: it also makes the text layer's fused RMS-norm + E4M3 producer
+reachable, so a layer emits one projection and one normalization kernel
+instead of three and two. Paired interleaved A/B on MUSA4 (2026-11-18) put it
+at 16.6234/16.6530 ms against 16.8673/16.6839 ms on the three-GEMM path; the
+three-GEMM form still runs for BF16 and for a calibration whose Q/K/V
+activation scales differ. The per-stage ledger and probes are
+in `devlocal/gr00t/`.
+
+The current dev-Yi pass moved FP8 18.541 -> **17.46 ms** (p50, four runs
+17.44-17.75, Orin fixture, cosine 0.9999584, relative L2 0.009127, max_abs
+0.0591; gates unchanged) with six producer/launch changes:
+
+- the DiT attention-output producer's 1536-column form switched from
+  `<128,3>` to `<384,1>` (probe 6.90 -> 4.13 us/call; `hidden` and the E4M3
+  output byte-identical, BF16 within one ulp; 128 calls, 0.39 ms);
+- the cross-attention K/V projections use the fused bias epilogue
+  (`linear_quantized_bias`) instead of `bias_bf16` (32 launches removed;
+  the ledger's `bias_activation_bf16_vector8` family falls 63 -> 18 calls);
+- the action head's state/action-encoder outputs, output projection and
+  decoder output quantize and then use the same fused bias epilogue, removing
+  one bias launch per site;
+- the text gated-MLP `silu_mul_bf16_e4m3` producer is vectorized eight lanes
+  per thread (byte-identical; 12.7 -> 12.2 us/call);
+- the vision QKV+bias+RoPE producer is specialized to the tower's fixed
+  16 heads x 64 dim: eight rotary pairs per thread with 32-bit shift/mask
+  indexing instead of the generic runtime-division form (probe 19.45 ->
+  7.22 us/call, q/k/v byte-identical; 24 calls, 0.29 ms);
+- the vision MLP boundary fuses residual + LayerNorm + E4M3 + the following
+  projection: `bias_residual_layer_norm_bf16_e4m3_block_kernel` is now
+  templated on its block shape and also covers width 1024 (256 threads x one
+  4-wide chunk; the 1152 form stays `<96,3>`), removing the BF16 normalized
+  intermediate and 24 quantize launches. The fused form's reduction tree
+  differs from the warp sibling, which is why the accuracy numbers moved by
+  ~0.5% relative while staying well inside the gates.
+
+A sixteenth-lane `bias_activation_bf16_e4m3` epilogue was measured and
+rejected: 6.79 us/call against 5.94 for the eight-lane form on [41,6144]
+(probe and msys ledger agree), so the launcher keeps the eight-lane kernel.
+The post-pass ledger is 1,861 kernels / 17.79 ms busy with the same
+803-call / 10.4 ms vendor FP8 GEMM and ~172-call / 2.2 ms attention budget;
+the remaining producer cost is ~5.0 ms across norm, quantize, activation,
+rope and residual launches.
+
+The remaining cost is the 803 vendor FP8 GEMMs (10.4 ms, 524 of them M=41) and
+the 196 muDNN attention calls (2.6 ms). A native MP31 plain-GEMM prototype
+(BM16/BN64/BK256 SQMMA/TME, `[N,K]` prepack) was measured and rejected: muDNN
+22.04 ms versus native 23.74 ms end-to-end, because the vendor's ~10.3 us
+small-M floor is a latency floor that a one/two-stage schedule does not beat;
+the `1f7cb0e` GeGLU win came from its fused epilogue, not the plain
+contraction. 60 Hz (16.67 ms) therefore remains out of reach on the current
+vendor stack. The next honest lever is the vendor's small-M FP8 GEMM (the
+measured shape table is in
+`devlocal/gr00t/reports/2026-11-16-ledger/native-gemm.md`), not
+another plain kernel route. Accuracy acceptance is unchanged by any of this
+work; it only moves where the quantizer runs.
+
+The 2026-11-17 pass extended the same measurement to two more native routes and
+rejected both: the tall-M vision/text/merger shapes (512/145 rows on the
+2D-grid kernel) ran at 2-5x muDNN's time (vision fc1 96 vs 19 us, text down
+73 vs 24 us), and a bias + GeLU + E4M3 epilogue for the DiT up projection
+measured 19.97 ms end-to-end against 19.51 ms for muDNN plus the
+`bias_gelu_bf16_e4m3` producer. The epilogue itself is not the cost -- the
+BM16/BN64/BK256 schedule is -- so the fused variant was removed after the
+measurement and the native plain-GEMM prototype was dropped; the default route
+remains muDNN.
+
+The 2026-11-18 pass measured the remaining precision-for-speed levers and
+rejected both. muDNN does expose a vendor GELU+bias epilogue, but only through
+`BatchMatMul::RunLt` with a `MatMulLtParam` (the `MatMul` class has no epilogue
+parameter), and FP8 output stays BF16, so the diT up projection still needs an
+E4M3 quantize after it. Measured on the DiT and vision shapes, the GELU-epilogue
+GEMM is ~2.6 us slower than the plain GEMM, which cancels the
+`bias_gelu_bf16_e4m3` producer it replaces (41x6144: 14.86 us composed versus
+14.88 us vendor; vision fc1: 26.18 versus 27.76). The E4M3 bytes were identical
+in all three shapes. Attention-output projections in BF16 were also rejected:
+muDNN BF16 is 10.7 us against 14.0 us for FP8 plus quantize in a hot-weight
+probe, but end to end it regressed 17.46 -> 17.87 ms, because keeping the BF16
+weight doubles that GEMM's per-layer-step weight traffic (2.36 -> 4.72 MB) and
+the shape is latency-bound. W4A16/FP4 have no MP31 vendor route (`arch == QY2`
+for the former, `>= PH1S` for the latter; MP31 is PH1), so the accuracy margin
+is not spendable on 4-bit weights.
+
+Kept from the pass: the prepared-input staging path (the only path now. The
+1.57 MB upload measures 203 us pageable/synchronous versus 73 us
+pinned/asynchronous; a 2026-11-18 ABBA on a loaded host measured -0.41 and
+-0.06 ms, median -0.13 ms, and the earlier quiet-host pass measured -0.05
+median / -0.16 mean), an
+eight-lane `add_bf16` (byte-identical; 5.86 ->
+5.30 us/call), and an eight-lane 1024-column vision residual LayerNorm
+(10.64 -> 8.37 us/call; the four-warp cross-warp sum moves the rounding
+boundaries by less than the gates). The full node ledger moved 17.786 ->
+17.748 ms; reverting the neutral quantize split leaves ~0.067 ms of
+kernel-time reduction plus the input-upload saving. The producer kernels are
+within one to two microseconds of the 48-CTA launch floor, so the remaining
+producer space is ~0.05 ms, not the 0.2-0.3 ms an earlier estimate suggested.
+Two wider-lane sweeps were measured and reverted: eight-lane 192-thread forms
+of the two DiT dual-LayerNorm kernels (bias_then_residual 5.94 vs 5.41 us,
+adaptive 5.46 vs 5.54) and a sixteen-pair vision QKV+RoPE form whose halved
+grid costs more than it saves (19.70 vs 10.70 us/call). A muBLAS-LT FP8 probe
+was also rejected: the OP_N column-major route measured 13-26x slower than
+muDNN on every DiT M=41 shape (133-266 us versus 8-15 us) and left the output
+zero, so the path is not usable on this toolkit.
+
+The 2026-11-18 attention pass replaced the DiT and vision SDPA with vendored
+MATE instantiations that write the output projection's E4M3 input directly.
+The DiT self-attention reads the fused QKV projection through a 4608-wide row
+stride (no split), the cross-attention runs the same kernel on separate Q/K/V,
+and the cross K/V input is quantized once per (source, scale) instead of once
+per layer (16 launches drop to 2). The vision tower uses a batch-2 x 256-token
+D64 sibling. The MATE epilogue gained `output_scale` (1.0f is an exact no-op,
+so the existing D256/BF16 paths are unchanged); the new instantiations pass
+`1/activation_scale` and store E4M3, which removes the 128 DiT and 24 vision
+post-attention quantizes.
+
+Paired A/B on GPU4 (145 tokens, require-graph, Orin gold): 17.45 ->
+17.15-17.18 ms; cosine 0.9999585, relative L2 0.0091, max_abs 0.0508 (better
+than stock's 0.9999528 / 0.0097 / 0.0625). The node ledger moves 17.668 ->
+17.530 ms busy and quantize 227 -> 98 calls (0.789 -> 0.387 ms); the MATE D48
+kernel itself measures 12.29 us against muDNN's ~12.0-12.5 us, so the gain is
+the fused quantize, not the attention math. The E4M3 text attention measured
+slower (17.18 -> 17.24 ms) and was removed. The DiT and vision variants are
+now selected unconditionally; every shape or precision the kernels do not own
+still falls through to muDNN, and a launch error leaves the SDPA path in
+place. (The text-QKV wide GEMM first measured 17.18 -> 17.57 ms and was left
+off; the 2026-11-18 pass re-measured it as 16.8673/16.6839 ms on the
+three-GEMM path against 16.6234/16.6530 ms fused, so it is now the FP8 path.)
+With prepared-input staging, the fixed-input run measures 17.04-17.11 ms on a
+loaded host (the 2026-11-18 ABBA pair: 17.04 vs 17.46 ms pageable).
+
+The same round fused the four VL self-attention blocks' two LayerNorms with the
+following projection's static-E4M3 quantizer (the 145x2048 scalar LayerNorm
+measured 15.15 us and each projection added a 3.2 us quantize). The fused
+producer writes normalized BF16 and E4M3 in one launch and the projection reads
+the E4M3 directly; BF16 and non-static-FP8 linears still take the composed path.
+Two paired runs measured -0.253 and +0.069 ms (median -0.09), so the kernel
+mechanism - eight 18.4 us producers replaced by four ~6 us dual producers -
+explains the mean; accuracy moves from cosine 0.99995849 / relative L2 0.00911
+/ max_abs 0.0508 to 0.99995668 / 0.00931 / 0.0547, still inside the gates.
 
 The backend keeps exact-shape acceleration behind model-neutral dispatchers.
 Measured GEMM variants, the MP22 scalar M=1 GEMV, muDNN attention, fused
@@ -430,16 +732,22 @@ and `--tactics DIR` names one explicitly — the directory, since the loader
 appends `tactics.json` itself.
 
 Records are bound to the kernel build id, the MP generation, the device name and
-the vendor library fingerprints. A database that does not match is ignored with
-a printed reason rather than silently used: a stale one measures another build,
-and copying one between machines is the usual way that happens.
+the toolkit version numbers. The load path decides whether the machine-local
+vendor library fingerprints are also compared: the unversioned
+`<device>-mp<N>` database is a hardware-class baseline, so it loads as
+`portable` and only the version numbers bind it (the file mtimes differ between
+machines, the versions do not). A version-qualified subdirectory or an explicit
+`--tactics` directory loads strict and requires the file fingerprints. A
+database that does not match is ignored with a printed reason rather than
+silently used: a stale one measures another build.
 
-No MUSA database is checked into this repository today. M1000's shapes are
-already covered closely enough that autotuning produces no measurable gain, so
-the directory above is an artifact of a local tuning run rather than a shipped
-file. A checkout without `configs/tuning/musa` is normal: every shape uses the
-safe default, and `cargo test -p apxinf-musa --lib` validates a database only
-when one is present. The same test covers an S5000 asset if one is added later.
+The MTT S5000 `mp_31` database is checked in under
+`configs/tuning/musa/mtt-s5000-mp31/`, written by `--autotune`. M1000's shapes
+are already covered closely enough that autotuning produces no measurable gain,
+so a M1000 directory, if present, is an artifact of a local tuning run rather
+than a shipped file. A checkout without a directory for the running device is
+normal: every shape uses the safe default, and
+`cargo test -p apxinf-musa --lib` validates a database only when one is present.
 
 Tuning itself is a load-time setting: `--tactics` and `--autotune` live in
 `LoadOptions` and are installed once before prepare or capture. They are not
@@ -545,13 +853,12 @@ measures the previous build, and nothing else tells you that.
 The MUSA GR00T BF16 path batches two independent 256-token vision segments
 with 16 heads and head dimension 64 into one muDNN Flash call. The output
 is contiguous `[512, 1024]`, avoiding the two-call path's final concatenation.
-The backend currently enables this route only for `mp_22`; other architectures
+The backend enables this route for `mp_22`; other architectures
 and unmeasured shapes retain the existing segmented path. Vendor errors are
 propagated rather than silently changing algorithms.
 
-Set `APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION=1` to retain the previous
-two-call path for same-binary A/B testing. The backend's legacy BF16 SDPA mode
-also bypasses batching. Keep prepared arena enabled, allocation cache disabled,
+The backend's legacy BF16 SDPA mode bypasses batching. Keep prepared arena
+enabled, allocation cache disabled,
 and use W10/R50 with required Graph execution for whole-model comparisons.
 For the fixed `libero-two-view` fixture, use the Orin normalized-action gold
 under `path_to/orin_gold/debug.npz`

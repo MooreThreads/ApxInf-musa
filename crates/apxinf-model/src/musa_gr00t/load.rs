@@ -7,6 +7,7 @@ use apxinf_core::{Device, Error, Result};
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 
 use super::assets;
+use super::model::executor::Gr00tPrecisionExecution;
 use super::model::precision;
 use super::weights::Gr00tWeights;
 use super::{backend, Gr00tConfig, Gr00tModelRunner};
@@ -36,16 +37,89 @@ pub(crate) fn load(path: &Path, device: Device, options: &LoadOptions) -> Result
             .map(|path| path.as_path()),
     )?;
     let config = Gr00tConfig::from_json_file(&root.join("config.json"))?;
-    let (backbone_config, weights) = Gr00tWeights::from_safetensors(&config, &backbone_path, root)?;
     let backend = backend::create(device)?;
+    let calibration = discover_calibration(root, options);
+    let precision = resolve_precision(options.precision, &backend, calibration.as_deref())?;
+    let (backbone_config, weights) = Gr00tWeights::from_safetensors(&config, &backbone_path, root)?;
     install_tactics(&backend, root, options)?;
-    let executor = precision::build(config, backbone_config, weights, backend)?;
-    let runner = Gr00tModelRunner::new(executor);
+    match precision {
+        ModelPrecision::Fp8 => Ok(finish(
+            Gr00tModelRunner::new(precision::build_fp8(
+                root,
+                &backbone_path,
+                calibration
+                    .as_deref()
+                    .expect("resolve_precision requires a calibration profile"),
+                config,
+                backbone_config,
+                weights,
+                backend,
+            )?),
+            options,
+        )),
+        _ => Ok(finish(
+            Gr00tModelRunner::new(precision::build(config, backbone_config, weights, backend)?),
+            options,
+        )),
+    }
+}
+
+fn finish<E: Gr00tPrecisionExecution>(
+    runner: Gr00tModelRunner<E>,
+    options: &LoadOptions,
+) -> LoadedModel {
     let runner = match options.execution_policy {
         Some(policy) => runner.with_execution_policy(policy),
         None => runner,
     };
-    Ok(LoadedModel::Vla(Box::new(runner)))
+    LoadedModel::Vla(Box::new(runner))
+}
+
+/// The explicit `calibration_path`, else `<model_dir>/calibration.json` when
+/// it exists. The GR00T contract keeps calibration an external deployment
+/// artifact, so a missing file is reported by `resolve_precision`, not created.
+fn discover_calibration(root: &Path, options: &LoadOptions) -> Option<PathBuf> {
+    if let Some(path) = &options.calibration_path {
+        return Some(path.clone());
+    }
+    let default = root.join("calibration.json");
+    default.is_file().then_some(default)
+}
+
+/// Resolve the requested precision against this device and build.
+///
+/// `auto` stays BF16 exactly like the CUDA family: a calibrated profile is an
+/// explicit deployment choice, never a silent one. FP8 requires native E4M3
+/// hardware (`mp_31`) and the muDNN route; there is no emulation fallback.
+fn resolve_precision(
+    requested: ModelPrecision,
+    backend: &backend::RuntimeBackend,
+    calibration: Option<&Path>,
+) -> Result<ModelPrecision> {
+    match requested {
+        ModelPrecision::Auto | ModelPrecision::Bf16 => Ok(ModelPrecision::Bf16),
+        ModelPrecision::Fp8 => {
+            let family = backend.context().arch_family();
+            if family != apxinf_musa::MusaArchFamily::Mp31 || apxinf_musa::FP8_ROUTE != "mudnn" {
+                return Err(Error::Other(format!(
+                    "GR00T FP8 requires an mp_31 build with the muDNN E4M3 route \
+                     (device family {family}, FP8_ROUTE={})",
+                    apxinf_musa::FP8_ROUTE
+                )));
+            }
+            if calibration.is_none() {
+                return Err(Error::Other(
+                    "GR00T FP8 requires a calibration profile: pass a calibration path or \
+                     place calibration.json in the model directory"
+                        .into(),
+                ));
+            }
+            Ok(ModelPrecision::Fp8)
+        }
+        other => Err(Error::Other(format!(
+            "MUSA GR00T supports auto, bf16, and fp8, not {other:?}"
+        ))),
+    }
 }
 
 fn select_tactics(default: &Path, legacy: &Path, options: &LoadOptions) -> Option<PathBuf> {
@@ -90,9 +164,9 @@ fn validate_options(options: &LoadOptions) -> Result<()> {
         ));
     }
     match options.precision {
-        ModelPrecision::Auto | ModelPrecision::Bf16 => Ok(()),
+        ModelPrecision::Auto | ModelPrecision::Bf16 | ModelPrecision::Fp8 => Ok(()),
         precision => Err(Error::Other(format!(
-            "MUSA GR00T currently supports BF16, not {precision:?}"
+            "MUSA GR00T supports auto, bf16, and fp8, not {precision:?}"
         ))),
     }
 }
@@ -124,12 +198,19 @@ mod tests {
 
     #[test]
     fn rejects_unimplemented_precisions() {
-        for precision in [ModelPrecision::Fp8, ModelPrecision::W8A8] {
-            let options = LoadOptions {
-                precision,
-                ..LoadOptions::default()
-            };
-            assert!(validate_options(&options).is_err());
-        }
+        let options = LoadOptions {
+            precision: ModelPrecision::W8A8,
+            ..LoadOptions::default()
+        };
+        assert!(validate_options(&options).is_err());
+    }
+
+    #[test]
+    fn accepts_explicit_fp8_request() {
+        let options = LoadOptions {
+            precision: ModelPrecision::Fp8,
+            ..LoadOptions::default()
+        };
+        validate_options(&options).unwrap();
     }
 }

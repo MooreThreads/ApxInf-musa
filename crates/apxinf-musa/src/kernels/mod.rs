@@ -15,8 +15,6 @@ pub mod activation;
 pub mod attention;
 pub mod cache;
 mod contracts;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub mod elementwise;
 pub mod embedding;
 pub mod fused;
@@ -25,6 +23,8 @@ pub mod norm;
 pub mod preprocess;
 pub mod quantization;
 pub mod rope;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 
@@ -62,10 +62,7 @@ impl TacticDispatch {
 /// Every native operator in this crate reaches its kernel the same way, so the
 /// two lines it takes are shared rather than repeated thirteen times.
 #[cfg(apxinf_musa_available)]
-pub(crate) fn check_native(
-    status: crate::ffi::musa::musaError_t,
-    operation: &str,
-) -> Result<()> {
+pub(crate) fn check_native(status: crate::ffi::musa::musaError_t, operation: &str) -> Result<()> {
     crate::ffi::check_runtime(status)
         .map_err(|message| crate::error::musa_error(format!("{operation}: {message}")))
 }
@@ -97,9 +94,6 @@ pub fn scratch_buffer(ctx: &crate::MusaContext, bytes: usize) -> Result<crate::M
 
 /// Zeroed scratch. Inside a workspace the arena is reused, so the clear is
 /// explicit rather than implied by a fresh allocation.
-pub fn scratch_buffer_zeroed(
-    ctx: &crate::MusaContext,
-    bytes: usize,
-) -> Result<crate::MusaBuffer> {
+pub fn scratch_buffer_zeroed(ctx: &crate::MusaContext, bytes: usize) -> Result<crate::MusaBuffer> {
     crate::workspace::output_buffer_zeroed(ctx, bytes)
 }

@@ -465,7 +465,7 @@ policy = AutoPolicy.from_pretrained("<path-to-model>", model_variant="bf16")
 | Precision | Where | Needs |
 |---|---|---|
 | `bf16` | every supported device; the default | the checkpoint alone |
-| `fp8_static` | Thor only, where it is the fastest path — Orin has no FP8 Tensor Cores | per-tensor activation scales |
+| `fp8_static` | Thor and MTT S5000 (mp_31); on the PI0.5 workload measured on MTT S5000 it is faster than BF16 — Orin and M1000 have no FP8 Tensor Cores | per-tensor activation scales |
 | `int8_dynamic` | W8A8, optimized for Orin (SM87) and Ada (SM89) | the checkpoint alone |
 
 ### FP8 calibration

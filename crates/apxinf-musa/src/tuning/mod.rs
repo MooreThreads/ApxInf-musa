@@ -49,17 +49,21 @@ fn next_generation() -> u64 {
 
 /// Persisted selection for one workload.
 ///
-/// Kept verbatim rather than decoded: the records in a real database describe
-/// provider-specific tactics, and no MUSA provider consumes one yet. What is
-/// checked here is that the file is a database at all, and that it does not
-/// name a CUDA provider — a `cublaslt` tactic id cannot be executed on M1000
-/// hardware, so silently accepting it would be the beginning of a wrong
-/// answer.
+/// Kept verbatim rather than decoded: the records describe the BF16 GEMM
+/// provider (muBLAS or muDNN) for a shape, and a record is accepted only when
+/// its fingerprint binds it to this build, device and toolkit. What is checked
+/// here is that the file is a database at all, and that it does not name a CUDA
+/// provider — a `cublaslt` tactic id cannot be executed on MUSA hardware, so
+/// silently accepting it would be the beginning of a wrong answer.
 #[derive(Clone, Debug, Default)]
 pub struct TuningDb {
     records: Vec<serde_json::Value>,
     device_name: Option<String>,
     fingerprint: Fingerprint,
+    /// Whether the loading path is the hardware-class baseline. Set by
+    /// [`TuningPaths::load_database`], never read from the file: portability is
+    /// a property of the directory a database is loaded from, not of its bytes.
+    portable: bool,
 }
 
 /// What a typed record is bound to. Kept as the checked pieces rather than as
@@ -77,15 +81,20 @@ impl Fingerprint {
         Self {
             kernel_build_id: value["kernel_build_id"].as_str().map(str::to_string),
             mp: value["mp"].as_u64(),
-            library_versions: match value.get("library_versions") {
-                Some(versions) if versions.get("binaries").is_some() => Some(versions.clone()),
-                _ => None,
-            },
+            // Kept whole rather than only when `binaries` exists: a portable
+            // database still needs `musa`/`mublas_lt`, and the strict path
+            // below rejects a missing binary map on its own.
+            library_versions: value.get("library_versions").cloned(),
         }
     }
 }
 
 impl TuningDb {
+    /// Load a database without a path scope.
+    ///
+    /// Strict by default: a caller that knows where the database came from
+    /// should use [`TuningPaths::load_database`], which applies that path's
+    /// portability to the records it returns.
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
@@ -132,7 +141,14 @@ impl TuningDb {
                 .and_then(|name| name.as_str())
                 .map(str::to_string),
             fingerprint: Fingerprint::from_document(&value),
+            portable: false,
         })
+    }
+
+    fn from_json_file_in(path: impl AsRef<Path>, portable: bool) -> Result<Self> {
+        let mut database = Self::from_json_file(path)?;
+        database.portable = portable;
+        Ok(database)
     }
 
     pub fn device_name(&self) -> Option<&str> {
@@ -224,9 +240,6 @@ impl TuningDb {
         if self.device_name() != Some(caps.device_name.as_str()) {
             return Some("device changed");
         }
-        if versions.binaries.is_empty() {
-            return Some("the running library fingerprint could not be taken");
-        }
         let Some(stored) = &self.fingerprint.library_versions else {
             return Some("the database carries no library fingerprint");
         };
@@ -237,6 +250,18 @@ impl TuningDb {
             if stored.get(field) != current.get(field) {
                 return Some("vendor library changed");
             }
+        }
+        // The unversioned `<device>-mp<N>` database is a hardware-class
+        // baseline: the same toolkit build on another machine has the same
+        // version numbers but different file mtimes and sizes. The kernel build
+        // id, device, MP and version numbers above still bind it to this code
+        // and toolkit; only the machine-local file fingerprint is skipped.
+        // `self.portable` comes from the loading path, not from the file.
+        if self.portable {
+            return None;
+        }
+        if versions.binaries.is_empty() {
+            return Some("the running library fingerprint could not be taken");
         }
         // The mapped-library fingerprints are compared **per name, and only
         // where both sides have that name**. `library_fingerprints` reads
@@ -585,6 +610,10 @@ pub struct TuningPaths {
     pub directory: PathBuf,
     pub tactics: PathBuf,
     pub report: PathBuf,
+    /// The unversioned `<device>-mp<N>` baseline may move between machines with
+    /// the same toolkit build. Loading a database through this path makes it
+    /// portable; see [`Self::load_database`] and [`TuningDb::portable`].
+    pub portable: bool,
 }
 
 impl TuningPaths {
@@ -595,7 +624,9 @@ impl TuningPaths {
             caps.device_name.to_lowercase().replace(' ', "-"),
             caps.mp
         );
-        Self::for_directory(root.as_ref().join("musa").join(hardware))
+        let mut paths = Self::for_directory(root.as_ref().join("musa").join(hardware));
+        paths.portable = true;
+        paths
     }
 
     /// The version-qualified directory, for a database that pins library
@@ -627,6 +658,7 @@ impl TuningPaths {
             tactics: directory.join("tactics.json"),
             report: directory.join("tuning_report.json"),
             directory,
+            portable: false,
         }
     }
 
@@ -643,6 +675,15 @@ impl TuningPaths {
         Self::for_device(root, caps)
     }
 
+    /// Load the database this path names, with the path's portability scope.
+    ///
+    /// The file itself carries no portability flag: whether the machine-local
+    /// library fingerprints are compared is a property of where the database was
+    /// found, not of its bytes.
+    pub fn load_database(&self) -> Result<TuningDb> {
+        TuningDb::from_json_file_in(&self.tactics, self.portable)
+    }
+
     pub fn from_tactics(path: impl Into<PathBuf>) -> Self {
         let tactics = path.into();
         let directory = tactics
@@ -653,6 +694,7 @@ impl TuningPaths {
             report: directory.join("tuning_report.json"),
             directory,
             tactics,
+            portable: false,
         }
     }
 }
@@ -771,7 +813,6 @@ impl TuningSession {
     pub fn autotune_enabled(&self) -> bool {
         self.mode == TuningMode::AutoTune && !autotune_suppressed()
     }
-
 }
 
 thread_local! {
@@ -849,6 +890,7 @@ mod cache_tests {
                 mp: Some(22),
                 library_versions: serde_json::to_value(versions()).ok(),
             },
+            portable: false,
         }
     }
 
@@ -897,6 +939,63 @@ mod cache_tests {
             .is_empty());
     }
 
+    /// The unversioned baseline is hardware-class: another machine with the
+    /// same toolkit build has different library mtimes, not different versions.
+    #[test]
+    fn a_portable_database_ignores_machine_local_binary_fingerprints() {
+        let caps = caps();
+        let mut moved = versions();
+        moved
+            .binaries
+            .insert("libmublas.so".into(), "other-machine".into());
+
+        let mut portable = database(vec![record()]);
+        portable.portable = true;
+        assert_eq!(
+            portable
+                .build_store(&caps, &moved)
+                .bf16
+                .get(&(10, 8192, 1024)),
+            Some(&Bf16Provider::Mudnn)
+        );
+
+        // The semantic bindings still reject a different toolkit build.
+        let mut other_toolkit = moved.clone();
+        other_toolkit.musa += 1;
+        assert!(portable.build_store(&caps, &other_toolkit).bf16.is_empty());
+
+        let mut other_kernel = database(vec![record()]);
+        other_kernel.portable = true;
+        other_kernel.fingerprint.kernel_build_id = Some("other".into());
+        assert!(other_kernel.build_store(&caps, &moved).bf16.is_empty());
+
+        let mut other_mp = database(vec![record()]);
+        other_mp.portable = true;
+        other_mp.fingerprint.mp = Some(31);
+        assert!(other_mp.build_store(&caps, &moved).bf16.is_empty());
+
+        let mut other_device = database(vec![record()]);
+        other_device.portable = true;
+        other_device.device_name = Some("S5000".into());
+        assert!(other_device.build_store(&caps, &moved).bf16.is_empty());
+
+        // The strict scope keeps the old machine-bound behaviour.
+        assert!(database(vec![record()])
+            .build_store(&caps, &moved)
+            .bf16
+            .is_empty());
+    }
+
+    /// Portability is a property of the loading path, not of the file.
+    #[test]
+    fn hardware_paths_are_portable_and_explicit_paths_are_strict() {
+        let caps = caps();
+        let versions = versions();
+        assert!(TuningPaths::for_device("configs/tuning", &caps).portable);
+        assert!(!TuningPaths::for_directory("configs/tuning/explicit").portable);
+        assert!(!TuningPaths::for_device_toolkit("configs/tuning", &caps, &versions).portable);
+    }
+
     /// A rejected database must not leave its records behind.
     ///
     /// `record_bf16` writes `store.records` back stamped with the *current*
@@ -924,14 +1023,20 @@ mod cache_tests {
 
         let mut wrong_device = database(vec![record()]);
         wrong_device.device_name = Some("S5000".into());
-        assert!(wrong_device.build_store(&caps, &versions()).records.is_empty());
+        assert!(wrong_device
+            .build_store(&caps, &versions())
+            .records
+            .is_empty());
 
         // Malformed and duplicate rows are the other half of the same hole:
         // left in `records` they are written back, stay on disk and keep
         // rejecting the file on every load.
         let mut wrong_layout = database(vec![record()]);
         wrong_layout.records[0]["layout"] = serde_json::json!("nk");
-        assert!(wrong_layout.build_store(&caps, &versions()).records.is_empty());
+        assert!(wrong_layout
+            .build_store(&caps, &versions())
+            .records
+            .is_empty());
 
         let duplicate = database(vec![record(), record()]);
         assert!(duplicate.build_store(&caps, &versions()).records.is_empty());
@@ -1115,7 +1220,14 @@ mod cache_tests {
         for (query, recorded) in [(601, 600), (649, 600), (650, 600), (651, 700), (900, 700)] {
             assert_eq!(
                 store.lookup_bf16_bucket(query, 2048, 2048),
-                Some((recorded, if recorded == 600 { Bf16Provider::Mudnn } else { Bf16Provider::Mublas })),
+                Some((
+                    recorded,
+                    if recorded == 600 {
+                        Bf16Provider::Mudnn
+                    } else {
+                        Bf16Provider::Mublas
+                    }
+                )),
                 "m={query}"
             );
         }

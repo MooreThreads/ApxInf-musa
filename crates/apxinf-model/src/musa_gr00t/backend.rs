@@ -6,13 +6,15 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use apxinf_core::{Device, Error, Graph, Result, Tensor};
+use apxinf_core::{DType, Device, Error, Graph, Result, Shape, Tensor};
 
 pub(crate) use apxinf_musa::MusaBuffer as DeviceBuffer;
 pub(crate) use apxinf_musa::MusaContext as Context;
 
 pub(crate) mod transfers {
-    pub(crate) use apxinf_musa::transfers::{copy_cpu_to_device, to_cpu, to_device};
+    pub(crate) use apxinf_musa::transfers::{
+        copy_cpu_to_device_pinned, to_cpu, to_device, PinnedBuffer,
+    };
 }
 
 pub(crate) mod tuning {
@@ -132,6 +134,119 @@ impl RuntimeBackend {
 
     pub(crate) fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         kernels::elementwise::add(self.context(), a, b)
+    }
+
+    /// Quantize a BF16 activation to E4M3 with a fixed dequantization scale.
+    ///
+    /// The static-FP8 executor owns the scale (from the calibration profile);
+    /// the kernel receives its reciprocal.
+    pub(crate) fn quantize_e4m3(&self, input: &Tensor, scale: f32) -> Result<Tensor> {
+        let mut output = self
+            .context
+            .allocate_output(input.shape().clone(), DType::F8E4M3)?;
+        kernels::quantization::quantize_fixed_e4m3(&self.context, input, &mut output, scale)?;
+        Ok(output)
+    }
+
+    /// E4M3 x E4M3 contraction with a per-tensor dequantization factor,
+    /// accumulating in F32 and writing BF16.
+    pub(crate) fn matmul_fp8(
+        &self,
+        activation: &Tensor,
+        weight: &Tensor,
+        alpha: f32,
+    ) -> Result<Tensor> {
+        let a = activation.shape().dims();
+        let b = weight.shape().dims();
+        if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+            return Err(Error::Other(format!(
+                "GR00T FP8 GEMM shape mismatch: {a:?} @ {b:?}"
+            )));
+        }
+        let mut output = self
+            .context
+            .allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+        kernels::gemm::gemm_fp8_into(
+            &self.context,
+            activation,
+            weight,
+            &mut output,
+            alpha,
+            "gr00t fp8 linear",
+        )?;
+        Ok(output)
+    }
+
+    /// `activation @ weight + bias` in one muDNN call, for the static-FP8
+    /// linears whose bias is BF16.
+    pub(crate) fn matmul_fp8_bias(
+        &self,
+        activation: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        alpha: f32,
+    ) -> Result<Tensor> {
+        let a = activation.shape().dims();
+        let b = weight.shape().dims();
+        if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+            return Err(Error::Other(format!(
+                "GR00T FP8 bias GEMM shape mismatch: {a:?} @ {b:?}"
+            )));
+        }
+        let mut output = self
+            .context
+            .allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+        kernels::gemm::gemm_fp8_bias_into(
+            &self.context,
+            activation,
+            weight,
+            &mut output,
+            bias,
+            alpha,
+            "gr00t fp8 linear bias",
+        )?;
+        Ok(output)
+    }
+
+    /// `activation @ weight + residual + bias` in one muDNN call, for the
+    /// static-FP8 routes whose residual and bias are both BF16.
+    pub(crate) fn matmul_fp8_bias_residual(
+        &self,
+        activation: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        residual: &Tensor,
+        alpha: f32,
+    ) -> Result<Tensor> {
+        let a = activation.shape().dims();
+        let b = weight.shape().dims();
+        if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+            return Err(Error::Other(format!(
+                "GR00T FP8 bias+residual GEMM shape mismatch: {a:?} @ {b:?}"
+            )));
+        }
+        if residual.shape().dims() != [a[0], b[1]] {
+            return Err(Error::Other(format!(
+                "GR00T FP8 bias+residual residual expects [{}, {}], got {:?}",
+                a[0],
+                b[1],
+                residual.shape().dims()
+            )));
+        }
+        let mut output = self
+            .context
+            .allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+        kernels::gemm::gemm_fp8_bias_residual_into(
+            &self.context,
+            activation,
+            weight,
+            &mut output,
+            bias,
+            residual,
+            alpha,
+            "gr00t fp8 linear bias residual",
+        )?;
+        Ok(output)
     }
 
     pub(crate) fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {

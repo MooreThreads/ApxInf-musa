@@ -139,7 +139,10 @@ fn strip_ansi(line: &str) -> String {
 /// Detect the compute capability of device 0 from `musaInfo`, or say why not.
 fn detect_from_musa_info(musa_info: &Path) -> Result<String, String> {
     let output = Command::new(musa_info).output().map_err(|error| {
-        format!("musaInfo could not be run ({}): {error}", musa_info.display())
+        format!(
+            "musaInfo could not be run ({}): {error}",
+            musa_info.display()
+        )
     })?;
     parse_musa_info(
         output.status.success(),
@@ -153,7 +156,11 @@ fn detect_from_musa_info(musa_info: &Path) -> Result<String, String> {
 /// that reaches this host's glibc, so a failure without the shim says nothing
 /// about the arch name; that is what the retry is for. Without it the probe
 /// could only ever answer "unverified".
-fn validate_mcc_arch(mcc_path: &Path, arch: &str, host_math_shim: Option<&Path>) -> Result<(), String> {
+fn validate_mcc_arch(
+    mcc_path: &Path,
+    arch: &str,
+    host_math_shim: Option<&Path>,
+) -> Result<(), String> {
     let scratch = mcc::Scratch::new("arch");
     let source = scratch.source("probe.mu", "int main() { return 0; }\n")?;
     let object = scratch.object("probe");
@@ -316,6 +323,55 @@ pub const ASSEMBLY_ARCH: &str = "mp_22";
 /// measured on.
 pub const VENDOR_FMHA_ARCH: &str = "mp_31";
 
+/// The generation whose vendor library has a native FP8 GEMM.
+///
+/// `mp_31` (S5000/S4000) has E4M3 tensor-core MMA and muDNN ships the E4M3
+/// xmma kernels. `mp_22` has neither: its vendored MMA builder has no FP8 atom
+/// and the hardware's 8-bit GEMM path is the INT8 `s8mma` assembly. There is
+/// no emulation route.
+pub const FP8_ARCH: &str = "mp_31";
+
+/// Which FP8 GEMM provider a build runs.
+///
+/// `mp_31` has the vendor E4M3 kernels; every other generation reports the gap
+/// explicitly instead of silently falling back to BF16.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fp8Route {
+    /// `adapters/mudnn_adapter.mu::apxinf_musa_mudnn_fp8_gemm`.
+    Mudnn,
+    /// No native FP8 on this target; FP8 operators report themselves as gaps.
+    Unsupported,
+}
+
+impl Fp8Route {
+    /// The name `build.rs` publishes for this route.
+    ///
+    /// A string for the same reason [`D256Route::as_str`] is one: the library
+    /// has to report which route it took, and `lib.rs` asserts at compile time
+    /// that only these names can arrive.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Fp8Route::Mudnn => "mudnn",
+            Fp8Route::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// The one place the FP8 routing rule is written.
+///
+/// Unlike D256 there is no vendor gate to carry: the muDNN FP8 kernels are
+/// part of the toolkit the target already links, so the arch alone decides.
+/// Keeping the function even with one input is what lets `build.rs` publish an
+/// answer and `arch_gate.rs` recompute it, instead of two copies of
+/// `arch == "mp_31"` in two places.
+pub fn fp8_route(arch: &str) -> Fp8Route {
+    if arch == FP8_ARCH {
+        Fp8Route::Mudnn
+    } else {
+        Fp8Route::Unsupported
+    }
+}
+
 /// Which D256 attention kernel a build runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum D256Route {
@@ -405,7 +461,11 @@ mod tests {
         // `chars().all(...)` is true for the empty string; that is how `mp_`
         // used to come out of `APXINF_MUSA_ARCH=`.
         for value in ["", " ", "mp_", "\t"] {
-            assert_ne!(normalize_explicit(value).as_deref(), Some("mp_"), "{value:?}");
+            assert_ne!(
+                normalize_explicit(value).as_deref(),
+                Some("mp_"),
+                "{value:?}"
+            );
         }
     }
 
@@ -413,7 +473,8 @@ mod tests {
     /// swallowed. Measured on MUSA 5.2: exit 1, the text on stdout, in colour.
     #[test]
     fn a_failed_probe_carries_musainfo_s_own_diagnostic() {
-        let captured = "compiler: mcc\n\x1b[31merror: 'no MUSA-capable device is detected'(100) at \
+        let captured =
+            "compiler: mcc\n\x1b[31merror: 'no MUSA-capable device is detected'(100) at \
                         /go/build/musa_toolkit.cpp:130\x1b[0m\n\x1b[31merror: API returned error \
                         code.\n";
         let reason = parse_musa_info(false, captured).unwrap_err();
@@ -434,4 +495,3 @@ mod tests {
         );
     }
 }
-

@@ -4,9 +4,9 @@
 //! this module is only the ABI, plus the one vendor symbol that turns a status
 //! into words.
 //!
-//! No bindgen and no vendor crate, as in `ffi::musa`: the surface is two
-//! functions, and a generated binding would be larger than the thing it
-//! describes.
+//! No bindgen and no vendor crate, as in `ffi::musa`: the surface is the BF16
+//! entry point, two batched entries and the status string, and a generated
+//! binding would be larger than the thing it describes.
 
 use std::ffi::{c_char, c_void};
 

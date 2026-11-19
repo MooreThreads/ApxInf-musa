@@ -87,6 +87,9 @@ extern "C" {
         bytes: usize,
         stream: *mut c_void,
     ) -> musaError_t;
+    /// Page-locked host allocation used by the prepared-input staging path.
+    pub fn musaMallocHost(pointer: *mut *mut c_void, bytes: usize) -> musaError_t;
+    pub fn musaFreeHost(pointer: *mut c_void) -> musaError_t;
 
     pub fn musaStreamCreate(stream: *mut *mut c_void) -> musaError_t;
     pub fn musaStreamDestroy(stream: *mut c_void) -> musaError_t;
