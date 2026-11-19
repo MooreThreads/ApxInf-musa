@@ -211,6 +211,17 @@ capability. What the port adds to the device path:
   (`k = 588`), the action input and the action head — and the ViT MLP is zero
   padded from 4304 to 4352 so that it does not.
 
+PI0.5 vision attention defaults to the bundled `custom` Flash Attention on
+MP22 for B=2, H=16, T=256, D=72. Other shapes keep their normal dispatch.
+Set `APXINF_PI05_FA=custom` to require that kernel, `mudnn` to select the
+vendor path, or `auto` to allow fallback if the custom kernel fails.
+
+For PI0.5 eager and graph execution, set `APXINF_MUSA_PI05_WORKSPACE_MIB=128`
+to request exactly 128 MiB per workspace (134217728 bytes), without retrying
+at a larger capacity. Unset it to restore automatic sizing. Values must be
+positive whole MiB; invalid values are errors. This setting does not toggle
+pooling. Set `APXINF_MUSA_WORKSPACE_REPORT=1` to verify the selected capacity.
+
 Full-encode quantization needs per-channel equalization to clear the 0.999 gate:
 the encode layers' shared residual stream has outlier channels one `amax/127`
 row scale cannot cover. `APXINF_INT8_EQUALIZATION` names the checked-in
@@ -269,10 +280,46 @@ not speed. The capture's arena is not CUDA's either — a measured INT8 capture
 touches 3.84 GB, so the reservation is the BF16 one rather than the doubled one
 upstream keeps for its INT32 accumulator and verifier.
 
+The arena is pooled and the reservation is a ladder, not a constant.
+`GraphWorkspace` reuses a slice once the last tensor reading it drops
+(cuda-new's generation-tagged lease free list), and `capture_infer_impl` tries
+`required/8` and doubles up to the modeled bound, retrying only on
+`"workspace exhausted"` and capturing on the session that succeeded; the eager
+path runs the same ladder because an eager plan retains its session. On M1000
+(int8_dynamic, 3 views, 10 tokens) the modeled 5.64 GiB becomes a 704.5 MiB
+arena with a 105.0 MiB live peak, and the steady device footprint falls from
+11.1 to 6.0 GiB. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
+allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
+capacity/used/peak/attempts.
+
 FP8 is **not ported**, and the port says so rather than silently degrading: an
 FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 `fp8_static`.
 
+### Streaming int8 loads
+
+A real-checkpoint `int8_dynamic` load never materializes the whole host model.
+`CheckpointReader` opens SafeTensors shard headers only and reads one tensor's
+bytes on demand; `Int8DynamicWeights::from_checkpoint` feeds those tensors
+through `WeightSource` one layer at a time, folds them in F32, quantizes and
+uploads them, then drops the host copy before the next layer. The reader shares
+header parsing and the sharded index's wrong-shard, duplicate, missing and
+unsafe-path checks with the whole-file loader, and it rejects a non-forward or
+overflowing `data_offsets` entry before any tensor is exposed. The streaming
+path runs the same shape validation as `Pi05Weights::from_map`, including the
+six checkpoint-wide tensors (`token_embedding`, `multimodal_projector`,
+`action_in_proj`, `action_out_proj`, `time_mlp_in`, `time_mlp_out`); only the
+order in which checks are reached differs, because the streaming builder
+validates each tensor when it takes it. `bf16_to_device` copies a tensor
+already in BF16 straight to the device rather than round-tripping through F32;
+`Pi05Weights` and the BF16 path are unchanged. On M1000 with
+`pi05_libero_pytorch` (two camera views), the measured host peak falls from
+14.1 GiB to 2.1 GiB while the device weights and the L0 actions stay
+bit-identical; the largest remaining transients are the token embedding and the
+language gate/up group's F32 staging. Loading stays synchronous per group, so
+capture and replay are unchanged. `CheckpointReader` reads with
+`FileExt::read_exact_at`, so the loader targets Unix; CI is Linux and the MLX
+target is macOS.
 ## GR00T N1.7 on MUSA
 
 `crates/apxinf-model/src/musa_gr00t/` is the independent MUSA port of the

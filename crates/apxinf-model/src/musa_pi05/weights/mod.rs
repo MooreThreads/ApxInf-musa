@@ -4,6 +4,7 @@ mod bf16;
 mod host;
 mod int8_dynamic;
 mod packing;
+mod source;
 
 pub use bf16::*;
 pub use host::*;

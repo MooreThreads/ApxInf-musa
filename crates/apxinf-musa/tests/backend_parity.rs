@@ -155,6 +155,11 @@ const KNOBS: &[Knob] = &[
         note: "=legacy selects the MUSA legacy vision MHA; cuda-new no longer reads APXINF_MHA_NAIVE",
     },
     Knob {
+        name: "APXINF_PI05_FA",
+        counterpart: None,
+        note: "select PI0.5 vision FlashAttention provider: custom (default for MP22 D72), mudnn, or auto",
+    },
+    Knob {
         name: "APXINF_MUSA_BF16_RMS",
         counterpart: None,
         note: "=scalar forces the language qkv input RMSNorm onto the scalar two-pass kernel; cuda-new has no matching switch",
@@ -177,6 +182,18 @@ const KNOBS: &[Knob] = &[
         note: "pad every arena allocation, so an out-of-bounds write lands in unused \
                memory instead of the next allocation. A diagnostic for a suspected \
                kernel overrun",
+    },
+    Knob {
+        name: "APXINF_MUSA_WORKSPACE_POOL",
+        counterpart: None,
+        note: "=0 restores the monotonic arena allocator; unset or any other value \
+               reuses a slice once the last tensor reading it drops",
+    },
+    Knob {
+        name: "APXINF_MUSA_WORKSPACE_REPORT",
+        counterpart: None,
+        note: "=1 prints the prepared arena's capacity, address high-water, peak live \
+               bytes and ladder attempts; cuda-new has no matching switch",
     },
     Knob {
         name: "APXINF_INT8_EQUALIZATION",

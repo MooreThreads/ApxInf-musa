@@ -550,6 +550,37 @@ impl MusaBuffer {
         })
     }
 
+    /// Create a bounds-checked view whose owner is supplied by the caller.
+    ///
+    /// The workspace's sub-allocator uses this to attach a per-slice lease:
+    /// when the last tensor reading the slice drops, the lease returns the
+    /// extent to the arena's free list. `owner` must keep the backing
+    /// allocation alive, directly or — as the lease does — by holding a clone
+    /// of this buffer.
+    pub(crate) fn view_with_owner(
+        &self,
+        byte_offset: usize,
+        len: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, String> {
+        let end = byte_offset
+            .checked_add(len)
+            .ok_or_else(|| "MUSA buffer view range overflow".to_string())?;
+        if end > self.len {
+            return Err(format!(
+                "MUSA buffer view [{byte_offset}..{end}] exceeds {} bytes",
+                self.len
+            ));
+        }
+        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        Ok(Self {
+            ptr,
+            len,
+            device: self.device,
+            owner,
+        })
+    }
+
     /// Borrow MUSA tensor storage as a buffer while retaining its allocation.
     pub fn from_tensor(tensor: &Tensor) -> Result<Self, String> {
         let device = match tensor.device() {
