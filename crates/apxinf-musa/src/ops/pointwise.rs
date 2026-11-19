@@ -2,7 +2,7 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
-use super::require_unit_output_scale;
+use super::{require_scaled_output, require_unit_output_scale, ScaledOutput};
 use crate::kernels::activation;
 use crate::kernels::elementwise;
 use crate::kernels::not_ported;
@@ -55,7 +55,6 @@ impl<'a> PointwiseArgs<'a> {
 }
 
 pub fn pointwise(ctx: &MusaContext, args: PointwiseArgs<'_>) -> Result<()> {
-    require_unit_output_scale("pointwise", args.output_scale)?;
     match args.semantic {
         PointwiseSemantic::Geglu => {
             if args.bias.is_some() || args.secondary.is_some() {
@@ -63,9 +62,15 @@ pub fn pointwise(ctx: &MusaContext, args: PointwiseArgs<'_>) -> Result<()> {
                     "MUSA pointwise geglu takes neither a bias nor a velocity".into(),
                 ));
             }
-            activation::geglu_bf16_into(ctx, args.input, args.out)
+            match require_scaled_output(args.out, args.output_scale, "pointwise geglu")? {
+                ScaledOutput::Bf16 => activation::geglu_bf16_into(ctx, args.input, args.out),
+                ScaledOutput::E4m3(scale) => {
+                    activation::geglu_bf16_e4m3_into(ctx, args.input, args.out, scale, 0)
+                }
+            }
         }
         PointwiseSemantic::BiasActivation => {
+            require_unit_output_scale("pointwise", args.output_scale)?;
             if args.secondary.is_some() {
                 return Err(Error::Other(
                     "MUSA pointwise bias activation takes no velocity".into(),
@@ -85,6 +90,7 @@ pub fn pointwise(ctx: &MusaContext, args: PointwiseArgs<'_>) -> Result<()> {
             }
         }
         PointwiseSemantic::EulerUpdate => {
+            require_unit_output_scale("pointwise", args.output_scale)?;
             let velocity = args.secondary.ok_or_else(|| {
                 Error::Other("MUSA pointwise Euler update requires a velocity tensor".into())
             })?;

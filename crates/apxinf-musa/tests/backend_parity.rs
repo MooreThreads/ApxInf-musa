@@ -160,9 +160,9 @@ const KNOBS: &[Knob] = &[
         note: "=scalar forces the language qkv input RMSNorm onto the scalar two-pass kernel; cuda-new has no matching switch",
     },
     Knob {
-        name: "APXINF_MUSA_FA_UNPACKED",
+        name: "APXINF_MUSA_BF16_SDPA_MODE",
         counterpart: None,
-        note: "=0 restores the packed MATE decode tile instead of the unpacked tile16 render for an A/B; cuda-new has no matching switch",
+        note: "selects direct, split or legacy BF16 SDPA dispatch; the default is direct and legacy is a fallback",
     },
     Knob {
         name: "APXINF_MUSA_BENCH_DEVICE",
@@ -173,6 +173,11 @@ const KNOBS: &[Knob] = &[
         name: "APXINF_MUSA_BENCH_COLD",
         counterpart: None,
         note: "=1 flushes device caches before each timed MUSA FP8 GEMM benchmark call; test-only",
+    },
+    Knob {
+        name: "APXINF_MUSA_ATTENTION_REAL_INPUT_DIR",
+        counterpart: None,
+        note: "folder of captured attention inputs for the ignored real-input device test; test-only",
     },
     Knob {
         name: "APXINF_MUSA_FA_REPLAY_DIR",

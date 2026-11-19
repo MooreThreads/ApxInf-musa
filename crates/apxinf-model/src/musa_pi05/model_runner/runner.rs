@@ -1,6 +1,7 @@
 //! PI0.5 runner: preparation, bounded plan cache, and per-call input binding.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,8 +15,7 @@ use crate::vla::{
 
 use super::prepare::CapturedGraph;
 use crate::musa_pi05::backend::{
-    self, ops, transfers, Context, DeviceBuffer, ExecutionSession,
-    ImageLayout as KernelImageLayout,
+    self, ops, transfers, Context, DeviceBuffer, ExecutionSession, ImageLayout as KernelImageLayout,
 };
 use crate::musa_pi05::model::ModelVariant;
 use crate::musa_pi05::Pi05Config;
@@ -173,6 +173,30 @@ impl Pi05PreparedInference {
         })?))
     }
 
+    /// The same eager traversal as `run_eager`, with the BF16 activation
+    /// observer installed by `ModelVariant::calibrate`.
+    fn calibrate_eager(
+        &self,
+        inputs: &EagerInputs,
+        request: &VlaRequest<'_>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.update_eager_inputs(inputs, request)?;
+        // Calibration is its own prepare pass: the modulation replay runs
+        // GEMMs the inference prepare pass never reaches (inference reads the
+        // precomputed modulation), so `with_session` would reject those shapes
+        // by name. `prepare_with_session` records them while the observer
+        // collects, which is exactly the one-shot warm-up this needs.
+        ops::prepare_with_session(&inputs.session, || {
+            eager_traversal(&self.model, &self.spec, inputs, || {
+                self.model.calibrate(
+                    &inputs.patches,
+                    &inputs.token_ids,
+                    self.spec.token_count,
+                    &inputs.noise,
+                )
+            })
+        })
+    }
 }
 
 impl PreparedInference for Pi05PreparedInference {
@@ -331,10 +355,13 @@ impl Pi05ModelRunner {
         }
         let cuda = &*self.backend;
         let dtype = crate::musa_pi05::model::ACTIVATION_DTYPE;
-        let patches = backend::to_device(&self.backend, &Tensor::zeros(
-            patch_shape(&self.config),
-            crate::musa_pi05::model::ACTIVATION_DTYPE,
-        ))?;
+        let patches = backend::to_device(
+            &self.backend,
+            &Tensor::zeros(
+                patch_shape(&self.config),
+                crate::musa_pi05::model::ACTIVATION_DTYPE,
+            ),
+        )?;
         let noise = backend::to_device(
             &self.backend,
             &Tensor::zeros(noise_shape(&self.config), dtype),
@@ -438,7 +465,8 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let raw_rgb = spec.image_layout.is_some();
 
-        let (graph, fallback_reason) = select_graph(policy, || capture(&patches, &token_ids, &noise))?;
+        let (graph, fallback_reason) =
+            select_graph(policy, || capture(&patches, &token_ids, &noise))?;
         if let Some(reason) = &fallback_reason {
             eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
         }
@@ -570,6 +598,23 @@ impl VlaRuntime for Pi05ModelRunner {
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         let action = self.infer(request)?;
         backend::to_cpu(action.tensor())?.to_f32_vec()
+    }
+
+    fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
+        request.observation.validate()?;
+        let prepared = self.build_eager(&request.observation.inference_spec())?;
+        let ExecStrategy::Eager(inputs) = &prepared.strategy else {
+            unreachable!("calibration plan is always eager")
+        };
+        prepared.calibrate_eager(inputs, request)
+    }
+
+    fn calibration_plan(&self) -> Result<Vec<String>> {
+        Ok(
+            crate::musa_pi05::Pi05CalibrationPlan::for_config(&self.config)
+                .sites()
+                .to_vec(),
+        )
     }
 }
 
@@ -913,7 +958,10 @@ mod tests {
             action_mask: None,
         }
         .inference_spec();
-        let cases = [("the captured inputs", 0.0, 0.0), ("changed inputs", 0.375, -0.5)];
+        let cases = [
+            ("the captured inputs", 0.0, 0.0),
+            ("changed inputs", 0.375, -0.5),
+        ];
         let run_plan = |plan: &Pi05PreparedInference, patch_value: f32, noise_value: f32| {
             let observation = Observation {
                 vision: VisionObservation::Patches(host_tensor(
@@ -929,7 +977,9 @@ mod tests {
             action_bits(plan.run(&request).unwrap().tensor())
         };
 
-        let eager = runner.build_prepared(&spec, ExecutionPolicy::Eager).unwrap();
+        let eager = runner
+            .build_prepared(&spec, ExecutionPolicy::Eager)
+            .unwrap();
         let eager_bits: Vec<_> = cases
             .iter()
             .map(|(_, patch, noise)| run_plan(&eager, *patch, *noise))
@@ -960,11 +1010,15 @@ mod tests {
         // bookkeeping, not a shape capture skipped.
         let warmed = graph.prepared_shapes();
         assert!(
-            warmed.iter().any(|shape| matches!(shape, backend::OperationShape::Gemm { .. })),
+            warmed
+                .iter()
+                .any(|shape| matches!(shape, backend::OperationShape::Gemm { .. })),
             "a PI0.5 capture with no GEMM recorded is not this model"
         );
         assert!(
-            warmed.iter().any(|shape| matches!(shape, backend::OperationShape::Attention { .. })),
+            warmed
+                .iter()
+                .any(|shape| matches!(shape, backend::OperationShape::Attention { .. })),
             "a PI0.5 capture with no attention recorded is not this model"
         );
         let ExecStrategy::Eager(eager_inputs) = &eager.strategy else {
@@ -987,7 +1041,10 @@ mod tests {
         let workspace = graph.workspace_used_bytes();
         for (index, (label, patch, noise)) in cases.iter().enumerate() {
             let actual = run_plan(&captured, *patch, *noise);
-            assert_eq!(actual, eager_bits[index], "eager and captured disagree on {label}");
+            assert_eq!(
+                actual, eager_bits[index],
+                "eager and captured disagree on {label}"
+            );
             assert_eq!(
                 graph.workspace_used_bytes(),
                 workspace,
@@ -1047,3 +1104,105 @@ mod tests {
     }
 }
 
+#[cfg(all(test, feature = "musa"))]
+mod fp8_device_tests {
+    //! End-to-end smoke test for the synthetic static-FP8 model.
+    //!
+    //! It proves the whole path exists: FP8 weights pack, the vendor GEMM runs
+    //! under the model's operator sequence, every normalization/quantizer writes
+    //! the dtype the next operator expects, and a traversal completes inside an
+    //! execution session. Accuracy is not asserted here; the real checkpoint and
+    //! calibration gate is the bench script.
+
+    use super::*;
+    use crate::musa_pi05::{
+        build_fp8_static_model, upload_time_embeddings_fp8_static, Fp8StaticActivationScales,
+        Fp8StaticWeights, Pi05Weights,
+    };
+
+    fn random_bf16(count: usize, seed: u64) -> Vec<bf16> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bf16::from_f32(((state >> 40) as f32 / (1u32 << 24) as f32) - 0.5)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires a MUSA device"]
+    fn fp8_static_synthetic_forward_is_finite() {
+        let ctx = Arc::new(Context::new(0).unwrap());
+        if apxinf_musa::FP8_ROUTE == "unsupported" || !ctx.caps().arch_family.has_native_fp8() {
+            eprintln!(
+                "skipping fp8_static_synthetic_forward_is_finite: no native FP8 route on this \
+                 build/device"
+            );
+            return;
+        }
+        let config = Arc::new(Pi05Config::three_view_config());
+        let host = Pi05Weights::synthetic(&config, 7).unwrap();
+        let weights = Arc::new(Fp8StaticWeights::from_host(&host, &*ctx).unwrap());
+        let scales = Arc::new(Fp8StaticActivationScales::uniform(&config, 1.0).unwrap());
+        let embeddings = upload_time_embeddings_fp8_static(&config, &*ctx).unwrap();
+        let model = build_fp8_static_model(
+            Arc::clone(&ctx),
+            Arc::clone(&config),
+            weights,
+            scales,
+            &embeddings,
+        )
+        .unwrap();
+
+        let token_count = 10usize;
+        let patches_cpu = Tensor::from_bf16(
+            vec![
+                config.num_views * config.patches_per_view(),
+                3 * config.patch_size * config.patch_size,
+            ],
+            &random_bf16(
+                config.num_views
+                    * config.patches_per_view()
+                    * 3
+                    * config.patch_size
+                    * config.patch_size,
+                11,
+            ),
+        )
+        .unwrap();
+        let noise_cpu = Tensor::from_bf16(
+            vec![config.action_horizon, config.action_dim],
+            &random_bf16(config.action_horizon * config.action_dim, 13),
+        )
+        .unwrap();
+        let patches = crate::musa_pi05::backend::to_device(&ctx, &patches_cpu).unwrap();
+        let noise = crate::musa_pi05::backend::to_device(&ctx, &noise_cpu).unwrap();
+        let ids = DeviceBuffer::alloc_zeros(token_count * 4, ctx.device_id()).unwrap();
+        let id_bytes: Vec<u8> = (0..token_count as u32)
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        ids.copy_from_host(&id_bytes).unwrap();
+
+        let requirements = model.workspace_requirements(token_count).unwrap();
+        let session = ExecutionSession::with_capacity(requirements.bytes, ctx.device_id()).unwrap();
+        // `prepare_with_session` is the warm-up pass the runner itself uses:
+        // it records every GEMM/attention shape while executing, which is what
+        // makes the same traversal replayable and captures vendor plans outside
+        // a capture region.
+        let output = ops::prepare_with_session(&session, || {
+            model.infer(&patches, &ids, token_count, &noise)
+        })
+        .unwrap();
+        assert_eq!(
+            output.shape().dims(),
+            &[config.action_horizon, config.action_dim]
+        );
+        let values = crate::musa_pi05::backend::to_cpu(&output)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().any(|value| *value != 0.0));
+    }
+}

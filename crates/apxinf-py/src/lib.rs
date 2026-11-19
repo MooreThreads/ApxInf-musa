@@ -169,6 +169,29 @@ fn parse_execution_policy(spec: &str) -> PyResult<ExecutionPolicy> {
     }
 }
 
+/// Split the `calibration` argument into a profile path or a uniform scale.
+///
+/// `PathBuf` (not `String`) so a `pathlib.Path` is accepted as well as a
+/// `str`; PyO3's `PathBuf` extractor goes through `os.fspath`.
+fn split_calibration_spec(
+    spec: Option<PathBuf>,
+    operation: &str,
+) -> PyResult<(Option<PathBuf>, Option<f32>)> {
+    let Some(spec) = spec else {
+        return Ok((None, None));
+    };
+    if let Some(text) = spec.to_str().and_then(|text| text.strip_prefix("uniform:")) {
+        let scale = text.parse::<f32>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.{operation}: invalid uniform FP8 scale in `{}`",
+                spec.display()
+            ))
+        })?;
+        return Ok((None, Some(scale)));
+    }
+    Ok((Some(spec), None))
+}
+
 fn parse_layout(spec: &str) -> PyResult<ImageLayout> {
     match spec {
         "nhwc" => Ok(ImageLayout::Nhwc),
@@ -1063,11 +1086,13 @@ impl ModelRunner {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
-    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
-    ///   The selected family and compiled features must support that backend.
+    /// * `device` — `cuda:N` (default), `hip:N`, `musa:N`, `metal:N`
+    ///   (`mlx:N` alias), or `cpu`. The selected family and compiled features
+    ///   must support that backend.
     /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
     /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
-    /// * `calibration` — optional FP8 calibration json.
+    /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
+    ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
     /// * `sampling_seed` — seed for the implicit device-side noise stream used
@@ -1151,12 +1176,14 @@ impl ModelRunner {
         } else {
             None
         };
+        let (calibration_path, uniform_fp8_scale) = split_calibration_spec(calibration, "load")?;
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
             model_variant,
             weight_layout_budget_bytes,
-            calibration_path: calibration,
+            calibration_path,
+            uniform_fp8_scale,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
             autotune,
@@ -1187,8 +1214,9 @@ impl ModelRunner {
     /// parameters, letting one call sweep 2/3-view, image size, horizon, etc.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
-    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
-    ///   The selected family and compiled features must support that backend.
+    /// * `device` — `cuda:N` (default), `hip:N`, `musa:N`, `metal:N`
+    ///   (`mlx:N` alias), or `cpu`. The selected family and compiled features
+    ///   must support that backend.
     /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
@@ -1226,7 +1254,7 @@ impl ModelRunner {
         num_flow_steps: usize,
         flow_start_time: f32,
         max_token_len: usize,
-        calibration: Option<String>,
+        calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
         autotune: bool,
         seed: u64,
@@ -1245,18 +1273,7 @@ impl ModelRunner {
         };
         config.validate().map_err(runtime_err)?;
 
-        let (calibration_path, uniform_fp8_scale) = match calibration {
-            Some(spec) if spec.starts_with("uniform:") => {
-                let scale = spec["uniform:".len()..].parse::<f32>().map_err(|_| {
-                    PyValueError::new_err(format!(
-                        "apxinf_py.random: invalid uniform FP8 scale in `{spec}`"
-                    ))
-                })?;
-                (None, Some(scale))
-            }
-            Some(spec) => (Some(PathBuf::from(spec)), None),
-            None => (None, None),
-        };
+        let (calibration_path, uniform_fp8_scale) = split_calibration_spec(calibration, "random")?;
 
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
@@ -1911,9 +1928,7 @@ impl ModelRunner {
 
     #[getter]
     fn patches_per_view(&self) -> usize {
-        self.patch_rows()
-            .checked_div(self.num_views())
-            .unwrap_or(0)
+        self.patch_rows() / self.num_views()
     }
 
     #[getter]

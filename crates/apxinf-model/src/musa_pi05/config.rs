@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use apxinf_core::{Error, Result};
+use apxinf_musa::MusaArchFamily;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmaVariantConfig {
@@ -305,6 +306,18 @@ impl Pi05Config {
         self.graph_workspace_bytes_bf16(token_count)
     }
 
+    /// Reservation for the static-FP8 graph: the BF16 arena, unchanged.
+    ///
+    /// The composed operators allocate extra BF16 scratch the BF16 route does
+    /// not: `gemm_bias_gelu` holds the GEMM result and the activated result
+    /// before quantizing, and the norm variants hold their normalized BF16
+    /// output alongside the E4M3 copy. The measured configurations fit inside
+    /// the doubled BF16 reservation; a new image size or view count should be
+    /// measured before it is treated as supported.
+    pub fn graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
+        self.graph_workspace_bytes_bf16(token_count)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.image_size % self.patch_size != 0 {
             return Err(Error::Other(format!(
@@ -479,11 +492,23 @@ mod tests {
     #[test]
     fn bf16_workspace_is_the_doubled_schedule_bound() {
         let config = Pi05Config::three_view_config();
-        assert_eq!(config.graph_workspace_bytes_bf16(10).unwrap(), 5_909_589_760);
-        assert_eq!(config.graph_workspace_bytes_bf16(21).unwrap(), 5_958_033_664);
+        assert_eq!(
+            config.graph_workspace_bytes_bf16(10).unwrap(),
+            5_909_589_760
+        );
+        assert_eq!(
+            config.graph_workspace_bytes_bf16(21).unwrap(),
+            5_958_033_664
+        );
         // The INT8 route reserves the BF16 arena unchanged.
         assert_eq!(
             config.graph_workspace_bytes_int8_dynamic(21).unwrap(),
+            config.graph_workspace_bytes_bf16(21).unwrap()
+        );
+        // Static FP8 does too; its composed operators' BF16 scratch fits inside
+        // the doubled schedule bound.
+        assert_eq!(
+            config.graph_workspace_bytes_fp8_static(21).unwrap(),
             config.graph_workspace_bytes_bf16(21).unwrap()
         );
     }
@@ -518,10 +543,16 @@ impl ModelVariantChoice {
             Self::Int8DynamicNoEncode => "int8_dynamic_no_encode",
         }
     }
-    pub fn resolve(self, sm: u32, has_fp8_scales: bool) -> Self {
+    /// Resolve `auto` against this device's MUSA family.
+    ///
+    /// `mp_31` with FP8 activation scales (a calibration profile or a
+    /// `uniform:<scale>` bring-up scale) is the FP8 route; every other
+    /// combination stays BF16. In particular `mp_22` is never upgraded to
+    /// INT8 by `auto`: that path exists only when a caller asks for it, and
+    /// FP8 on `mp_22` does not exist at all.
+    pub fn resolve(self, family: MusaArchFamily, has_fp8_scales: bool) -> Self {
         match self {
-            Self::Auto if sm >= 100 && has_fp8_scales => Self::Fp8Static,
-            Self::Auto if (80..100).contains(&sm) => Self::Int8Dynamic,
+            Self::Auto if family.has_native_fp8() && has_fp8_scales => Self::Fp8Static,
             Self::Auto => Self::Bf16,
             explicit => explicit,
         }
@@ -529,10 +560,10 @@ impl ModelVariantChoice {
 
     /// Reject an explicitly selected implementation before loading or
     /// quantizing weights when the device cannot execute its full model path.
-    pub fn ensure_supported(self, sm: u32) -> Result<Self> {
-        if self == Self::Fp8Static && sm < 100 {
+    pub fn ensure_supported(self, family: MusaArchFamily) -> Result<Self> {
+        if self == Self::Fp8Static && !family.has_native_fp8() {
             return Err(Error::Other(format!(
-                "PI0.5 model_variant=fp8_static is unsupported on sm_{sm}; it requires sm_100 or newer and will not fall back to bf16"
+                "PI0.5 model_variant=fp8_static requires mp_31 (S5000/S4000); this device is {family}, which has no E4M3 MMA. There is no FP8 emulation fallback"
             )));
         }
         Ok(self)
@@ -566,31 +597,38 @@ mod model_variant_tests {
         for ambiguous in ["fp8", "int8", "w8a8", "unknown"] {
             assert!(ambiguous.parse::<ModelVariantChoice>().is_err());
         }
+        use apxinf_musa::MusaArchFamily;
         assert_eq!(
-            ModelVariantChoice::Auto.resolve(110, true),
+            ModelVariantChoice::Auto.resolve(MusaArchFamily::Mp31, true),
             ModelVariantChoice::Fp8Static
         );
         assert_eq!(
-            ModelVariantChoice::Auto.resolve(110, false),
+            ModelVariantChoice::Auto.resolve(MusaArchFamily::Mp31, false),
+            ModelVariantChoice::Bf16
+        );
+        // `auto` on mp22 stays BF16; INT8 remains an explicit choice.
+        assert_eq!(
+            ModelVariantChoice::Auto.resolve(MusaArchFamily::Mp22, true),
             ModelVariantChoice::Bf16
         );
         assert_eq!(
-            ModelVariantChoice::Auto.resolve(87, false),
-            ModelVariantChoice::Int8Dynamic
-        );
-        assert_eq!(
-            ModelVariantChoice::Bf16.resolve(110, true),
+            ModelVariantChoice::Bf16.resolve(MusaArchFamily::Mp31, true),
             ModelVariantChoice::Bf16
         );
         let error = ModelVariantChoice::Fp8Static
-            .ensure_supported(89)
+            .ensure_supported(MusaArchFamily::Mp22)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unsupported on sm_89"));
-        assert!(error.contains("will not fall back to bf16"));
-        assert_eq!(
-            ModelVariantChoice::Fp8Static.ensure_supported(110).unwrap(),
-            ModelVariantChoice::Fp8Static
-        );
+        assert!(error.contains("requires mp_31"));
+        assert!(error.contains("no E4M3 MMA"));
+        assert!(error.contains("no FP8 emulation fallback"));
+        assert!(ModelVariantChoice::Fp8Static
+            .ensure_supported(MusaArchFamily::Mp31)
+            .is_ok());
+        // `Other` is the "not measured yet" arm, so even a large number is
+        // not permission to run FP8; only `Mp31` is.
+        assert!(ModelVariantChoice::Fp8Static
+            .ensure_supported(MusaArchFamily::Other(110))
+            .is_err());
     }
 }

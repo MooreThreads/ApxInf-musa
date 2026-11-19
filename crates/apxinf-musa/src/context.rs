@@ -99,6 +99,9 @@ impl MusaLibraryVersions {
 }
 
 pub struct MusaContext {
+    pub(crate) native_attention: std::sync::Mutex<crate::kernels::attention::mp31::State>,
+    pub(crate) native_fp8_weights:
+        std::sync::Mutex<crate::kernels::gemm::mp31_fp8::PreparedWeights>,
     pub(crate) asm_weights: std::sync::Mutex<crate::kernels::gemm::assembly::PreparedWeights>,
     device_id: usize,
     caps: MusaDeviceCaps,
@@ -190,6 +193,8 @@ impl MusaContext {
         warn_unmeasured_generation(&caps);
         Ok(Self {
             asm_weights: Default::default(),
+            native_attention: Default::default(),
+            native_fp8_weights: Default::default(),
             device_id,
             caps,
             stream: MusaStream::new()?,

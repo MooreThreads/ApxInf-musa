@@ -4,8 +4,8 @@
 
 /// Forward the inherent methods of one precision's Blocks type to the trait.
 ///
-/// Both precisions implement the same five delegations; expanding them here
-/// keeps the trait's shape and the two impls from drifting apart without
+/// Every precision implements the same six delegations; expanding them here
+/// keeps the trait's shape and the three impls from drifting apart without
 /// flattening the differences that live below them.
 macro_rules! impl_blocks {
     ($blocks:ty, $prefix:ty, $modulation:ty) => {
@@ -17,7 +17,11 @@ macro_rules! impl_blocks {
                 &self.config
             }
 
-            fn vision(&self, patches: &apxinf_core::Tensor, native: bool) -> apxinf_core::Result<apxinf_core::Tensor> {
+            fn vision(
+                &self,
+                patches: &apxinf_core::Tensor,
+                native: bool,
+            ) -> apxinf_core::Result<apxinf_core::Tensor> {
                 let _ = native;
                 self.encode_vision(patches)
             }
@@ -35,11 +39,11 @@ macro_rules! impl_blocks {
                 self.prefix_forward(input)
             }
 
-            fn compute_modulation(
+            fn prepare_modulation(
                 &self,
-                embeddings: &[apxinf_core::Tensor],
-            ) -> apxinf_core::Result<Vec<Self::StepModulation>> {
-                self.compute_all_modulation(embeddings)
+                time_embedding: &apxinf_core::Tensor,
+            ) -> apxinf_core::Result<Self::StepModulation> {
+                self.prepare_step_modulation(time_embedding)
             }
 
             fn step_with_modulation(
@@ -56,11 +60,15 @@ macro_rules! impl_blocks {
 }
 
 pub(super) mod bf16;
+pub(super) mod fp8_static;
 pub(super) mod int8_dynamic;
+pub(super) mod shared;
 
 pub(super) use bf16::backbone::Bf16Blocks;
-pub(super) use int8_dynamic::backbone::Int8DynamicBlocks;
 pub use bf16::backbone::Bf16PrefixKvCache;
+pub(super) use fp8_static::backbone::Fp8StaticBlocks;
+pub use fp8_static::backbone::Fp8StaticPrefixKvCache;
+pub(super) use int8_dynamic::backbone::Int8DynamicBlocks;
 pub use int8_dynamic::backbone::Int8DynamicPrefixKvCache;
 
 use crate::musa_pi05::backend::{
@@ -105,7 +113,21 @@ pub trait Blocks {
     /// those addresses would replay against someone else's outputs. The model
     /// holding the result is what keeps those addresses valid for the life of
     /// the graph.
-    fn compute_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>>;
+    fn compute_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>> {
+        if embeddings.len() != self.config().num_flow_steps {
+            return Err(Error::Other(format!(
+                "PI0.5 expected {} timestep embeddings, got {}",
+                self.config().num_flow_steps,
+                embeddings.len()
+            )));
+        }
+        embeddings
+            .iter()
+            .map(|embedding| self.prepare_modulation(embedding))
+            .collect()
+    }
+    /// Project one step's time embedding into its modulation.
+    fn prepare_modulation(&self, time_embedding: &Tensor) -> Result<Self::StepModulation>;
     fn step_with_modulation(
         &self,
         state: &Tensor,
@@ -115,12 +137,16 @@ pub trait Blocks {
     ) -> Result<Tensor>;
 }
 
-// ── The arithmetic both precisions share ─────────────────────────────────
+// ── The arithmetic the BF16 and INT8 precisions share ────────────────────
 //
 // LayerNorm, adaptive RMSNorm and the three bias+residual forms are identical
 // in BF16 and INT8: the precision lives in the linear layers, not in these
 // normalizations. They live here so the two block files carry only what
-// actually differs.
+// actually differs. Static FP8 keeps its own norm variants in
+// `fp8_static.rs`, because those also act as producers for E4M3 outputs and
+// carry an `output_scale` the BF16/INT8 kernels do not. Attention, RoPE/QKV
+// splits and the element-wise producers shared by all three precisions live in
+// `shared.rs`.
 
 pub(super) struct QkvTensors {
     pub(super) q: Tensor,

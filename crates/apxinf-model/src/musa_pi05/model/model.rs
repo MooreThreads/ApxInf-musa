@@ -1,9 +1,11 @@
 //! Construction and typed dispatch of loaded PI0.5 computation. No execution policy or capture ownership.
-use super::blocks::{Bf16Blocks, Int8DynamicBlocks, L3Policies};
+use super::blocks::{Bf16Blocks, Fp8StaticBlocks, Int8DynamicBlocks, L3Policies};
 use super::Pi05Model;
-use super::{Bf16Model, Int8DynamicModel};
+use super::{Bf16Model, Fp8StaticModel, Int8DynamicModel};
 use crate::musa_pi05::backend::{self, Context};
-use crate::musa_pi05::weights::{Bf16Weights, Int8DynamicWeights};
+use crate::musa_pi05::weights::{
+    Bf16Weights, Fp8StaticActivationScales, Fp8StaticWeights, Int8DynamicWeights,
+};
 use crate::musa_pi05::{sinusoidal_time_embedding, Pi05Config};
 use apxinf_core::{Result, Tensor};
 use std::sync::Arc;
@@ -53,10 +55,38 @@ pub(in crate::musa_pi05) fn build_int8_dynamic_model_with_policies(
         embeddings,
     )?))
 }
-pub fn upload_time_embeddings_bf16(
-    config: &Pi05Config,
-    context: &Context,
-) -> Result<Vec<Tensor>> {
+pub fn build_fp8_static_model(
+    backend: Arc<Context>,
+    config: Arc<Pi05Config>,
+    weights: Arc<Fp8StaticWeights>,
+    scales: Arc<Fp8StaticActivationScales>,
+    embeddings: &[Tensor],
+) -> Result<Arc<Pi05Model<Fp8StaticBlocks>>> {
+    build_fp8_static_model_with_policies(
+        backend,
+        config,
+        weights,
+        scales,
+        L3Policies::default(),
+        embeddings,
+    )
+}
+
+pub(in crate::musa_pi05) fn build_fp8_static_model_with_policies(
+    backend: Arc<Context>,
+    config: Arc<Pi05Config>,
+    weights: Arc<Fp8StaticWeights>,
+    scales: Arc<Fp8StaticActivationScales>,
+    policies: L3Policies,
+    embeddings: &[Tensor],
+) -> Result<Arc<Pi05Model<Fp8StaticBlocks>>> {
+    Ok(Arc::new(Pi05Model::new(
+        Fp8StaticBlocks::new(backend, config, weights, scales, policies)?,
+        embeddings,
+    )?))
+}
+
+pub fn upload_time_embeddings_bf16(config: &Pi05Config, context: &Context) -> Result<Vec<Tensor>> {
     (0..config.num_flow_steps)
         .map(|step| {
             let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
@@ -69,10 +99,10 @@ pub fn upload_time_embeddings_bf16(
             .into_iter()
             .map(half::bf16::from_f32)
             .collect::<Vec<_>>();
-            backend::to_device(context, &Tensor::from_bf16(
-                vec![1, config.action_expert.width],
-                &values,
-            )?)
+            backend::to_device(
+                context,
+                &Tensor::from_bf16(vec![1, config.action_expert.width], &values)?,
+            )
         })
         .collect()
 }
@@ -80,6 +110,7 @@ use crate::musa_pi05::backend::DeviceBuffer;
 /// The time conditioning is precision-independent: both routes embed the same
 /// schedule and feed it to projections of the same width.
 pub use upload_time_embeddings_bf16 as upload_time_embeddings_int8_dynamic;
+pub use upload_time_embeddings_bf16 as upload_time_embeddings_fp8_static;
 #[derive(Clone)]
 pub(in crate::musa_pi05) enum ModelVariant {
     Bf16 {
@@ -93,6 +124,9 @@ pub(in crate::musa_pi05) enum ModelVariant {
         /// weight preparation and this label differ.
         name: &'static str,
     },
+    Fp8Static {
+        model: Fp8StaticModel,
+    },
 }
 
 impl ModelVariant {
@@ -100,6 +134,7 @@ impl ModelVariant {
         match self {
             Self::Bf16 { .. } => "bf16",
             Self::Int8Dynamic { name, .. } => name,
+            Self::Fp8Static { .. } => "fp8_static",
         }
     }
 
@@ -110,6 +145,7 @@ impl ModelVariant {
         match self {
             Self::Bf16 { model, .. } => model.workspace_requirements(token_count),
             Self::Int8Dynamic { model, .. } => model.workspace_requirements(token_count),
+            Self::Fp8Static { model, .. } => model.workspace_requirements(token_count),
         }
     }
 
@@ -123,13 +159,34 @@ impl ModelVariant {
         match self {
             Self::Bf16 { model } => model.infer(patches, token_ids, token_count, noise),
             Self::Int8Dynamic { model, .. } => model.infer(patches, token_ids, token_count, noise),
+            Self::Fp8Static { model } => model.infer(patches, token_ids, token_count, noise),
         }
     }
 
-    pub(in crate::musa_pi05) fn with_model<O: ModelOperation>(&self, operation: O) -> Result<O::Output> {
+    /// Collect one calibration traversal from the BF16 model.
+    pub(in crate::musa_pi05) fn calibrate(
+        &self,
+        patches: &Tensor,
+        token_ids: &DeviceBuffer,
+        token_count: usize,
+        noise: &Tensor,
+    ) -> Result<std::collections::BTreeMap<String, f32>> {
+        match self {
+            Self::Bf16 { model } => model.calibrate(patches, token_ids, token_count, noise),
+            _ => Err(apxinf_core::Error::Other(
+                "PI0.5 calibration requires model_variant=bf16".into(),
+            )),
+        }
+    }
+
+    pub(in crate::musa_pi05) fn with_model<O: ModelOperation>(
+        &self,
+        operation: O,
+    ) -> Result<O::Output> {
         match self {
             Self::Bf16 { model } => operation.run(model),
             Self::Int8Dynamic { model, .. } => operation.run(model),
+            Self::Fp8Static { model } => operation.run(model),
         }
     }
 }
@@ -145,6 +202,7 @@ impl ModelVariant {
         match self {
             Self::Bf16 { model, .. } => model.blocks.preprocess(images, patches, layout),
             Self::Int8Dynamic { model, .. } => model.blocks.preprocess(images, patches, layout),
+            Self::Fp8Static { model, .. } => model.blocks.preprocess(images, patches, layout),
         }
     }
 }

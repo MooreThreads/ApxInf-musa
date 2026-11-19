@@ -24,7 +24,9 @@ python3 scripts/calibrate_pi05.py \
   --manifest <path-to-observations.jsonl>
 ```
 
-By default this writes `<path-to-model>/calibration.json`. Use `--output` for
+This runs on the same devices inference does: `--device musa:0` generates the
+profile on the MUSA backend, whose calibration observer is wired into the BF16
+GEMM path. By default this writes `<path-to-model>/calibration.json`. Use `--output` for
 another location. Existing files are not overwritten unless `--force` is
 passed.
 
@@ -99,7 +101,7 @@ through the manifest or directory interface instead.
 `AutoPolicy` automatically uses `<model-dir>/calibration.json`:
 
 ```python
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="fp8")
+policy = AutoPolicy.from_pretrained("<path-to-model>", model_variant="fp8_static")
 ```
 
 Pass `calibration=` only when the calibration file is stored elsewhere:
@@ -107,7 +109,7 @@ Pass `calibration=` only when the calibration file is stored elsewhere:
 ```python
 policy = AutoPolicy.from_pretrained(
     "<path-to-model>",
-    precision="fp8",
+    model_variant="fp8_static",
     calibration="/path/to/calibration.json",
 )
 ```

@@ -7,19 +7,26 @@ use apxinf_core::{Error, Result, Tensor};
 use blocks::Blocks;
 
 mod blocks;
+mod calibration;
 mod model;
 pub(in crate::musa_pi05) use blocks::L3Policies;
+pub use calibration::Pi05CalibrationObserver;
 pub use model::{
-    build_bf16_model, build_int8_dynamic_model, upload_time_embeddings_bf16,
+    build_bf16_model, build_fp8_static_model, build_int8_dynamic_model,
+    upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic,
 };
-pub(in crate::musa_pi05) use model::{build_bf16_model_with_policies, build_int8_dynamic_model_with_policies};
+pub(in crate::musa_pi05) use model::{
+    build_bf16_model_with_policies, build_fp8_static_model_with_policies,
+    build_int8_dynamic_model_with_policies,
+};
 pub(super) use model::{ModelOperation, ModelVariant};
 
 use crate::musa_pi05::backend::Context;
 use crate::musa_pi05::Pi05ImageLayout;
 use apxinf_core::DType;
 use std::sync::Arc;
+
 /// Resource requirements supplied by a model implementation. Execution owns
 /// allocation, warmup, capture and lifetime; this description allocates nothing.
 pub struct WorkspaceRequirements {
@@ -30,9 +37,9 @@ pub trait PrepareBlocks: Blocks + 'static {
     fn workspace_requirements(&self, tokens: usize) -> Result<WorkspaceRequirements>;
     /// RGB bytes to patch-major BF16.
     ///
-    /// Both precisions preprocess identically — the image never passes through
-    /// a quantized layer — so the traversal lives here and the impls say only
-    /// which arena and how many bytes it needs.
+    /// All three precisions preprocess identically — the image never passes
+    /// through a quantized layer — so the traversal lives here and the impls
+    /// say only which arena and how many bytes it needs.
     fn preprocess(
         &self,
         images: &DeviceBuffer,
@@ -78,13 +85,19 @@ pub use blocks::bf16::{
     action_layer_bf16, language_layer_bf16, vision_layer_bf16, vision_patch_embed_bf16,
     Bf16ActionLayerOutput, Bf16LanguageLayerOutput,
 };
+pub use blocks::fp8_static::{
+    action_layer_fp8_static, language_layer_fp8_static, vision_layer_fp8_static,
+    vision_patch_embed_fp8_static, Fp8StaticActionLayerOutput, Fp8StaticLanguageLayerOutput,
+};
 pub use blocks::int8_dynamic::{
     action_layer_int8_dynamic, language_layer_int8_dynamic, vision_layer_int8_dynamic,
     vision_patch_embed_int8_dynamic, Int8DynamicActionLayerOutput, Int8DynamicLanguageLayerOutput,
 };
 pub use blocks::Bf16PrefixKvCache;
+pub use blocks::Fp8StaticPrefixKvCache;
 pub use blocks::Int8DynamicPrefixKvCache;
 pub type Bf16Model = std::sync::Arc<Pi05Model<blocks::Bf16Blocks>>;
+pub type Fp8StaticModel = std::sync::Arc<Pi05Model<blocks::Fp8StaticBlocks>>;
 pub type Int8DynamicModel = std::sync::Arc<Pi05Model<blocks::Int8DynamicBlocks>>;
 
 impl<B: PrepareBlocks> Pi05Model<B> {
@@ -98,11 +111,13 @@ impl<B: PrepareBlocks> Pi05Model<B> {
     }
 }
 
-/// Every activation, input and output of this port is BF16.
+/// The dtype of the tensors the runner carries between the caller and the model.
 ///
-/// The precision lives in the linear layers' representation, not in the tensors
-/// that flow between them; a second precision would have to change this const
-/// and the kernels behind it, not add a branch at each call site.
+/// The static-FP8 route is not an exception: its patch/noise ingress and action
+/// egress stay BF16, and only the linear operands inside the traversal are
+/// E4M3. Keeping the runner contract single-dtype is what lets the BF16 and
+/// FP8 variants share graph input binding; the quantizer is an operator inside
+/// the captured region, not a second input format.
 pub(in crate::musa_pi05) const ACTIVATION_DTYPE: DType = DType::BF16;
 
 pub struct Pi05Model<B: Blocks> {
@@ -116,30 +131,50 @@ pub struct Pi05Model<B: Blocks> {
     /// only safe because something owns them for the life of the graph, and the
     /// captured graph owning this model is that something.
     modulation: Vec<B::StepModulation>,
+    /// The time embeddings the modulation was projected from.
+    ///
+    /// Inference never reads them again — the projection is precomputed — but
+    /// the FP8 calibration traversal replays that projection under an
+    /// observer, and this is the only copy of its input. The tensors are a
+    /// few KiB and are owned for the life of the model, like the modulation.
+    embeddings: Vec<Tensor>,
 }
 
 impl<B: Blocks> Pi05Model<B> {
     /// Assemble the model together with its per-step constants.
     ///
-    /// This is the only place modulation is computed. It runs while the loader
+    /// This computes the modulation the model keeps. It runs while the loader
     /// has no traversal workspace bound, so the tensors land in ordinary device
     /// memory — an arena allocation would not survive the reset at the head of
     /// the next traversal, and a captured graph would replay against whatever
     /// took its addresses.
     pub fn new(blocks: B, embeddings: &[Tensor]) -> Result<Self> {
         let modulation = blocks.compute_modulation(embeddings)?;
-        Ok(Self { blocks, modulation })
+        Ok(Self {
+            blocks,
+            modulation,
+            embeddings: embeddings.to_vec(),
+        })
     }
 
     pub fn modulation(&self) -> &[B::StepModulation] {
         &self.modulation
     }
 
+    pub(in crate::musa_pi05) fn embeddings(&self) -> &[Tensor] {
+        &self.embeddings
+    }
+
     pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
         self.blocks.vision(patches, false)
     }
 
-    pub fn embed_prefix(&self, vision: &Tensor, ids: &DeviceBuffer, count: usize) -> Result<Tensor> {
+    pub fn embed_prefix(
+        &self,
+        vision: &Tensor,
+        ids: &DeviceBuffer,
+        count: usize,
+    ) -> Result<Tensor> {
         self.blocks.embed_prefix(vision, ids, count)
     }
     pub fn prefix_forward(&self, prefix: &Tensor) -> Result<B::Prefix> {
@@ -240,6 +275,9 @@ mod tests {
         fn compute_modulation(&self, _: &[Tensor]) -> Result<Vec<()>> {
             self.record("modulation");
             Ok(vec![(); 2])
+        }
+        fn prepare_modulation(&self, _: &Tensor) -> Result<()> {
+            Ok(())
         }
         fn step_with_modulation(&self, _: &Tensor, _: &(), _: &(), dt: f32) -> Result<Tensor> {
             assert_eq!(dt, -0.5);

@@ -176,9 +176,9 @@ rename and acceptance, and must not inherit MUSA's device constraints.
 [`doc/musa-backend.md#pi05-on-musa`](../../doc/musa-backend.md#pi05-on-musa) is the
 example's own record.
 
-- The rename is `crate::musa_pi05` ↔ `crate::pi05`. Sixteen files were added with
-  the top-level port (`ce1fb3c`); the two INT8 files (`model/blocks/int8_dynamic.rs`,
-  `weights/int8_dynamic.rs`) were added in `51f644b`.
+- The rename is `crate::musa_pi05` ↔ `crate::pi05`. The eighteen-file port
+  (including the two INT8 files) was added by `4957e27`; the four static-FP8
+  files were added with the MUSA static-FP8 work and are listed below.
 - The weights file is this example's `semantic-review-only` file: it follows the
   MUSA implementation line rather than the upstream 414-line file, and
   [`doc/musa-backend.md#int8-w8a8`](../../doc/musa-backend.md#int8-w8a8) records
@@ -195,18 +195,27 @@ example's own record.
   `euler_flow_step`'s doc records that it equals the model's step only when
   `flow_start_time == 1.0`. An upstream change to `pi05/math.rs` must be applied
   to this copy by hand, keeping those two differences.
-- The four upstream-only files are deliberately not copied:
-  `model/calibration.rs`, `model/blocks/fp8_static.rs`, `weights/fp8_static.rs`
-  and `weights/fp8_static_calibration.rs`. MUSA has no FP8 route, and their main
-  symbols have no consumers in the port or `apxinf-musa`. A new upstream-only file
-  is a finding even when it lives beside them.
+- The four static-FP8 files are copies with different lineages:
+  `weights/fp8_static_calibration.rs` keeps the plan/validation/checkpoint-identity
+  half near-verbatim (module path, feature gate, `two_view_config`, loader error
+  context and the missing/unknown site detail differ); its host E4M3 codec was
+  removed because MUSA quantizes on device. `weights/fp8_static.rs` keeps the F16
+  weight staging and uses BF16 biases and position embeddings.
+  `model/calibration.rs` keeps the observer protocol but installs it through
+  `apxinf_musa`'s `Bf16ActivationObserver` and replays the precomputed modulation.
+  `model/blocks/fp8_static.rs` is `semantic-review-only` — BF16 intermediates,
+  attention/RoPE helpers from `shared.rs` plus an explicit quantizer, no
+  packed-QKV branch, no KV-cache attention args and no FA2 E4M3 epilogue — so
+  read upstream changes and decide whether they apply instead of running a text
+  three-way merge.
 - The example's guards are `scripts/check_pi05_module_boundaries.py` and
   `scripts/check_ops_contract_surface.py`; its numerical gate is `python3
   scripts/bench_pi05_musa.py --layer l0 --reference <gold bundle> --model-variant
-  <bf16|int8_dynamic|int8_dynamic_no_encode> --execution eager`, then again with
-  `--execution require-graph` (both cosines must meet `--gate`; numerical
-  acceptance needs `--reference`, without it the run is latency only, and L2
-  needs `--tokenizer`). Its no-device compile gate is
+  <bf16|fp8_static|int8_dynamic|int8_dynamic_no_encode> --execution eager`, then
+  again with `--execution require-graph` (both cosines must meet `--gate`;
+  numerical acceptance needs `--reference`, without it the run is latency only,
+  and L2 needs `--tokenizer`). `fp8_static` additionally needs `--calibration
+  <json|uniform:scale>` and runs only on `mp_31`. Its no-device compile gate is
   `MUSA_PATH=/nonexistent cargo check` for `-p apxinf-musa`,
   `-p apxinf-model --features musa`, `-p apxinf-model --features musa,hip` and
   `-p apxinf-py --features musa`; the `auto.rs` conversion of `Pi05Config` is what

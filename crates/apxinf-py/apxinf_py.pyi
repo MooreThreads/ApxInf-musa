@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import numpy.typing as npt
 
@@ -39,7 +41,7 @@ class ModelRunner:
         path: str,
         device: str = ...,
         precision: str = ...,
-        calibration: str | None = ...,
+        calibration: str | os.PathLike[str] | None = ...,
         tactics: str | None = ...,
         autotune: bool = ...,
         config_json: str | None = ...,
@@ -59,6 +61,18 @@ class ModelRunner:
         ``musa:N``, ``metal:N`` (alias ``mlx:N``), or ``cpu``. Model support
         depends on the selected backend.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        ``model_variant`` is the PI0.5 implementation choice: ``auto``,
+        ``bf16``, ``fp8_static``, ``int8_dynamic``, or
+        ``int8_dynamic_no_encode``; ``auto`` resolves per device (on MUSA:
+        ``fp8_static`` on mp_31 when FP8 activation scales are supplied, else
+        ``bf16``).
+        ``calibration`` is either a calibration JSON path (``str`` or
+        ``os.PathLike``) or ``"uniform:<scale>"`` for a uniform bring-up scale.
+        It is consumed by ``model_variant="fp8_static"`` and ignored by the
+        other variants.
+        ``execution`` selects how the MUSA PI0.5 runtime builds cached plans:
+        ``eager``, ``prefer-graph`` (default), or ``require-graph``; the mode a
+        run actually took is available from ``execution_mode``.
         ``config_json`` supplies architecture JSON when it is stored outside the
         checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
         ``action_horizon`` overrides the checkpoint's chunk length (a sequence
@@ -192,6 +206,10 @@ class ModelRunner:
 
     @property
     def device(self) -> str: ...
+    @property
+    def model_variant(self) -> str | None: ...
+    @property
+    def execution_mode(self) -> str: ...
     @property
     def action_dim(self) -> int: ...
     @property

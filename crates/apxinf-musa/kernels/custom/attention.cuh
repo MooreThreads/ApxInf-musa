@@ -120,14 +120,15 @@ __global__ void row_softmax_f32_kernel(float* data, int rows, int cols) {
   const float maximum = local_max;
 
   float local_sum = 0.0f;
-  for (int col = lane; col < cols; col += 32) local_sum += expf(target[col] - maximum);
+  for (int col = lane; col < cols; col += 32)
+    local_sum += __musa_exp_f(target[col] - maximum);
   for (int offset = 16; offset > 0; offset >>= 1) {
     local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
   }
   const float inverse = 1.0f / local_sum;
 
   for (int col = lane; col < cols; col += 32) {
-    target[col] = expf(target[col] - maximum) * inverse;
+    target[col] = __musa_exp_f(target[col] - maximum) * inverse;
   }
 }
 

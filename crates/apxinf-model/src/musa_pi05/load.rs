@@ -5,12 +5,17 @@
 //! own [`Pi05Config`]. Weights are synthetic when requested, else the
 //! SafeTensors at `path`.
 
-use super::model::{
-    build_bf16_model_with_policies, build_int8_dynamic_model_with_policies,
-    upload_time_embeddings_bf16, upload_time_embeddings_int8_dynamic, L3Policies, ModelVariant,
-};
-use super::weights::{Bf16Weights, Int8DynamicWeights, Int8Scope, Pi05Weights};
 use super::backend::Context;
+use super::model::{
+    build_bf16_model_with_policies, build_fp8_static_model_with_policies,
+    build_int8_dynamic_model_with_policies, upload_time_embeddings_bf16,
+    upload_time_embeddings_fp8_static, upload_time_embeddings_int8_dynamic, L3Policies,
+    ModelVariant,
+};
+use super::weights::{
+    checkpoint_identity, Bf16Weights, Fp8StaticActivationScales, Fp8StaticCalibration,
+    Fp8StaticWeights, Int8DynamicWeights, Int8Scope, Pi05Weights,
+};
 use super::{backend, ModelVariantChoice, Pi05Config, Pi05ModelRunner};
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Device, Error, Result};
@@ -50,38 +55,65 @@ pub(crate) fn load_model_runner(
             "PI0.5 uses model_variant instead of precision".into(),
         ));
     }
-    // FP8 calibration is an input to the CUDA quantization path MUSA does not
-    // have; accepting one here would leave the caller believing it took effect.
-    if options.calibration_path.is_some() || options.uniform_fp8_scale.is_some() {
-        return Err(Error::Other(
-            "PI0.5 calibration is an FP8 input; MUSA has no FP8 path".into(),
-        ));
-    }
+    // The calibration file is the FP8 route's input. A model directory that
+    // carries one is treated the way CUDA treats it; a synthetic model never
+    // auto-discovers one, because its weights are not the checkpoint the
+    // profile was measured against.
+    let calibration_path = options.calibration_path.clone().or_else(|| {
+        options
+            .synthetic
+            .is_none()
+            .then(|| root.join("calibration.json"))
+            .filter(|path| path.is_file())
+    });
     let requested = options
         .model_variant
         .as_deref()
         .unwrap_or("auto")
         .parse::<ModelVariantChoice>()?;
-    // Zero is the device key: MUSA reports `mp_22`, not an `sm_` compute
-    // capability, so `auto` resolves to BF16. INT8 is a device key like any
-    // other: which projections a tile can serve is decided per shape at pack
-    // time.
-    //
-    // The FP8 refusal sits before `ensure_supported`, not after: that check
-    // reports a vendor `sm_N` compute capability, which this device does not
-    // have. Answering a MUSA caller with "unsupported on sm_0" would name a
-    // capability nothing here reports and would not say what to ask for
-    // instead.
-    let model_variant = requested.resolve(0, false);
-    if matches!(model_variant, ModelVariantChoice::Fp8Static) {
-        return Err(Error::Other(
-            "PI0.5 model_variant=fp8_static needs an FP8 path MUSA does not have; \
-             ask for bf16, int8_dynamic or int8_dynamic_no_encode"
-                .into(),
-        ));
+    // `auto` is resolved against the MUSA family, not an `sm_`: mp_31 with a
+    // calibration profile is the FP8 route, everything else stays BF16.
+    let family = backend.caps().arch_family;
+    let model_variant = requested
+        .resolve(
+            family,
+            calibration_path.is_some() || options.uniform_fp8_scale.is_some(),
+        )
+        .ensure_supported(family)?;
+    if matches!(model_variant, ModelVariantChoice::Fp8Static)
+        && apxinf_musa::FP8_ROUTE == "unsupported"
+    {
+        return Err(Error::Other(format!(
+            "PI0.5 model_variant=fp8_static requires a build with a native FP8 route; this \
+             binary published FP8_ROUTE={} (target {}), so no vendor FP8 kernel was compiled in",
+            apxinf_musa::FP8_ROUTE,
+            apxinf_musa::MUSA_ARCH
+        )));
     }
-    let model_variant = model_variant.ensure_supported(0)?;
     eprintln!("[apxinf] PI0.5 model_variant={}", model_variant.as_str());
+
+    // Resolve the FP8 scales before the checkpoint is read: a missing or
+    // malformed profile should fail without first materializing every weight.
+    let fp8_scales = match model_variant {
+        ModelVariantChoice::Fp8Static => {
+            let scales = if let Some(scale) = options.uniform_fp8_scale {
+                Fp8StaticActivationScales::uniform(&config, scale)?
+            } else {
+                let calibration_path = calibration_path.ok_or_else(|| {
+                    Error::Other(
+                        "FP8 PI0.5 requires LoadOptions.calibration_path or calibration.json"
+                            .into(),
+                    )
+                })?;
+                let checkpoint = checkpoint_identity(path)?;
+                let calibration =
+                    Fp8StaticCalibration::from_json_file(&calibration_path, &config, &checkpoint)?;
+                Fp8StaticActivationScales::from_calibration(&config, &calibration)?
+            };
+            Some(Arc::new(scales))
+        }
+        _ => None,
+    };
 
     let host_weights = match options.synthetic {
         Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
@@ -90,13 +122,34 @@ pub(crate) fn load_model_runner(
     let policies = L3Policies::default();
     install_tactics(&backend, options)?;
     let model = match model_variant {
+        ModelVariantChoice::Fp8Static => {
+            let scales = fp8_scales.ok_or_else(|| {
+                Error::Other("PI0.5 FP8 activation scales were not resolved during load".into())
+            })?;
+            let weights = Arc::new(Fp8StaticWeights::from_host(&host_weights, &*backend)?);
+            // Weight packing is the only reader of the host copy.
+            drop(host_weights);
+            let time_embeddings = upload_time_embeddings_fp8_static(&config, &*backend)?;
+            ModelVariant::Fp8Static {
+                model: build_fp8_static_model_with_policies(
+                    Arc::clone(&backend),
+                    Arc::clone(&config),
+                    weights,
+                    scales,
+                    policies,
+                    &time_embeddings,
+                )?,
+            }
+        }
         ModelVariantChoice::Int8Dynamic | ModelVariantChoice::Int8DynamicNoEncode => {
             let scope = match model_variant {
                 ModelVariantChoice::Int8DynamicNoEncode => Int8Scope::WithoutEncode,
                 _ => Int8Scope::All,
             };
             let weights = Arc::new(Int8DynamicWeights::from_host(
-                &host_weights, &*backend, scope,
+                &host_weights,
+                &*backend,
+                scope,
             )?);
             // Packing is the only reader of the host copy; the device weights
             // and their FP16 scale renderings are independent of it.
@@ -191,7 +244,7 @@ fn install_tactics(backend: &Context, options: &LoadOptions) -> Result<()> {
     let database = paths
         .as_ref()
         .filter(|paths| paths.tactics.is_file())
-        .map(|paths| backend::tuning::TuningDb::from_json_file(&paths.tactics))
+        .map(|paths| paths.load_database())
         .transpose()?;
     backend::tuning::configure_tuning(
         backend,

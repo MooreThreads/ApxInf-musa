@@ -115,7 +115,7 @@ DEFAULT_GATE = 0.999
 PROMPT_T10 = "put both moka pots on the stove"
 
 # Every switch that changes what a run of this tool measures: the backend's own
-# `env::var` reads plus the two that decide whether a trace is labelled.
+# `env::var` reads plus the one that decides whether a trace is labelled.
 ENV_WATCH = (
     "APXINF_MUSA_ALLOC_CACHE", "APXINF_MUSA_ALLOC_CACHE_MB", "APXINF_MUSA_ARCH",
     "APXINF_MUSA_ASSEMBLY_ARCH", "APXINF_MUSA_BF16_MHA",
@@ -136,6 +136,21 @@ def _refuse(message: str) -> None:
     raise SystemExit(2)
 
 
+def _engine_call(args: argparse.Namespace, what: str, call):
+    """Run one engine call, turning a `require-graph` failure into a refusal.
+
+    Capture happens lazily on the first inference, so `ModelRunner.load` cannot
+    report it. Only `require-graph` promises a refusal; `prefer-graph` and
+    `eager` keep the original exception so a real bug is not relabelled.
+    """
+    try:
+        return call()
+    except Exception as error:  # noqa: BLE001 - reported with its own text
+        if args.execution == "require-graph":
+            _refuse(f"{what} failed under --execution require-graph: {error}")
+        raise
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -151,13 +166,18 @@ def parse_args() -> argparse.Namespace:
                         help="checkpoint directory holding model.safetensors")
     parser.add_argument("--device", default="musa:0", help="MUSA device (default: musa:0)")
     parser.add_argument("--model-variant", default="bf16",
-                        choices=("bf16", "int8_dynamic", "int8_dynamic_no_encode"),
-                        help="PI0.5 variant. `int8_dynamic` quantizes every projection an "
-                             "embedded s8mma tile can serve (the ViT patch embedding and the "
-                             "action head stay BF16) and needs APXINF_INT8_EQUALIZATION for "
-                             "the language layers to clear the gate; "
-                             "`int8_dynamic_no_encode` keeps those four language projections "
-                             "in BF16 instead")
+                        choices=("bf16", "fp8_static", "int8_dynamic", "int8_dynamic_no_encode"),
+                        help="PI0.5 variant. `fp8_static` is the mp_31 E4M3 route and needs "
+                             "`--calibration` (or a calibration.json beside the checkpoint); "
+                             "`int8_dynamic` quantizes every projection an embedded s8mma tile "
+                             "can serve (the ViT patch embedding and the action head stay BF16) "
+                             "and needs APXINF_INT8_EQUALIZATION for the language layers to "
+                             "clear the gate; `int8_dynamic_no_encode` keeps those four language "
+                             "projections in BF16 instead")
+    parser.add_argument("--calibration", default=None,
+                        help="FP8 calibration profile path, or `uniform:<scale>` for a "
+                             "scale-only bring-up run (default: the checkpoint's "
+                             "calibration.json for fp8_static)")
     parser.add_argument("--reference", type=pathlib.Path, default=None,
                         help="torch-eager-gold.v1 bundle; given, its frames are the workload "
                         "and the L0 call is scored against it, omitted, the layers run on "
@@ -173,10 +193,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-checkpoint-mismatch", action="store_true",
                         help="score a checkpoint the bundle was not recorded from")
     parser.add_argument("--tactics", type=pathlib.Path, default=None,
-                        help="tactic-store DIRECTORY (the loader appends tactics.json)")
+                        help="tactic-store DIRECTORY (the loader appends tactics.json); "
+                             "selects BF16 GEMM providers only -- the fp8_static route "
+                             "uses the vendor muDNN GEMM and is not tuned")
     parser.add_argument("--autotune", action="store_true",
-                        help="measure missing exact GEMM shapes and persist them under "
-                        "configs/tuning/musa/<device>-mp<N>/")
+                        help="measure missing exact BF16 GEMM shapes and persist them under "
+                             "configs/tuning/musa/<device>-mp<N>/; the fp8_static route is "
+                             "not tuned")
     parser.add_argument("--tokenizer", type=pathlib.Path, default=None,
                         help="SentencePiece model for L2 (else APXINF_TOKENIZER, else beside "
                         "the checkpoint)")
@@ -312,11 +335,15 @@ def _load_engine(args, checkpoint_dir: pathlib.Path, fixture, manifest, verify: 
                 "flow_start_time": float(fixture["flow_start_time"])}
     else:
         pins = {"num_views": args.views if args.views is not None else DEFAULT_VIEWS}
-    handle = apxinf_py.ModelRunner.load(
-        "pi05", str(weights), device=args.device, model_variant=args.model_variant,
-        execution=args.execution, **pins,
-        tactics=None if args.tactics is None else str(args.tactics), autotune=args.autotune,
-    )
+    try:
+        handle = apxinf_py.ModelRunner.load(
+            "pi05", str(weights), device=args.device, model_variant=args.model_variant,
+            calibration=args.calibration,
+            execution=args.execution, **pins,
+            tactics=None if args.tactics is None else str(args.tactics), autotune=args.autotune,
+        )
+    except Exception as error:  # noqa: BLE001 - any load failure is a refusal with its reason
+        _refuse(str(error))
     declared = (manifest or {}).get("model_config", {})
     for attribute in ("action_horizon", "action_dim", "num_views"):
         actual = getattr(handle, attribute)
@@ -327,6 +354,22 @@ def _load_engine(args, checkpoint_dir: pathlib.Path, fixture, manifest, verify: 
         _refuse(f"the checkpoint's image_size {handle.image_size} is not the fixture's "
                 f"{fixture['images'].shape[2]}")
     return handle, identity
+
+
+def _calibration_source(args, checkpoint_dir: pathlib.Path) -> dict[str, object]:
+    """Record which FP8 profile a run used, so its numbers are traceable."""
+    spec = args.calibration
+    if spec is not None and spec.startswith("uniform:"):
+        return {"source": "uniform", "scale": spec[len("uniform:"):]}
+    if spec is not None:
+        path = pathlib.Path(spec).expanduser()
+        source: dict[str, object] = {"source": "explicit", "path": str(path)}
+    else:
+        path = checkpoint_dir / "calibration.json"
+        source = {"source": "checkpoint", "path": str(path)}
+    if path.is_file():
+        source["sha256"] = artifact.sha256(path)
+    return source
 
 
 def _check_mode(args, handle, layer: str) -> str:
@@ -424,7 +467,11 @@ def _time_layers(args, layers, handle, inputs, policy, observation):
     for layer in IN_PROCESS:
         if layer not in layers:
             continue
-        timings[layer], outputs = time_loop(runners[layer], args.warmup, args.samples)
+        timings[layer], outputs = _engine_call(
+            args,
+            f"{LAYER_NAMES[layer]} inference",
+            lambda: time_loop(runners[layer], args.warmup, args.samples),
+        )
         modes[layer] = _check_mode(args, handle, layer)
         if layer == "l2":
             # The policy samples its latent on device: its repeats are meant to
@@ -598,6 +645,8 @@ def main() -> int:
     args = parse_args()
     if args.device.split(":")[0] != "musa":
         _refuse(f"{args.device} is not a MUSA device; scripts/bench_pi05.py covers other backends")
+    if args.calibration is not None and args.model_variant != "fp8_static":
+        _refuse("--calibration only applies to --model-variant fp8_static")
     if args.warmup < 0 or args.samples < 1:
         _refuse("--warmup must be >= 0 and --samples >= 1")
     if args.views is not None and args.views < 1:
@@ -660,6 +709,8 @@ def main() -> int:
             args, checkpoint_dir, fixture, manifest, verify
         )
         report["model_dir"] = str(checkpoint_dir)
+        if args.model_variant == "fp8_static":
+            report["calibration"] = _calibration_source(args, checkpoint_dir)
         inputs, workload = _inputs(fixture, handle, args, checkpoint_dir)
         workload["prompt"] = args.prompt if "l2" in layers else None
         report["workload"] = workload
@@ -707,7 +758,13 @@ def main() -> int:
             # layer selection: one L0 call costs less than a latency report with no
             # accuracy statement attached to it.
             scored = np.asarray(
-                handle._infer_patches(inputs["patches"], inputs["tokens"], inputs["noise"]),
+                _engine_call(
+                    args,
+                    "L0 inference",
+                    lambda: handle._infer_patches(
+                        inputs["patches"], inputs["tokens"], inputs["noise"]
+                    ),
+                ),
                 dtype=np.float32,
             )
         accuracy.update(_score(args, scored, expected))

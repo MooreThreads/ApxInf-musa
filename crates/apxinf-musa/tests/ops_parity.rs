@@ -131,8 +131,11 @@ fn gemm_and_activation_match_the_kernel_facade() {
     assert_same(&ctx, &out, &kernels::gemm::bf16(&ctx, &a, &b).unwrap(), "gemm");
 
     let mut out = output(&ctx, &[rows, cols / 2]);
-    ops::gemm_geglu(&ctx, ops::GemmGegluArgs { gemm: ops::GemmArgs::new(&a, &b, &mut out) })
-        .unwrap();
+    ops::gemm_geglu(
+        &ctx,
+        ops::GemmGegluArgs::new(ops::GemmArgs::new(&a, &b, &mut out)),
+    )
+    .unwrap();
     assert_same(
         &ctx,
         &out,
@@ -220,12 +223,13 @@ fn rope_and_attention_match_the_kernel_facade() {
 
     // Prefix geometry: the layer hands the MQA op a `[1, keys, 1, head_dim]`
     // cache and a `[1, tokens, heads, head_dim]` query, while the kernel reads
-    // the cache as rows of `head_dim`.
+    // the cache as rows of `head_dim`. Ten rows is the model's decode length
+    // and the smallest length both the MP22 and mp_31 routes have a tile for.
     let (keys, heads, mqa_dim) = (24, 8, 256);
-    let q = upload(&ctx, &[1, 6, heads, mqa_dim], 18);
+    let q = upload(&ctx, &[1, 10, heads, mqa_dim], 18);
     let k = upload(&ctx, &[1, keys, 1, mqa_dim], 19);
     let v = upload(&ctx, &[1, keys, 1, mqa_dim], 20);
-    let mut out = output(&ctx, &[1, 6, heads, mqa_dim]);
+    let mut out = output(&ctx, &[1, 10, heads, mqa_dim]);
     ops::attention(
         &ctx,
         ops::AttentionArgs::new(&q, &k, &v, &mut out),
@@ -233,13 +237,13 @@ fn rope_and_attention_match_the_kernel_facade() {
     .unwrap();
     let reference = kernels::attention::mqa_bf16(
         &ctx,
-        &q.reshape(vec![6, heads, mqa_dim]).unwrap(),
+        &q.reshape(vec![10, heads, mqa_dim]).unwrap(),
         &k.reshape(vec![keys, mqa_dim]).unwrap(),
         &v.reshape(vec![keys, mqa_dim]).unwrap(),
         keys,
     )
     .unwrap()
-    .reshape(vec![1, 6, heads, mqa_dim])
+    .reshape(vec![1, 10, heads, mqa_dim])
     .unwrap();
     assert_same(&ctx, &out, &reference, "mqa attention");
 }

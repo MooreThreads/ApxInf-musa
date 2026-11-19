@@ -1,5 +1,7 @@
 //! Attention operator contracts.
 
+pub(crate) mod mp31;
+
 #[cfg(apxinf_musa_available)]
 use std::ffi::c_void;
 
@@ -302,6 +304,19 @@ pub fn mqa_bf16_into_with(
     key_tokens: usize,
     tactic: TacticDispatch,
 ) -> Result<()> {
+    mqa_bf16_into_with_workspace(ctx, q, k, v, output, key_tokens, tactic, usize::MAX)
+}
+
+pub(crate) fn mqa_bf16_into_with_workspace(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    key_tokens: usize,
+    tactic: TacticDispatch,
+    workspace_limit: usize,
+) -> Result<()> {
     let (tokens, heads, head_dim) = require_3d_bf16(ctx, q, "mqa", "q")?;
     if (heads, head_dim) != (ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM) {
         return Err(Error::Other(format!(
@@ -349,6 +364,18 @@ pub fn mqa_bf16_into_with(
         heads,
         head_dim,
     })?;
+    #[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
+    if mp31::try_launch(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        [tokens, heads, head_dim, available, key_tokens],
+        workspace_limit,
+    )? {
+        return Ok(());
+    }
     launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens, tactic)
 }
 
@@ -418,18 +445,6 @@ fn launch_mqa(
     }
 }
 
-/// Whether the unpacked decode render is selected for 9–16 query rows.
-///
-/// Default on: the packed render puts all eight heads in one TileM=128 tile and
-/// launches one CTA for PI0.5's ten-row decode. `APXINF_MUSA_FA_UNPACKED=0`
-/// keeps the packed kernel for an A/B.
-#[cfg(all(apxinf_musa_available, apxinf_musa_mutlass_fmha))]
-fn unpacked_decode_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("APXINF_MUSA_FA_UNPACKED").map_or(true, |value| value != "0"))
-}
-
 /// Which D256 attention kernel this build runs.
 ///
 /// A property of the build, not of the call: the three assembly images are
@@ -474,9 +489,8 @@ fn d256_route() -> D256Route {
 /// rows, buckets the packed row count onto a tile of 16/32/64/128/192/256, and
 /// caps the tile at 192. This port applies that rule with two overrides:
 ///
-/// * 9..=16 rows -- MATE chooses the packed tile 128. This build defaults to
-///   the unpacked tile 16 (one block per head instead of one CTA for all
-///   eight); `APXINF_MUSA_FA_UNPACKED=0` restores MATE's choice for an A/B.
+/// * 9..=16 rows -- MATE chooses the packed tile 128. This build uses the
+///   unpacked tile 16 (one block per head instead of one CTA for all eight).
 /// * 17 rows and up -- the packed count lands in the 192 bucket. This build
 ///   freezes only the *unpacked* tile 192, so these lengths run that
 ///   instantiation in place of the one MATE would have chosen; 257 and up is
@@ -497,7 +511,7 @@ fn d256_route() -> D256Route {
 fn mp31_fa_variant(tokens: usize, tactic: TacticDispatch) -> Option<MutlassFaVariant> {
     match tokens {
         0..=8 => None,
-        9..=16 if !tactic.requires_exact() && unpacked_decode_enabled() => {
+        9..=16 if !tactic.requires_exact() => {
             Some(MutlassFaVariant::UnpackedDecodeTile16)
         }
         9..=16 => Some(MutlassFaVariant::PackedDecodeTile128),

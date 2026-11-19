@@ -7,10 +7,12 @@
 //! facade below, and an operator or variant this port cannot serve reports
 //! itself by name instead of approximating.
 //!
-//! Only the names PI0.5's BF16 path imports are mirrored flat. The W8A8 route
-//! has its own module ([`w8a8`]) rather than a [`GemmQuantization`] arm: its
-//! scale vectors are FP16 with a tile-ABI pad, which the f32 contract cannot
-//! carry without a conversion on every GEMM. FP8/NVFP4, GDN and the
+//! Only the names PI0.5's BF16, INT8 and static-FP8 paths import are mirrored
+//! flat. The W8A8 route has its own module ([`w8a8`]) rather than a
+//! [`GemmQuantization`] arm: its scale vectors are FP16 with a tile-ABI pad,
+//! which the f32 contract cannot carry without a conversion on every GEMM.
+//! Static FP8 is served through `GemmQuantization::Fp8UnitScale` and
+//! `QuantizationSemantic::FixedScaleE4m3`; per-row FP8/NVFP4, GDN and the
 //! packed-quantization family are not part of this surface.
 
 mod attention;
@@ -19,25 +21,32 @@ mod gather;
 mod gemm;
 mod norm;
 mod pointwise;
+mod quantization;
 mod rope;
 pub mod w8a8;
 
-pub use attention::{attention, AttentionArgs, AttentionMask, AttentionPolicy};
+pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
 pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
-pub use gemm::{gemm, gemm_geglu, GemmArgs, GemmGegluArgs, GemmPolicy, GemmQuantization};
+pub use gemm::{
+    gemm, gemm_ada_gate_residual_rms_norm, gemm_bias_gelu, gemm_bias_residual, gemm_fp8_qkv_rope,
+    gemm_geglu,
+    prepare_fp8_weight, GegluWeightLayout, GemmAdaGateResidualRmsNormArgs, GemmArgs,
+    GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
+};
 pub use norm::{
-    adaptive_rms_norm, ada_gate_residual_rms_norm, bias_residual, bias_residual_layer_norm,
-    bias_residual_rms_norm, layer_norm, rms_norm, AdaGateResidualRmsNormArgs,
-    AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
-    LayerNormArgs, RmsNormArgs,
+    ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual, bias_residual_layer_norm,
+    bias_residual_rms_norm, layer_norm, rms_norm, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs,
+    BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs, LayerNormArgs,
+    RmsNormArgs,
 };
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
+pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{rope, RopeArgs, RopeSemantic};
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 
-use apxinf_core::{DType, Error, Result};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 /// Run a fixed-shape forward pass that may prepare native executions.
 pub fn prepare_with_session<T>(
@@ -55,11 +64,12 @@ pub fn with_session<T>(
     crate::workspace::with_session(session, operation)
 }
 
-/// Reject an output scale this backend cannot honour.
+/// Reject an output scale this backend cannot honour for a BF16 output.
 ///
-/// Every operator here writes BF16. A scale other than 1.0 only makes sense for
+/// BF16 outputs require scale 1.0. A scale other than 1.0 only makes sense for
 /// a quantized output, and silently ignoring it would store unscaled values
-/// that every consumer then reads as if they had been scaled.
+/// that every consumer then reads as if they had been scaled. E4M3 outputs use
+/// [`require_positive_output_scale`] instead.
 fn require_unit_output_scale(operation: &str, output_scale: f32) -> Result<()> {
     if output_scale != 1.0 {
         return Err(Error::Other(format!(
@@ -108,4 +118,46 @@ fn require_workspace(operation: &str, required: usize, limit: usize) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// Reject a scale an E4M3 output cannot honour.
+///
+/// The dequantization contract is `real = e4m3 * scale`, so the scale must be
+/// finite and positive; zero or negative would make the reciprocal in the
+/// quantizer meaningless.
+fn require_positive_output_scale(operation: &str, output_scale: f32) -> Result<()> {
+    if !output_scale.is_finite() || output_scale <= 0.0 {
+        return Err(Error::Other(format!(
+            "MUSA {operation} needs a finite positive output_scale for an E4M3 output, got {output_scale}"
+        )));
+    }
+    Ok(())
+}
+
+/// The output form a post-op was validated for.
+///
+/// Validating before the vendor GEMM means an illegal dtype or scale fails
+/// without launching a full-size contraction, and leaves nothing half-recorded
+/// in a captured traversal.
+#[derive(Clone, Copy)]
+enum ScaledOutput {
+    Bf16,
+    /// E4M3 with the validated dequantization scale.
+    E4m3(f32),
+}
+
+fn require_scaled_output(out: &Tensor, scale: f32, operation: &str) -> Result<ScaledOutput> {
+    match out.dtype() {
+        DType::BF16 => {
+            require_unit_output_scale(operation, scale)?;
+            Ok(ScaledOutput::Bf16)
+        }
+        DType::F8E4M3 => {
+            require_positive_output_scale(operation, scale)?;
+            Ok(ScaledOutput::E4m3(scale))
+        }
+        dtype => Err(Error::Other(format!(
+            "MUSA {operation} out expects BF16 or F8E4M3, got {dtype}"
+        ))),
+    }
 }

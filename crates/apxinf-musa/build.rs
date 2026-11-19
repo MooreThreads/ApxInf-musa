@@ -71,9 +71,14 @@ const KERNEL_INPUT_TREES: &[KernelTree] = &[
         includes: &[
             "kernels/mutlass_fmha/tools",
             "kernels/mutlass_fmha/mate/data/mutlass/include",
+            "kernels/mp31_attention/tilelang/include",
         ],
         vendor_flags: false,
-        only_with_vendor_fmha: &["mutlass_fa_adapter.mu"],
+        only_with_vendor_fmha: &[
+            "mutlass_fa_adapter.mu",
+            "mp31_fp8_adapter.mu",
+            "mp31_attention_adapter.mu",
+        ],
     },
     KernelTree {
         path: "kernels/custom",
@@ -85,6 +90,22 @@ const KERNEL_INPUT_TREES: &[KernelTree] = &[
         // nothing can reach — while the build id stays correct, so nothing would
         // say so. `compiled` lists what this tree is expected to contain, and
         // the `kernels/asm` entry below it says "not compiled" the same way.
+        compiled: &[],
+        includes: &[],
+        vendor_flags: false,
+        only_with_vendor_fmha: &[],
+    },
+    KernelTree {
+        path: "kernels/mp31_fp8",
+        recursive: true,
+        compiled: &[],
+        includes: &[],
+        vendor_flags: false,
+        only_with_vendor_fmha: &[],
+    },
+    KernelTree {
+        path: "kernels/mp31_attention",
+        recursive: true,
         compiled: &[],
         includes: &[],
         vendor_flags: false,
@@ -218,7 +239,10 @@ const QINT8_ASM_VARIANTS: &[(&str, &str)] = &[
     ("qint8_256x64", "kApxinfMusaQint8Gemm256x64Image"),
     ("qint8_32x128", "kApxinfMusaQint8Gemm32x128Image"),
     ("qint8_32x64", "kApxinfMusaQint8Gemm32x64Image"),
-    ("qint8_256x128_mfast", "kApxinfMusaQint8Gemm256x128MfastImage"),
+    (
+        "qint8_256x128_mfast",
+        "kApxinfMusaQint8Gemm256x128MfastImage",
+    ),
 ];
 
 // Separate from the convolution tile ABI: these use the BF16 GEMM ABI with

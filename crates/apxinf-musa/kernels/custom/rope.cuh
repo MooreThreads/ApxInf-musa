@@ -575,8 +575,10 @@ __global__ void qkv_rope_bf16_kernel(const __mt_bfloat16* qkv,
   // this changes no numbers. A host-side table would not be: `math.cuh`'s note
   // about device and host transcendentals differing applies here too.
   const float rate = frequency[pair];
-  const float cosine = round_bf16(cosf(static_cast<float>(position) * rate));
-  const float sine = round_bf16(sinf(static_cast<float>(position) * rate));
+  float cosine_raw, sine_raw;
+  __sincosf(static_cast<float>(position) * rate, &sine_raw, &cosine_raw);
+  const float cosine = round_bf16(cosine_raw);
+  const float sine = round_bf16(sine_raw);
 
   // The packed projection and its bias share one layout -- q | k | v, each
   // segment `heads * head_dim` wide -- so one offset serves both.

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Check that MUSA exports the typed operators its model port imports.
 
-The independent CUDA PI0.5 port can evolve its operators and weight layouts
-without adding requirements to MUSA. Scan the MUSA port's BF16 and INT8 paths;
-compare their imports against `crates/apxinf-musa/src/ops/` exports.
+The MUSA backend mirrors `apxinf-cuda-new`'s `ops` public surface, but only the
+part PI0.5's BF16, INT8 and static-FP8 paths actually name. This script is the
+check on that claim: it collects every `backend::ops` name the model tree
+mentions and compares the set against what `crates/apxinf-musa/src/ops/` exports.
 
 `--tree` may be repeated to check additional MUSA model ports.
 """
@@ -21,9 +22,11 @@ DEFAULT_TREES = (
     "crates/apxinf-model/src/musa_pi05",
 )
 # Files whose imports do not describe this backend's surface, keyed by tree.
-# MUSA's INT8 files count; its unimplemented FP8 path does not.
+# `pi05/` is not compiled on MUSA, so its FP8 and INT8 files describe cuda-new's
+# contracts, not this crate's; the port's own INT8 and static-FP8 files do count.
 TREE_EXCLUSIONS = {
-    "crates/apxinf-model/src/musa_pi05": ("fp8_static",),
+    "crates/apxinf-model/src/pi05": ("fp8_static", "int8_dynamic"),
+    "crates/apxinf-model/src/musa_pi05": (),
 }
 DEFAULT_EXCLUSIONS = ()
 

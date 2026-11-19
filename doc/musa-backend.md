@@ -277,6 +277,22 @@ upstream keeps for its INT32 accumulator and verifier.
 
 ### FP8 (static E4M3)
 
+The verified MP31 decode O/down projections also reduce FP32 split-K partials
+inside the gate/residual/AdaRMSNorm/E4M3 consumer. O encodes BF16 activation
+while loading; the safe GEMM API also provides composed fallback for this input
+mode. Shapes are restricted to M=10, N=1024, K=2048/4096; both sites are
+enabled by default. The final decoder layer retains its existing
+down/final-normalization path.
+
+MP31 also has a native fused E4M3 GEMM → BF16 GeGLU → E4M3 epilogue for
+`M=10, K=1024, N=8192`, with interleaved gate/up pairs of width 32. The loader
+prepares immutable weights once; `ops::gemm_geglu` selects it without changing
+the model variant or Python interface. Unsupported shapes retain the existing
+path. See
+[`kernels/mp31_fp8`](../crates/apxinf-musa/kernels/mp31_fp8/README.md) for
+preparation, validation and source provenance. The measured improvement does
+not meet the 16.67 ms / 60 Hz target.
+
 `model_variant=fp8_static` is the `mp_31` route. `mp_22` refuses it before
 weights load: its 8-bit tensor-core path is the INT8 `s8mma` assembly, it has no
 E4M3 MMA, and the port has no emulation fallback. The build publishes
@@ -316,7 +332,33 @@ MATE kernel for 9–16 query rows (`mp31_decode_unpacked_tile16`). The packed
 render launches `(1, 1, 1)` for the model's ten-query pass — one CTA over all
 532 keys — while the unpacked one gives each of the eight heads a block,
 `(1, 8, 1)`. Measured on an idle S5000: 22.3 µs vs 32.5 µs per call.
-`APXINF_MUSA_FA_UNPACKED=0` keeps the packed kernel for an A/B.
+
+For the PI0.5 static-FP8 decoder shape `(T=10, q_heads=8, kv_heads=1,
+head_dim=256, valid_kv=532)`, the MP31 native BF16 QK/PV path is enabled by
+default. It uses BN64 with fixed-order split-KV=5 reduction. K/V descriptors
+expose the logical 532 rows; TME zero-fills the final tile. Declaring 576
+rows would read past the logical tensors and can propagate poisoned values.
+Unsupported shapes keep the MATE fallback.
+
+Barrier initialization is performed by one elected thread. A single producer
+warp registers DMA transactions and arrives at the corresponding barriers;
+consumer release barriers retain four participating warps. Multi-process
+stress testing of the earlier protocol exposed `asyncTransBarArrivalOutOfBounds`
+(MUSA error 784); the corrected protocol passed a 60-second, four-process run
+on two S5000 cards with no errors or output drift.
+
+The native path is prepared before graph capture and keeps its workspace
+alive for replay. Graph nodes copy the prepared descriptors. Other sequence
+lengths, layouts and MP22 retain their existing routes. Regression tests use
+NaN-poisoned storage beyond the real KV length and assert that the exact
+shape actually enters the native route, then check eager/capture/1000 replays
+and workspace guards.
+
+The unchanged L0 benchmark (`require-graph`, 2 views at 224, 10 flow steps,
+horizon 10, warmup 5, samples 20) measured 25.811 / 25.594 ms P50 on two idle
+S5000 cards, with cosine 0.999441895 and zero replay drift. The 16.67 ms /
+60 Hz target remains unmet. The local evidence does not retune the checked-in
+GEMM tactics or change the workload.
 
 The end-to-end measurement on S5000 (L0, `require-graph`, 2 views, T=10) is
 **29.45 ms** against **34.71 ms** for tuned BF16 on the same idle card
@@ -877,3 +919,8 @@ APXINF_PI05_TEST_CHECKPOINT=<checkpoint dir> \
 The first runs without a checkpoint. The second needs a real one: it includes
 the capture acceptance test, which builds an eager and a captured plan from one
 loaded model and compares raw action bits under a changed latent.
+
+GeGLU 的后续长跑仍曾暴露 `AsyncTransBarArrivalOutOfBounds`。当前实现改为完整首 warp 初始化，
+producer/consumer 各自循环、排空全部使用过的 stage，并在 epilogue 前后做 CTA 同步。
+独立压力探针通过 360 万次调用；两卡各 60 秒整模串行运行分别完成 2252/2265 次，输出逐位相同。
+这组验证是阶段稳定性证据，不能替代尚未达到的两卡 60 Hz 最终验收。

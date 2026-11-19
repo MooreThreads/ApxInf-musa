@@ -18,6 +18,7 @@ use crate::tuning::{TuningDb, TuningMode, TuningPaths};
 pub(crate) mod assembly;
 mod bf16;
 mod fp8;
+pub(crate) mod mp31_fp8;
 #[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
 mod qint8_tiles;
 mod w8a8;
@@ -29,6 +30,7 @@ pub use bf16::{
     gemm_bf16_into_with,
 };
 pub use fp8::{gemm_fp8_bias_into, gemm_fp8_bias_residual_into, gemm_fp8_into};
+pub use mp31_fp8::prepare_fp8_weight;
 pub use qint8_tiles::serves as w8a8_tile_serves;
 pub use w8a8::{
     norm_quantize_w8a8_activation,

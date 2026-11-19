@@ -26,7 +26,7 @@ constexpr int kMaxGridY = 65535;
 __device__ __forceinline__ float gelu_tanh(float value) {
   constexpr float kAlpha = 0.7978845608028654f;
   return 0.5f * value *
-         (1.0f + tanhf(kAlpha * (value + 0.044715f * value * value * value)));
+         (1.0f + __musa_tanh_f(kAlpha * (value + 0.044715f * value * value * value)));
 }
 
 // The static-FP8 quantizer's per-value arithmetic, shared by the standalone

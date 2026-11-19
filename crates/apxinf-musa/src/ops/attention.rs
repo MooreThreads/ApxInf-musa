@@ -55,13 +55,15 @@ impl Default for AttentionPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AdmittedAttentionPolicy {
     tactic: TacticDispatch,
+    workspace_limit: usize,
 }
 
 impl AttentionPolicy {
     /// Validate every field and keep only what execution must honour.
     fn admit(&self, operation: &str) -> Result<AdmittedAttentionPolicy> {
         require_deterministic(operation, self.deterministic)?;
-        // Attention allocates no workspace of its own.
+        // The composed path needs no intermediate. Native candidates separately
+        // check their prepared scratch against the admitted per-call limit.
         require_workspace(operation, 0, self.workspace_limit)?;
         Ok(AdmittedAttentionPolicy {
             tactic: if self.allow_fallback {
@@ -69,6 +71,7 @@ impl AttentionPolicy {
             } else {
                 TacticDispatch::RequireExact
             },
+            workspace_limit: self.workspace_limit,
         })
     }
 }
@@ -127,9 +130,7 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
         return Err(not_ported("attention with a non-default scale"));
     }
 
-    let mut query = args
-        .query
-        .reshape(vec![batch * tokens, heads, head_dim])?;
+    let mut query = args.query.reshape(vec![batch * tokens, heads, head_dim])?;
     let mut out = args.out.reshape(vec![batch * tokens, heads, head_dim])?;
     if args.key.shape().dims() == query_dims {
         let [key_batch, key_tokens, key_heads, key_dim] = args.key.shape().dims() else {
@@ -165,7 +166,7 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
         // accepted rank describes the same bytes of one contiguous buffer.
         let key = args.key.reshape(vec![key_tokens, head_dim])?;
         let value = args.value.reshape(vec![key_tokens, head_dim])?;
-        kernels::mqa_bf16_into_with(
+        kernels::mqa_bf16_into_with_workspace(
             ctx,
             &mut query,
             &key,
@@ -173,6 +174,7 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
             &mut out,
             key_tokens,
             admitted.tactic,
+            admitted.workspace_limit,
         )
     }
 }
@@ -252,4 +254,20 @@ mod policy_tests {
         .admit("attention")
         .is_ok());
     }
+}
+
+/// Prepare optional kernels and bounded scratch for a head geometry before capture.
+/// Other geometries and targets retain the existing routes.
+pub fn prepare_attention(
+    ctx: &MusaContext,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if query_heads == 0 || kv_heads == 0 || head_dim == 0 || query_heads % kv_heads != 0 {
+        return Err(apxinf_core::Error::Other(
+            "prepare_attention: invalid head geometry".into(),
+        ));
+    }
+    kernels::mp31::prepare(ctx, query_heads, kv_heads, head_dim)
 }

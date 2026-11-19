@@ -43,7 +43,7 @@ __global__ void bias_activation_bf16_kernel(const __mt_bfloat16* input,
       float value = __bfloat162float(input[base + col]);
       if (bias != nullptr) value += __bfloat162float(bias[col]);
       if (activation == Activation::Gelu) value = gelu_tanh(value);
-      if (activation == Activation::Silu) value = value / (1.0f + expf(-value));
+      if (activation == Activation::Silu) value = value / (1.0f + __musa_exp_f(-value));
       if (activation == Activation::Relu) value = fmaxf(value, 0.0f);
       output[base + col] = __float2bfloat16(value);
     }
@@ -160,7 +160,7 @@ __global__ void bias_activation_bf16_vector8_kernel(
         float value = __bfloat162float(input_raw.lanes[i]);
         if (HAS_BIAS) value += __bfloat162float(bias_raw.lanes[i]);
         if (ACTIVATION == Activation::Gelu) value = gelu_tanh(value);
-        if (ACTIVATION == Activation::Silu) value = value / (1.0f + expf(-value));
+        if (ACTIVATION == Activation::Silu) value = value / (1.0f + __musa_exp_f(-value));
         if (ACTIVATION == Activation::Relu) value = fmaxf(value, 0.0f);
         output_raw.lanes[i] = __float2bfloat16(value);
       }
@@ -209,7 +209,7 @@ __global__ void bias_activation_bf16_e4m3_vector8_kernel(
         float value = __bfloat162float(input_raw.lanes[i]);
         if (HAS_BIAS) value += __bfloat162float(bias_raw.lanes[i]);
         if (ACTIVATION == 1) value = gelu_tanh(value);
-        if (ACTIVATION == 2) value = value / (1.0f + expf(-value));
+        if (ACTIVATION == 2) value = value / (1.0f + __musa_exp_f(-value));
         const __mt_bfloat16 rounded = __float2bfloat16(value);
         packed_out |= static_cast<uint64_t>(
                           quantize_e4m3_value(__bfloat162float(rounded),

@@ -1,0 +1,200 @@
+//! Native BF16 activation collection for PI0.5 FP8 calibration on MUSA.
+//!
+//! Copied from the CUDA `pi05` model calibration; the observer itself is the
+//! same, but the installation hook is `apxinf_musa`'s
+//! `Bf16ActivationObserver`, which `gemm_bf16_into` already calls before every
+//! BF16 GEMM. No explicit call sites are added to the BF16 blocks.
+//!
+//! The model precomputes its modulation at load, so `calibrate` replays that
+//! projection with the observer installed before running inference; otherwise
+//! the time/conditioning sites would never be observed.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
+
+use apxinf_core::{Error, Result, Tensor};
+
+use crate::musa_pi05::backend::gemm::{install_bf16_observer, Bf16ActivationObserver};
+use crate::musa_pi05::{backend, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
+
+pub struct Pi05CalibrationObserver {
+    sites: HashMap<usize, String>,
+    plan: Pi05CalibrationPlan,
+    records: RefCell<BTreeMap<String, f32>>,
+}
+
+impl Pi05CalibrationObserver {
+    pub fn new(config: &Pi05Config, weights: &Bf16Weights) -> Result<Self> {
+        let mut sites = HashMap::new();
+        let plan = Pi05CalibrationPlan::for_config(config);
+        let mut insert = |tensor: &Tensor, name: String| -> Result<()> {
+            let handle = tensor
+                .storage()
+                .as_gpu()
+                .ok_or_else(|| Error::Other(format!("calibration weight {name} is not on MUSA")))?;
+            sites.insert(handle.ptr, name);
+            Ok(())
+        };
+
+        insert(&weights.patch_embedding.weight, "vision.patch_input".into())?;
+        for (layer, names) in weights.vision_layers.iter().zip(plan.vision_layers()) {
+            insert(&layer.qkv.weight, names.attention_norm.clone())?;
+            insert(
+                &layer.output.weight,
+                names.attention_output.clone().expect("vision tail site"),
+            )?;
+            insert(
+                &layer.fc1.weight,
+                names.mlp_norm.clone().expect("vision tail site"),
+            )?;
+            insert(
+                &layer.fc2.weight,
+                names.mlp_activation.clone().expect("vision tail site"),
+            )?;
+        }
+        insert(
+            &weights.multimodal_projector.weight,
+            "vision.post_norm".into(),
+        )?;
+        for (layer, names) in weights.language_layers.iter().zip(plan.language_layers()) {
+            insert(&layer.qkv.weight, names.attention_norm.clone())?;
+            if let Some(attention_output) = &names.attention_output {
+                insert(&layer.output.weight, attention_output.clone())?;
+                insert(
+                    &layer.gate_up.weight,
+                    names.mlp_norm.clone().expect("language tail site"),
+                )?;
+                insert(
+                    &layer.down.weight,
+                    names.mlp_activation.clone().expect("language tail site"),
+                )?;
+            }
+        }
+        insert(&weights.action_in.weight, "action.input".into())?;
+        insert(&weights.time_mlp_in.weight, "time.input".into())?;
+        insert(&weights.time_mlp_out.weight, "time.hidden".into())?;
+        for layer in &weights.action_layers {
+            insert(&layer.input_modulation.weight, "action.conditioning".into())?;
+            insert(
+                &layer.post_attention_modulation.weight,
+                "action.conditioning".into(),
+            )?;
+        }
+        insert(
+            &weights.action_final_modulation.weight,
+            "action.conditioning".into(),
+        )?;
+        for (layer, names) in weights.action_layers.iter().zip(plan.action_layers()) {
+            insert(&layer.qkv.weight, names.attention_norm.clone())?;
+            insert(
+                &layer.output.weight,
+                names.attention_output.clone().expect("action tail site"),
+            )?;
+            insert(
+                &layer.gate_up.weight,
+                names.mlp_norm.clone().expect("action tail site"),
+            )?;
+            insert(
+                &layer.down.weight,
+                names.mlp_activation.clone().expect("action tail site"),
+            )?;
+        }
+        insert(&weights.action_out.weight, "action.final_norm".into())?;
+
+        Ok(Self {
+            sites,
+            plan,
+            records: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn records(&self) -> Result<BTreeMap<String, f32>> {
+        let records = self.records.borrow().clone();
+        let expected = self.plan.sites().iter().cloned().collect::<BTreeSet<_>>();
+        let observed = records.keys().cloned().collect::<BTreeSet<_>>();
+        if observed != expected {
+            let missing = expected.difference(&observed).take(8).collect::<Vec<_>>();
+            let unknown = observed.difference(&expected).take(8).collect::<Vec<_>>();
+            return Err(Error::Other(format!(
+                "calibration site coverage mismatch: missing={missing:?}, unknown={unknown:?}"
+            )));
+        }
+        Ok(records)
+    }
+}
+
+impl Bf16ActivationObserver for Pi05CalibrationObserver {
+    fn observe(&self, activation: &Tensor, weight: &Tensor) -> Result<()> {
+        let pointer = weight
+            .storage()
+            .as_gpu()
+            .ok_or_else(|| Error::Other("observed BF16 weight is not on MUSA".into()))?
+            .ptr;
+        let Some(name) = self.sites.get(&pointer) else {
+            return Ok(());
+        };
+        // The host vector is scoped to this reduction and dropped immediately;
+        // the collector retains only one scalar per logical site.
+        let values = backend::to_cpu(activation)?.to_f32_vec()?;
+        let amax = finite_amax(values, name)?;
+        let mut records = self.records.borrow_mut();
+        records
+            .entry(name.clone())
+            .and_modify(|current| *current = current.max(amax))
+            .or_insert(amax);
+        Ok(())
+    }
+}
+
+fn finite_amax(values: impl IntoIterator<Item = f32>, name: &str) -> Result<f32> {
+    let mut amax = 0.0f32;
+    for value in values {
+        if !value.is_finite() {
+            return Err(Error::Other(format!(
+                "calibration site {name} produced non-finite activation {value}"
+            )));
+        }
+        amax = amax.max(value.abs());
+    }
+    Ok(amax)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finite_amax;
+
+    #[test]
+    fn activation_amax_rejects_non_finite_values() {
+        assert!(finite_amax([1.0, f32::NAN], "test.site").is_err());
+        assert!(finite_amax([f32::INFINITY], "test.site").is_err());
+        assert_eq!(finite_amax([-2.0, 1.0], "test.site").unwrap(), 2.0);
+    }
+}
+
+use super::blocks::{Bf16Blocks, Blocks};
+use super::Pi05Model;
+use crate::musa_pi05::backend::DeviceBuffer;
+impl Pi05Model<Bf16Blocks> {
+    /// Explicit diagnostic traversal of the same Model; no second model body.
+    pub fn calibrate(
+        &self,
+        patches: &Tensor,
+        ids: &DeviceBuffer,
+        count: usize,
+        noise: &Tensor,
+    ) -> Result<std::collections::BTreeMap<String, f32>> {
+        let observer = Rc::new(Pi05CalibrationObserver::new(
+            &self.blocks.config,
+            &self.blocks.weights,
+        )?);
+        let _guard = install_bf16_observer(observer.clone())?;
+        // The load-time modulation is already on the model; this replay exists
+        // only so the observer sees the time/conditioning GEMMs that produced
+        // it. Its outputs are dropped, and inference uses the stored copy.
+        let _ = self.blocks.compute_modulation(self.embeddings())?;
+        self.infer(patches, ids, count, noise)?;
+        backend::synchronize(&self.blocks.backend)?;
+        observer.records()
+    }
+}

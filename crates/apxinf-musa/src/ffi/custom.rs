@@ -14,6 +14,83 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_attention_prepare() -> musaError_t;
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_attention_descriptors(
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        result: *mut *mut c_void,
+    ) -> musaError_t;
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_attention_release(descriptors: *mut c_void);
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_attention(
+        descriptors: *const c_void,
+        partials: *mut f32,
+        stats: *mut f32,
+        output: *mut c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_fp8_projection_norm(
+        input: *const c_void,
+        weight: *const c_void,
+        partial: *mut f32,
+        residual: *const c_void,
+        gate: *const c_void,
+        style: *const c_void,
+        hidden: *mut c_void,
+        out: *mut c_void,
+        m: i32,
+        bf16_input: i32,
+        inverse_input_scale: f32,
+        alpha: f32,
+        output_scale: f32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_prepare_fp8(
+        input: *const c_void,
+        packed: *mut c_void,
+        direct_packed: *mut c_void,
+        k: i32,
+        n: i32,
+        handle: *mut *mut c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_release_fp8(handle: *mut c_void);
+    #[cfg(apxinf_musa_mutlass_fmha)]
+    pub fn apxinf_musa_mp31_fp8_geglu(
+        input: *const c_void,
+        handle: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        alpha: f32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    pub fn apxinf_musa_mp31_fp8_qkv_rope(
+        input: *const c_void,
+        handle: *const c_void,
+        bias: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        theta: f32,
+        position_offset: i32,
+        kv_output_offset: i32,
+        alpha: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// RMSNorm (norm_bias null, cols 2048) or LayerNorm (cols 1152), optional
     /// bias+residual producer, and row quantization. BF16 inputs/hidden; INT8
     /// output [rows,cols]; FP16 scales [rows+512]; optional F32 inv_c [cols].
@@ -32,7 +109,6 @@ extern "C" {
         inv_c: *const c_void,
         stream: *mut c_void,
     ) -> musaError_t;
-
 
     /// Adaptive RMSNorm + row quantization for 1024 columns. A non-null
     /// residual enables gated addition and writes BF16 hidden; otherwise

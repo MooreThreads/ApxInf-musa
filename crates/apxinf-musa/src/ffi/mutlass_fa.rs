@@ -33,8 +33,7 @@ pub enum MutlassFaVariant {
     /// MATE 0.2.7 config `fmha_fwd_4386cd8f…`: `TileM` 128, packed GQA, two
     /// QK/PV consumer warpgroups. MATE's tile rule selects it for 9 to 16 query
     /// rows, which is PI0.5's ten-row action pass; this port defaults those rows
-    /// to `UnpackedDecodeTile16` and keeps this variant behind
-    /// `APXINF_MUSA_FA_UNPACKED=0`.
+    /// to `UnpackedDecodeTile16` and keeps this variant for `RequireExact`.
     PackedDecodeTile128 = 0,
     /// MATE 0.2.7 config `fmha_fwd_be3f5142…`: `TileM` 192, unpacked, three
     /// consumer warpgroups. MATE selects it for 257 or more query rows, which is

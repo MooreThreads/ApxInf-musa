@@ -26,8 +26,9 @@ pub(crate) use apxinf_musa::sampling;
 pub(crate) mod gemm {
     pub(crate) use apxinf_musa::kernels::gemm::{
         adaptive_gate_residual_rms_quantize_w8a8_activation,
-        adaptive_rms_quantize_w8a8_activation, decode_scope, norm_quantize_w8a8_activation,
-        prepare_bf16_nn_weight, prepare_bf16_nt_weight,
+        adaptive_rms_quantize_w8a8_activation, decode_scope, install_bf16_observer,
+        norm_quantize_w8a8_activation, prepare_bf16_nn_weight, prepare_bf16_nt_weight,
+        Bf16ActivationObserver,
     };
 }
 

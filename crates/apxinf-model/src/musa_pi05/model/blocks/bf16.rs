@@ -2,21 +2,24 @@
 
 use crate::musa_pi05::backend::{
     ops::{
-        attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
-        gemm as l3_gemm, gemm_geglu as l3_gemm_geglu, pointwise as l3_pointwise,
-        rms_norm as l3_rms_norm, reserve_prefix as l3_reserve_prefix, rope as l3_rope,
-        AttentionArgs, GatherArgs, GatherSemantic, GemmArgs, GemmGegluArgs, PointwiseActivation,
-        PointwiseArgs, PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic,
+        concat_rows as l3_concat_rows, gather as l3_gather, gemm as l3_gemm,
+        gemm_geglu as l3_gemm_geglu, reserve_prefix as l3_reserve_prefix, GatherArgs,
+        GatherSemantic, GemmArgs, GemmGegluArgs, PointwiseActivation,
     },
-    Context, DeviceBuffer,
+    Context,
 };
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
+use super::L3Policies;
+use super::shared::{
+    adaptive_gate_residual_rms_bf16, add_position_bf16, bias_activation_bf16, euler_update_bf16,
+    mha_bf16, mqa_bf16, rms_bf16, split_qkv_bias_bf16, split_qkv_rope_bf16,
+    split_qkv_rope_into_cache_bf16,
+};
 use super::{
     adaptive_rms_bf16, bias_residual_bf16, bias_residual_layer_bf16, bias_residual_rms_bf16,
-    bf16_vector_prefix, layer_bf16, QkvTensors, QkvViews, ResidualNormTensors,
+    layer_bf16, QkvViews,
 };
-use super::L3Policies;
 use crate::musa_pi05::{
     Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Bf16LinearWeights,
     GemmaVariantConfig,
@@ -31,56 +34,6 @@ pub struct Bf16LanguageLayerOutput {
 pub struct Bf16ActionLayerOutput {
     pub hidden: Tensor,
     pub next_normalized: Tensor,
-}
-
-fn rms_bf16(ctx: &Context, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_rms_norm(ctx, RmsNormArgs::new(input, weight, &mut output, eps))?;
-    Ok(output)
-}
-
-fn bias_activation_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    bias: Option<&Tensor>,
-    activation: PointwiseActivation,
-) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    let mut args = PointwiseArgs::new(PointwiseSemantic::BiasActivation, input, &mut output);
-    args.bias = bias;
-    args.activation = activation;
-    l3_pointwise(ctx, args)?;
-    Ok(output)
-}
-
-fn euler_update_bf16(
-    ctx: &Context,
-    state: &Tensor,
-    velocity: &Tensor,
-    dt: f32,
-) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(state.shape().clone(), DType::BF16)?;
-    let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, state, &mut output);
-    args.secondary = Some(velocity);
-    args.dt = dt;
-    l3_pointwise(ctx, args)?;
-    Ok(output)
-}
-
-fn add_position_bf16(
-    ctx: &Context,
-    projection: &Tensor,
-    bias: Option<&Tensor>,
-    position: &Tensor,
-    tokens_per_view: usize,
-) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut args = GatherArgs::new(GatherSemantic::BiasPosition, projection, &mut output);
-    args.bias = bias;
-    args.position = Some(position);
-    args.tokens_per_view = tokens_per_view;
-    l3_gather(ctx, args)?;
-    Ok(output)
 }
 
 fn gemm_bf16(
@@ -136,266 +89,8 @@ fn gemm_geglu_bf16(
     // there is no per-call candidate cache for a version token to key.
     let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output);
     gemm.policy = policies.gemm.clone();
-    l3_gemm_geglu(ctx, GemmGegluArgs { gemm })?;
+    l3_gemm_geglu(ctx, GemmGegluArgs::new(gemm))?;
     Ok(output)
-}
-
-fn mqa_bf16(
-    ctx: &Context,
-    policies: &L3Policies,
-    query: &Tensor,
-    key: &Tensor,
-    value: &Tensor,
-    key_tokens: usize,
-) -> Result<Tensor> {
-    let q = query.shape().dims();
-    let k = key.shape().dims();
-    if query.dtype() != DType::BF16
-        || key.dtype() != DType::BF16
-        || value.dtype() != DType::BF16
-        || q.len() != 3
-        || value.shape() != key.shape()
-        || !matches!(k.len(), 2 | 3)
-        || k[k.len() - 1] != q[2]
-    {
-        return Err(Error::Other("PI0.5 BF16 MQA shape/dtype mismatch".into()));
-    }
-    let kv_heads = if k.len() == 2 { 1 } else { k[1] };
-    let available_tokens = k[0];
-    if key_tokens == 0 || key_tokens > available_tokens || q[1] % kv_heads != 0 {
-        return Err(Error::Other("PI0.5 BF16 MQA token/head mismatch".into()));
-    }
-    let kv_elements = key_tokens
-        .checked_mul(kv_heads)
-        .and_then(|count| count.checked_mul(q[2]))
-        .ok_or_else(|| Error::Other("PI0.5 BF16 MQA size overflow".into()))?;
-    let kv_bytes = kv_elements
-        .checked_mul(DType::BF16.size_in_bytes())
-        .ok_or_else(|| Error::Other("PI0.5 BF16 MQA byte-size overflow".into()))?;
-    let key = DeviceBuffer::from_tensor(key)
-        .and_then(|buffer| buffer.view(0, kv_bytes))
-        .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
-        })
-        .map_err(Error::Other)?;
-    let value = DeviceBuffer::from_tensor(value)
-        .and_then(|buffer| buffer.view(0, kv_bytes))
-        .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
-        })
-        .map_err(Error::Other)?;
-    let query4 = query.reshape(Shape::new(vec![1, q[0], q[1], q[2]]))?;
-    let mut output = ctx.allocate_output(query4.shape().clone(), DType::BF16)?;
-    let mut args = AttentionArgs::new(&query4, &key, &value, &mut output);
-    args.policy = policies.attention.clone();
-    l3_attention(ctx, args)?;
-    output.reshape(query.shape().clone())
-}
-
-fn mha_bf16(
-    ctx: &Context,
-    policies: &L3Policies,
-    query: &Tensor,
-    key: &Tensor,
-    value: &Tensor,
-    tokens_per_batch: usize,
-) -> Result<Tensor> {
-    let shape = query.shape().dims();
-    if query.dtype() != DType::BF16
-        || key.dtype() != DType::BF16
-        || value.dtype() != DType::BF16
-        || shape.len() != 3
-        || key.shape() != query.shape()
-        || value.shape() != query.shape()
-        || tokens_per_batch == 0
-        || shape[0] % tokens_per_batch != 0
-    {
-        return Err(Error::Other("PI0.5 BF16 MHA shape/dtype mismatch".into()));
-    }
-    let batch = shape[0] / tokens_per_batch;
-    let shape4 = Shape::new(vec![batch, tokens_per_batch, shape[1], shape[2]]);
-    let query4 = query.reshape(shape4.clone())?;
-    let key4 = key.reshape(shape4.clone())?;
-    let value4 = value.reshape(shape4.clone())?;
-    let mut output = ctx.allocate_output(shape4, DType::BF16)?;
-    let mut args = AttentionArgs::new(&query4, &key4, &value4, &mut output);
-    args.policy = policies.attention.clone();
-    l3_attention(ctx, args)?;
-    output.reshape(query.shape().clone())
-}
-
-fn split_qkv_bias_bf16(
-    ctx: &Context,
-    qkv: &Tensor,
-    bias: Option<&Tensor>,
-    heads: usize,
-    head_dim: usize,
-) -> Result<QkvTensors> {
-    let shape = qkv.shape().dims();
-    if qkv.dtype() != DType::BF16
-        || shape.len() != 2
-        || shape[1] != 3 * heads * head_dim
-    {
-        return Err(Error::Other(
-            "PI0.5 BF16 vision QKV shape/dtype mismatch".into(),
-        ));
-    }
-    let output_shape = Shape::new(vec![shape[0], heads, head_dim]);
-    let mut q = ctx.allocate_output(output_shape.clone(), DType::BF16)?;
-    let mut k = ctx.allocate_output(output_shape.clone(), DType::BF16)?;
-    let mut v = ctx.allocate_output(output_shape, DType::BF16)?;
-    l3_rope(
-        ctx,
-        RopeArgs {
-            semantic: RopeSemantic::SplitQkvBias,
-            qkv,
-            bias,
-            q: &mut q,
-            k: &mut k,
-            v: &mut v,
-            q_heads: heads,
-            kv_heads: heads,
-            head_dim,
-            theta: 1.0,
-            position_offset: 0,
-            kv_output_offset: 0,
-        },
-    )?;
-    Ok(QkvTensors { q, k, v })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn split_qkv_rope_bf16(
-    ctx: &Context,
-    qkv: &Tensor,
-    bias: Option<&Tensor>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    theta: f32,
-    position_offset: usize,
-) -> Result<QkvTensors> {
-    let shape = qkv.shape().dims();
-    let expected_width = (q_heads + 2 * kv_heads)
-        .checked_mul(head_dim)
-        .ok_or_else(|| Error::Other("PI0.5 BF16 QKV width overflow".into()))?;
-    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != expected_width {
-        return Err(Error::Other(
-            "PI0.5 BF16 rotary QKV shape/dtype mismatch".into(),
-        ));
-    }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
-    let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
-    let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
-    let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
-    l3_rope(
-        ctx,
-        RopeArgs {
-            semantic: RopeSemantic::SplitQkvRope,
-            qkv,
-            bias,
-            q: &mut q,
-            k: &mut k,
-            v: &mut v,
-            q_heads,
-            kv_heads,
-            head_dim,
-            theta,
-            position_offset,
-            kv_output_offset: 0,
-        },
-    )?;
-    Ok(QkvTensors { q, k, v })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn split_qkv_rope_into_cache_bf16(
-    ctx: &Context,
-    qkv: &Tensor,
-    bias: Option<&Tensor>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    theta: f32,
-    position_offset: usize,
-    cache_offset: usize,
-    key_cache: &Tensor,
-    value_cache: &Tensor,
-) -> Result<Tensor> {
-    let shape = qkv.shape().dims();
-    let expected_width = (q_heads + 2 * kv_heads)
-        .checked_mul(head_dim)
-        .ok_or_else(|| Error::Other("PI0.5 BF16 QKV width overflow".into()))?;
-    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != expected_width {
-        return Err(Error::Other(
-            "PI0.5 BF16 cached rotary QKV shape/dtype mismatch".into(),
-        ));
-    }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
-    let mut key_cache = key_cache.clone();
-    let mut value_cache = value_cache.clone();
-    l3_rope(
-        ctx,
-        RopeArgs {
-            semantic: RopeSemantic::SplitQkvRope,
-            qkv,
-            bias,
-            q: &mut q,
-            k: &mut key_cache,
-            v: &mut value_cache,
-            q_heads,
-            kv_heads,
-            head_dim,
-            theta,
-            position_offset,
-            kv_output_offset: cache_offset,
-        },
-    )?;
-    Ok(q)
-}
-
-fn adaptive_gate_residual_rms_bf16(
-    ctx: &Context,
-    projection: &Tensor,
-    residual: &Tensor,
-    gate_style: &Tensor,
-    norm_style: &Tensor,
-    eps: f32,
-) -> Result<ResidualNormTensors> {
-    let cols = projection
-        .shape()
-        .dims()
-        .last()
-        .copied()
-        .ok_or_else(|| Error::Other("PI0.5 AdaRMS input has no columns".into()))?;
-    let norm_style = bf16_vector_prefix(norm_style, 2 * cols)?;
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    crate::musa_pi05::backend::ops::ada_gate_residual_rms_norm(
-        ctx,
-        crate::musa_pi05::backend::ops::AdaGateResidualRmsNormArgs::new(
-            projection,
-            residual,
-            &norm_style,
-            gate_style,
-            &mut hidden,
-            &mut normalized,
-            eps,
-        ),
-    )?;
-    Ok(ResidualNormTensors { hidden, normalized })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -454,7 +149,7 @@ fn language_layer_bf16_with_policies(
             value: qkv.value_2d(tokens, config.head_dim)?,
         });
     }
-    let attention = mqa_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, tokens)?
+    let attention = mqa_bf16(ctx, &policies.attention, &qkv.q, &qkv.k, &qkv.v, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
     let fused = bias_residual_rms_bf16(
@@ -467,8 +162,7 @@ fn language_layer_bf16_with_policies(
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
-    let hidden =
-        bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -549,7 +243,7 @@ fn action_layer_bf16_with_policies(
     )?;
     let attention = mqa_bf16(
         ctx,
-        policies,
+        &policies.attention,
         &q,
         prefix_k,
         prefix_v,
@@ -661,7 +355,7 @@ fn vision_layer_bf16_with_policies(
     )?;
     let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
     let qkv = split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
-    let attention = mha_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
+    let attention = mha_bf16(ctx, &policies.attention, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
     let projection = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
     let fused = bias_residual_layer_bf16(
@@ -892,23 +586,6 @@ pub(in crate::musa_pi05::model) mod backbone {
                 mlp,
                 final_norm,
             })
-        }
-
-        fn compute_all_modulation(
-            &self,
-            time_embeddings: &[Tensor],
-        ) -> Result<Vec<Bf16StepModulation>> {
-            if time_embeddings.len() != self.config.num_flow_steps {
-                return Err(Error::Other(format!(
-                    "PI0.5 expected {} timestep embeddings, got {}",
-                    self.config.num_flow_steps,
-                    time_embeddings.len()
-                )));
-            }
-            time_embeddings
-                .iter()
-                .map(|embedding| self.prepare_step_modulation(embedding))
-                .collect()
         }
 
         fn denoise_step_with_modulation(

@@ -461,3 +461,98 @@ def test_requantization_matches_the_remote_client():
     images[0, 1, 0, 0] = 1.0
     images[1, 2, 3, 4] = 1.0
     assert np.array_equal(client._requantize_to_u8(images), BENCH._requantize_to_u8(images))
+
+
+def test_calibration_is_refused_for_other_variants(engine, monkeypatch, capsys, tmp_path):
+    """A profile that the selected variant ignores is a mistake, not a no-op."""
+
+    _, checkpoint, _, _ = engine()
+
+    code, stdout, stderr, _ = _run(
+        monkeypatch, capsys, "--layer", "l0", "--samples", "1",
+        "--checkpoint", str(checkpoint), "--calibration", "uniform:1.0",
+    )
+
+    assert code == 2, (stdout, stderr)
+    assert "--calibration only applies to --model-variant fp8_static" in stderr
+
+
+def test_a_load_error_is_a_refusal(engine, monkeypatch, capsys, tmp_path):
+    """A bad profile is refused (exit 2), not reported as a failed comparison."""
+
+    _, checkpoint, _, runner = engine()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("no usable FP8 profile")
+
+    runner.load = fail
+
+    code, stdout, stderr, _ = _run(
+        monkeypatch, capsys, "--layer", "l0", "--samples", "1",
+        "--checkpoint", str(checkpoint),
+    )
+
+    assert code == 2, (stdout, stderr)
+    assert "no usable FP8 profile" in stderr
+
+
+def test_a_require_graph_failure_is_a_refusal(engine, monkeypatch, capsys):
+    """Capture is lazy, so its failure is reclassified where it happens."""
+
+    _, checkpoint, handle, _ = engine()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("capture refused")
+
+    handle._infer_patches = fail
+
+    code, stdout, stderr, _ = _run(
+        monkeypatch, capsys, "--layer", "l0", "--warmup", "0", "--samples", "1",
+        "--execution", "require-graph", "--checkpoint", str(checkpoint),
+    )
+
+    assert code == 2, (stdout, stderr)
+    assert "FAIL:" in stderr
+    assert "failed under --execution require-graph" in stderr
+    assert "capture refused" in stderr
+
+    # The other policies keep the original failure instead of relabelling it.
+    with pytest.raises(RuntimeError, match="capture refused"):
+        _run(
+            monkeypatch, capsys, "--layer", "l0", "--warmup", "0", "--samples", "1",
+            "--execution", "prefer-graph", "--checkpoint", str(checkpoint),
+        )
+
+
+def test_fp8_report_records_the_calibration_source(engine, monkeypatch, capsys, tmp_path):
+    """The profile behind an FP8 number has to be identifiable afterwards."""
+
+    _, checkpoint, _, runner = engine()
+    out = tmp_path / "uniform.json"
+
+    code, stdout, _, report = _run(
+        monkeypatch, capsys, "--layer", "l0", "--warmup", "0", "--samples", "1",
+        "--model-variant", "fp8_static", "--calibration", "uniform:2.0",
+        "--checkpoint", str(checkpoint), "--out", str(out),
+    )
+
+    assert code == 0, stdout
+    assert runner.load_kwargs["model_variant"] == "fp8_static"
+    assert runner.load_kwargs["calibration"] == "uniform:2.0"
+    assert report["calibration"] == {"source": "uniform", "scale": "2.0"}
+
+    profile = checkpoint / "calibration.json"
+    profile.write_text("{}\n")
+    out = tmp_path / "explicit.json"
+    code, stdout, _, report = _run(
+        monkeypatch, capsys, "--layer", "l0", "--warmup", "0", "--samples", "1",
+        "--model-variant", "fp8_static", "--calibration", str(profile),
+        "--checkpoint", str(checkpoint), "--out", str(out),
+    )
+
+    assert code == 0, stdout
+    assert report["calibration"] == {
+        "source": "explicit",
+        "path": str(profile),
+        "sha256": artifact.sha256(profile),
+    }

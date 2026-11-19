@@ -1,0 +1,19 @@
+{
+  "mudnn_revision": "e82652999b20e378cc663653aaabb0236ccac61a",
+  "origin": "experimental frozen snapshot of TileLang headers used with muDNN MP31 forward generator",
+  "patches": [
+    "Use existing MUTLASS BLK/BULK name aliases in attention.cuh; do not copy a second MUTLASS tree."
+  ],
+  "sha256": {
+    "include/tilelang/musa/atomic.h": "6008dac46f99d41c4f84774f9efc1affda89611713377d88a23b133081334938",
+    "include/tilelang/musa/common.h": "d2f96b93d9d31b7f15c82ffe9352b81fc7befb74ac475c8100dbfdc0491a3e4d",
+    "include/tilelang/musa/copy.h": "4eb47ed693af058ebe98c2b8b9277153f80d372356a9f8ffe7374c594a660607",
+    "include/tilelang/musa/copy_mp31.h": "6120c2be83bf9c9b4f065ca3df977fd33e83d33312b17c843d3450b2da6a7400",
+    "include/tilelang/musa/gemm.h": "c3f25276588b27f10e337a55fe3103c9b990c0531e33c9e39c480264695e1c2a",
+    "include/tilelang/musa/gemm_mp31.h": "1a1bec62ed443c3319696b6576539220731405128e00aaf49d2722d0d9f872fe",
+    "include/tilelang/musa/intrin.h": "5a52bd25cbe175c063843d1f634e7fcd5658266fbc078d15fce0ad548f5bbca6",
+    "include/tilelang/musa/musa_fp8.h": "9a1f46acf40f85da61399a6fb1aa935513b601df07615d25941199e4d4f21d9e",
+    "include/tilelang/musa/reduce.h": "7511890178e9675afeb85e3f1c1193f25c41415fccc6e472e40e685f5ad77a52"
+  },
+  "tilelang_revision": "d63264e005bac8495183bfad96b38a4dad652d148"
+}

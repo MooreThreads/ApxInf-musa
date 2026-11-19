@@ -83,7 +83,7 @@ transform; run it again rather than editing a `.mu` by hand.
 
 | | `TileM` | warpgroups | `IsPackGQA` | PI0.5 shape | where |
 |---|---:|---:|---|---|---|
-| `mp31_decode_packed_tile128` | 128 | 2 | true | decode `10/532` | `mp31_fa_variant`; only with `APXINF_MUSA_FA_UNPACKED=0` |
+| `mp31_decode_packed_tile128` | 128 | 2 | true | decode `10/532` | `mp31_fa_variant` when `RequireExact` keeps MATE's packed tile |
 | `mp31_decode_unpacked_tile16` | 16 | 1 | false | decode `10/532` on mp_31 | `mp31_fa_variant`, default for 9-16 rows |
 | `mp31_general_unpacked_tile192` | 192 | 3 | false | prefill `522/522` | `mp31_fa_variant`, 17+ rows |
 
@@ -107,8 +107,7 @@ The unpacked decode is the mp_31 port's answer to the packed tile's grid: with
 axis to `params.h = 8`, giving `(1, 8, 1)` — eight CTAs, no split, no combine,
 no metadata. Measured on an idle S5000: 22.28 µs vs 32.47 µs per call, with the
 same f32-reference error (6.1e-4, 37% of the test gate). `kernels::attention`
-selects it for 9–16 rows on mp_31 and keeps the packed kernel behind
-`APXINF_MUSA_FA_UNPACKED=0` for an A/B.
+selects it for 9–16 rows on mp_31; `RequireExact` keeps MATE's packed tile.
 
 ## What was changed, and what was not
 
