@@ -2405,6 +2405,79 @@ mod tests {
         check_mqa(&ctx, 10, 532, 500);
     }
 
+    /// Direct row-softmax check. The fused attention tests observe this kernel
+    /// only through their 1%-of-peak gate; the 5b7d172 `__musa_exp_f`
+    /// substitution moved whole bf16 ulps on some rows and still passed that
+    /// gate. This compares against a host f64 softmax at 1e-6.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn row_softmax_matches_a_host_reference() {
+        use crate::buffer::MusaBuffer;
+        use crate::ffi;
+        use crate::kernels::check_native;
+
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (rows, cols) = (6usize, 9usize);
+        let scores: Vec<f32> = vec![
+            -1000.0, -100.0, -10.0, 0.0, 10.0, 100.0, 1000.0, 5.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 50.0, -50.0, 50.0, -50.0, 50.0, -50.0, 50.0, -50.0,
+            50.0, 1.0e3, 1.0e3, 1.0e3, 1.0e3, 1.0e3, 1.0e3, 1.0e3, 1.0e3, 1.0e3,
+        ];
+        let bytes: Vec<u8> = scores
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let buffer = MusaBuffer::alloc_on(&ctx, bytes.len()).expect("scores buffer");
+        buffer.copy_from_host(&bytes).expect("upload scores");
+        // SAFETY: `buffer` is a contiguous f32 allocation of `rows * cols` and
+        // the call only rewrites it in place.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_row_softmax_f32(
+                    buffer.ptr(),
+                    rows as i32,
+                    cols as i32,
+                    ctx.stream().handle(),
+                ),
+                "row softmax",
+            )
+            .expect("native row softmax");
+        }
+        ctx.stream().synchronize().expect("synchronise");
+        let mut out = vec![0u8; bytes.len()];
+        buffer.copy_to_host(&mut out).expect("read softmax");
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        for row in 0..rows {
+            let row_scores = &scores[row * cols..(row + 1) * cols];
+            let maximum = row_scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max) as f64;
+            let exps: Vec<f64> = row_scores
+                .iter()
+                .map(|value| (*value as f64 - maximum).exp())
+                .collect();
+            let sum: f64 = exps.iter().sum();
+            let mut worst = 0.0f64;
+            let mut got_sum = 0.0f64;
+            for col in 0..cols {
+                let expected = exps[col] / sum;
+                let actual = f64::from(got[row * cols + col]);
+                assert!(actual.is_finite(), "softmax row {row} col {col} non-finite");
+                worst = worst.max((actual - expected).abs());
+                got_sum += actual;
+            }
+            assert!((got_sum - 1.0).abs() < 1e-6, "row {row} sums to {got_sum}");
+            assert!(worst < 1e-6, "row {row} worst abs {worst:.3e}");
+            println!("  softmax row {row}  worst abs {worst:.3e}  sum {got_sum:.9}");
+        }
+    }
+
     // ── The vendored mp_31 FMHA ──────────────────────────────────────────────
 
     #[cfg(apxinf_musa_mutlass_fmha)]

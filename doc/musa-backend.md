@@ -100,6 +100,26 @@ context on such a device prints one line per process naming the generation, so
 that "a kernel that exists for this generation is unused rather than absent"
 stops being invisible.
 
+### Fast transcendentals
+
+`__musa_exp_f`, `__musa_tanh_f` and `__sincosf` are MP31 (S5000/S4000) fast
+paths. On MP22 (M1000) they are not a faster spelling of the libm call: commit
+`5b7d172` substituted them unguarded in `kernels/custom/` and PI0.5 BF16
+produced NaN, its INT8 graph fell to cosine 0.1329 against the Orin bundle, and
+GR00T BF16 to 0.9611. Reverting the four substitutions restored the PI0.5 gate
+(cosine 0.99995867).
+
+Shared kernels route these through `apxinf_exp_f`, `apxinf_tanh_f` and
+`apxinf_sincosf` in
+[`kernels/custom/math.cuh`](../crates/apxinf-musa/kernels/custom/math.cuh),
+which take the intrinsic only under `__MUSA_ARCH__ >= 310` and the libm call
+otherwise — the same rule the vendored `mutlass::fast_tanh` already used.
+`kernels/mp31_fp8/` and `kernels/mp31_attention/` keep their local guards and
+are compiled only under the vendor/mp_31 gates.
+`scripts/check_musa_fast_math.py` enforces the rule for `kernels/custom/`;
+`crates/apxinf-musa/tests/device_parity.rs` exercises the affected operators at
+bf16 resolution.
+
 ## Relationship to the CUDA backends
 
 The legacy `apxinf-cuda` tree was removed when all CUDA families migrated to
@@ -919,6 +939,14 @@ APXINF_PI05_TEST_CHECKPOINT=<checkpoint dir> \
 The first runs without a checkpoint. The second needs a real one: it includes
 the capture acceptance test, which builds an eager and a captured plan from one
 loaded model and compares raw action bits under a changed latent.
+
+The shared-kernel parity tests are device-only and serial:
+
+```bash
+cargo test -p apxinf-musa --test device_parity -- --ignored --test-threads=1 --nocapture
+cargo test -p apxinf-musa --lib -- --ignored --test-threads=1
+python3 scripts/check_musa_fast_math.py
+```
 
 GeGLU 的后续长跑仍曾暴露 `AsyncTransBarArrivalOutOfBounds`。当前实现改为完整首 warp 初始化，
 producer/consumer 各自循环、排空全部使用过的 stage，并在 epilogue 前后做 CTA 同步。

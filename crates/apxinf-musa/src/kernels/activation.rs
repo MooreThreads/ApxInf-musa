@@ -632,11 +632,13 @@ mod tests {
     use crate::context::MusaContext;
     use crate::kernels::activation::{
         bias_gelu_bf16, bias_gelu_bf16_e4m3_into, bias_gelu_bf16_into, bias_relu_bf16,
-        bias_silu_bf16, geglu_bf16, geglu_bf16_e4m3_into, geglu_bf16_into,
+        bias_silu_bf16, geglu_bf16, geglu_bf16_e4m3_into, geglu_bf16_into, silu_bf16,
+        silu_mul_bf16,
     };
     use crate::kernels::elementwise::bias_bf16;
     use crate::kernels::test_support::{
-        from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values, zeros_as,
+        assert_all_finite, assert_tight, from_bf16_bits, gate_for, read_back, to_bf16_bits,
+        upload, values, zeros_as,
     };
 
     /// The kernel's own spellings, in f32, so the reference differs only where
@@ -984,5 +986,113 @@ mod tests {
             );
             println!("  bias_gelu e4m3 [{rows} x {cols}] byte-identical");
         }
+    }
+
+    fn rounded(value: f32) -> f32 {
+        from_bf16_bits(to_bf16_bits(value))
+    }
+
+    fn silu_reference(value: f32) -> f32 {
+        let value = rounded(value);
+        rounded(value / (1.0 + (-value).exp()))
+    }
+
+    /// The tight SiLU test the 5b7d172 fast-intrinsic substitution escaped:
+    /// the existing 1%-of-peak gate cannot see a changed `expf`.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn silu_matches_a_tight_reference() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        for (rows, cols) in [(3usize, 5usize), (257, 300), (3, 320)] {
+            let input_values = values(rows * cols, 0x5eed_1234);
+            let input = upload(&ctx, &input_values, Shape::new(vec![rows, cols]));
+            let got = read_back(&silu_bf16(&ctx, &input).expect("native silu"));
+            let expected: Vec<f32> = input_values.iter().map(|value| silu_reference(*value)).collect();
+            assert_tight(&format!("silu [{rows}x{cols}]"), &got, &expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn silu_mul_matches_a_tight_reference() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        for (rows, cols) in [(3usize, 5usize), (257, 300), (3, 320)] {
+            let gate_values = values(rows * cols, 0x5eed_1234);
+            let up_values = values(rows * cols, 0x0bad_c0de);
+            let gate = upload(&ctx, &gate_values, Shape::new(vec![rows, cols]));
+            let up = upload(&ctx, &up_values, Shape::new(vec![rows, cols]));
+            let got = read_back(&silu_mul_bf16(&ctx, &gate, &up).expect("native silu_mul"));
+            let mut expected = Vec::with_capacity(rows * cols);
+            for (gate, up) in gate_values.iter().zip(&up_values) {
+                let gate = rounded(*gate);
+                let up = rounded(*up);
+                expected.push(rounded(gate / (1.0 + (-gate).exp()) * up));
+            }
+            assert_tight(&format!("silu_mul [{rows}x{cols}]"), &got, &expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn bias_silu_matches_a_tight_reference() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        for (rows, cols) in [(3usize, 5usize), (257, 300), (3, 320)] {
+            let input_values = values(rows * cols, 0x5eed_1234);
+            let bias_values = values(cols, 0x0bad_c0de);
+            let input = upload(&ctx, &input_values, Shape::new(vec![rows, cols]));
+            let bias = upload(&ctx, &bias_values, Shape::new(vec![cols]));
+            let got = read_back(
+                &bias_silu_bf16(&ctx, &input, Some(&bias)).expect("native bias silu"),
+            );
+            let mut expected = Vec::with_capacity(rows * cols);
+            for row in 0..rows {
+                for col in 0..cols {
+                    let value = rounded(input_values[row * cols + col])
+                        + rounded(bias_values[col]);
+                    expected.push(rounded(value / (1.0 + (-value).exp())));
+                }
+            }
+            assert_tight(&format!("bias_silu [{rows}x{cols}]"), &got, &expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn geglu_matches_a_tight_reference() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let alpha = 0.7978845608028654f32;
+        let gelu = |value: f32| {
+            let value = rounded(value);
+            0.5 * value * (1.0 + (alpha * (value + 0.044715 * value * value * value)).tanh())
+        };
+        for (rows, cols) in [(3usize, 10usize), (7, 302)] {
+            let input_values = values(rows * 2 * cols, 0x5eed_1234);
+            let input = upload(&ctx, &input_values, Shape::new(vec![rows, 2 * cols]));
+            let got = read_back(&geglu_bf16(&ctx, &input).expect("native geglu"));
+            let mut expected = Vec::with_capacity(rows * cols);
+            for row in 0..rows {
+                for col in 0..cols {
+                    let gate = input_values[row * 2 * cols + col];
+                    let up = rounded(input_values[row * 2 * cols + cols + col]);
+                    expected.push(rounded(gelu(gate) * up));
+                }
+            }
+            assert_tight(&format!("geglu [{rows}x{cols}]"), &got, &expected);
+        }
+    }
+
+    /// A fast `tanh`/`exp` can return NaN or overflow at magnitudes the 1% gate
+    /// never visits; this is the finite check that would have caught it.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn gelu_stays_finite_at_extreme_inputs() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let edge_values = [
+            -1.0e4f32, -1.0e3, -100.0, -20.0, -8.0, 0.0, 8.0, 20.0, 100.0, 1.0e3, 1.0e4,
+        ];
+        let input = upload(&ctx, &edge_values, Shape::new(vec![1, edge_values.len()]));
+        let got = read_back(&bias_gelu_bf16(&ctx, &input, None).expect("native gelu"));
+        assert_all_finite("bias_gelu extremes", &got);
+        println!("  bias_gelu extremes: {got:?}");
     }
 }

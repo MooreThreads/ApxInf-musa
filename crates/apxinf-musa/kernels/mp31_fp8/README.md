@@ -41,6 +41,9 @@ the separate path.
 
 The same build uses the MP31 fast transcendental intrinsics in the native
 attention softmax/merge, the sigmoid/GELU helpers and the RoPE `sincos` pair.
+The shared `kernels/custom` kernels reach the same intrinsics only through
+`math.cuh`'s `apxinf_*` helpers, which compile the libm branch on mp_22 (see
+`doc/musa-backend.md`, "Fast transcendentals").
 The D256 attention uses five KV partitions, and the action `partial_norm`
 keeps the FP32 intermediate for its M=10 rows instead of re-reading the
 BF16-rounded value. The Rust workspace and the adapter launch both size for

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "math.cuh"
+
 // Derived in part from `crates/apxinf-cuda/kernels/custom/` (Apache-2.0,
 // Copyright 2026 apxinf contributors); the differences are explained below.
 
@@ -121,14 +123,14 @@ __global__ void row_softmax_f32_kernel(float* data, int rows, int cols) {
 
   float local_sum = 0.0f;
   for (int col = lane; col < cols; col += 32)
-    local_sum += __musa_exp_f(target[col] - maximum);
+    local_sum += apxinf_exp_f(target[col] - maximum);
   for (int offset = 16; offset > 0; offset >>= 1) {
     local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
   }
   const float inverse = 1.0f / local_sum;
 
   for (int col = lane; col < cols; col += 32) {
-    target[col] = __musa_exp_f(target[col] - maximum) * inverse;
+    target[col] = apxinf_exp_f(target[col] - maximum) * inverse;
   }
 }
 

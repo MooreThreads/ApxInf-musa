@@ -1431,6 +1431,17 @@ mod shipped_tests {
         if db.record_count() == 0 {
             return Err(format!("{tactics:?} carries no records"));
         }
+        // `build_store` binds the records to *this binary's* kernel build id
+        // (`stale_reason`), so a database for another generation — which the
+        // id check above deliberately let through — always comes back empty.
+        // This build will never load it; parse, path and record count above
+        // are the checks that apply, and reporting the cross-generation
+        // mismatch as "records did not load" would name the wrong cause. The
+        // same-generation case below still catches a stale database through
+        // `stale_reason`.
+        if Some(caps.mp) != built_mp() {
+            return Ok(());
+        }
         let store = db.build_store(&caps, &recorded_versions(&db)?);
         if store.bf16.len() != db.record_count() {
             return Err(format!(
@@ -1505,14 +1516,36 @@ mod shipped_tests {
         root
     }
 
-    /// Write one M1000/mp22 database where `TuningPaths` derives its name.
+    /// Write one database for *this build's* generation, where `TuningPaths`
+    /// derives its name.
+    ///
+    /// The stale fixture below exercises the same-generation id check; a
+    /// hardcoded M1000 here made that fixture "another generation" on an S5000
+    /// build, where `check_shipped_database` deliberately lets another
+    /// generation's file through. A no-toolkit build has no generation to
+    /// match and keeps the historical M1000 shape for the parse/path checks.
     fn write_fixture_database(root: &Path, kernel_build_id: &str) -> PathBuf {
-        let directory = root.join("musa").join("m1000-mp22");
-        std::fs::create_dir_all(&directory).expect("the fixture directory");
-        let tactics = directory.join("tactics.json");
+        let mp = built_mp().unwrap_or(22);
+        let device_name = match mp {
+            22 => "M1000".to_string(),
+            31 => "MTT S5000".to_string(),
+            other => format!("fixture-mp{other}"),
+        };
+        let caps = MusaDeviceCaps {
+            device_name: device_name.clone(),
+            compute_major: mp / 10,
+            compute_minor: mp % 10,
+            mp,
+            multiprocessor_count: 0,
+            arch_family: MusaArchFamily::from_mp(mp),
+            hardware_warp_size: 128,
+        };
+        let tactics = TuningPaths::for_device(root, &caps).tactics;
+        std::fs::create_dir_all(tactics.parent().expect("a tactics directory"))
+            .expect("the fixture directory");
         let document = serde_json::json!({
-            "device_name": "M1000",
-            "mp": 22,
+            "device_name": device_name,
+            "mp": mp,
             "kernel_build_id": kernel_build_id,
             "library_versions": {
                 "musa": 1,
@@ -1543,16 +1576,19 @@ mod shipped_tests {
 
     #[test]
     fn a_database_from_another_kernel_build_is_refused() {
+        // A no-toolkit build has no generation to compare against;
+        // `check_shipped_database` deliberately lets another generation's file
+        // through, and there is no same-generation id that can be stale.
+        if built_mp().is_none() {
+            return;
+        }
         let root = fixture_root("stale");
         let tactics = write_fixture_database(&root, "kb-another-build");
         let result = check_shipped_database(&root, &tactics);
         std::fs::remove_dir_all(&root).ok();
         let reason = result.expect_err("a database for another build must not load");
-        // A build for another MP generation skips the id comparison above; the
-        // load then reports the records that did not arrive. Both name the
-        // cause closely enough for a maintainer to regenerate the database.
         assert!(
-            reason.contains("another kernel build") || reason.contains("did not load"),
+            reason.contains("another kernel build"),
             "the refusal does not name the kernel build: {reason}"
         );
     }

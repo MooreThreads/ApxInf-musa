@@ -122,3 +122,103 @@ pub fn capture_with_output<T>(
             .expect("a successful capture always produced a value"),
     ))
 }
+
+/// Tight numeric gates for the shared-kernel parity tests.
+///
+/// `GATE_FRACTION` above is an absolute 1%-of-peak bound: right for a
+/// reduction-order difference in a fused kernel, and too loose to see a
+/// fast-transcendental substitution. The 5b7d172 sites (`__musa_exp_f`,
+/// `__musa_tanh_f`, `__sincosf`) passed the 1% gate while PI0.5 produced NaN
+/// and GR00T fell to 0.9611 cosine, because a broken transcendental moves the
+/// value by far less than 1% of the row maximum but by whole bf16 ulps.
+///
+/// These helpers compare against a host reference that reproduces the kernel's
+/// own rounding chain, so a change of implementation shows up in bf16 ulp
+/// distance. The bounds are calibrated on mp_22 (see the measured values the
+/// callers print); a future generation whose libm differs more may need a
+/// larger `TIGHT_MAX_ULP`, recorded here with the measurement that justified it.
+pub const TIGHT_MIN_COSINE: f64 = 0.99999;
+pub const TIGHT_MAX_REL_L2: f64 = 1e-3;
+pub const TIGHT_MAX_ULP: u32 = 2;
+
+pub fn cosine(got: &[f32], expected: &[f32]) -> f64 {
+    assert_eq!(got.len(), expected.len(), "cosine length mismatch");
+    let mut dot = 0.0f64;
+    let mut got_norm = 0.0f64;
+    let mut expected_norm = 0.0f64;
+    for (got, expected) in got.iter().zip(expected) {
+        let (got, expected) = (*got as f64, *expected as f64);
+        dot += got * expected;
+        got_norm += got * got;
+        expected_norm += expected * expected;
+    }
+    let denominator = (got_norm * expected_norm).sqrt();
+    if denominator == 0.0 {
+        return if got_norm == expected_norm { 1.0 } else { 0.0 };
+    }
+    dot / denominator
+}
+
+pub fn relative_l2(got: &[f32], expected: &[f32]) -> f64 {
+    assert_eq!(got.len(), expected.len(), "relative L2 length mismatch");
+    let mut difference = 0.0f64;
+    let mut norm = 0.0f64;
+    for (got, expected) in got.iter().zip(expected) {
+        let delta = *got as f64 - *expected as f64;
+        difference += delta * delta;
+        norm += (*expected as f64) * (*expected as f64);
+    }
+    difference.sqrt() / norm.sqrt().max(f64::MIN_POSITIVE)
+}
+
+/// Map a bf16 bit pattern onto an ordered i32 so `+x` and `-x` are adjacent
+/// around zero and the distance is the number of representable bf16 values.
+fn bf16_key(bits: u16) -> i32 {
+    let magnitude = i32::from(bits & 0x7fff);
+    if bits & 0x8000 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+pub fn max_bf16_ulp(got: &[f32], expected: &[f32]) -> u32 {
+    assert_eq!(got.len(), expected.len(), "ulp length mismatch");
+    got.iter()
+        .zip(expected)
+        .map(|(got, expected)| {
+            (bf16_key(to_bf16_bits(*got)) - bf16_key(to_bf16_bits(*expected))).unsigned_abs()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub fn assert_all_finite(what: &str, values: &[f32]) {
+    if let Some((index, value)) = values.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        panic!("{what}: non-finite value {value} at index {index}");
+    }
+}
+
+/// Assert a host-reference comparison at bf16 resolution, not at 1% of peak.
+///
+/// Prints the three measured numbers so a failing run says which bound moved
+/// and by how much.
+pub fn assert_tight(what: &str, got: &[f32], expected: &[f32]) {
+    assert_all_finite(what, got);
+    let cosine = cosine(got, expected);
+    let relative_l2 = relative_l2(got, expected);
+    let ulp = max_bf16_ulp(got, expected);
+    println!("  {what}: cosine {cosine:.12}  rel_l2 {relative_l2:.3e}  max_ulp {ulp}");
+    assert!(
+        cosine >= TIGHT_MIN_COSINE,
+        "{what}: cosine {cosine:.12} < {TIGHT_MIN_COSINE}"
+    );
+    assert!(
+        relative_l2 <= TIGHT_MAX_REL_L2,
+        "{what}: relative L2 {relative_l2:.3e} > {TIGHT_MAX_REL_L2}"
+    );
+    assert!(
+        ulp <= TIGHT_MAX_ULP,
+        "{what}: bf16 ulp distance {ulp} > {TIGHT_MAX_ULP}"
+    );
+}

@@ -816,10 +816,13 @@ mod tests {
 
     use apxinf_core::{DType, Shape, Tensor};
 
+    use crate::buffer::MusaBuffer;
     use crate::context::MusaContext;
-    use crate::kernels::rope::{apply_q_write_kv_bf16, split_qkv_apply_bf16};
+    use crate::kernels::rope::{
+        apply_mrope, apply_q_write_kv_bf16, apply_vision_2d, split_qkv_apply_bf16,
+    };
     use crate::kernels::test_support::{
-        from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values,
+        assert_tight, from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values,
     };
 
     /// The kernel's arithmetic, spelled out: bias in f32, bf16 for the operands
@@ -951,6 +954,11 @@ mod tests {
                  exceeds gate {tolerance:.3e}"
             );
             println!("  rope {name} q_heads {q_heads} kv_heads {kv_heads} bias {bias}  worst abs {worst:.3e}");
+            assert_tight(
+                &format!("rope {name} [{tokens},{q_heads},{kv_heads},{head_dim}]"),
+                &got,
+                expected,
+            );
         }
     }
 
@@ -985,5 +993,98 @@ mod tests {
             "unhelpful refusal: {error}"
         );
         println!("  rope cache write refused: {error}");
+    }
+
+    fn rounded(value: f32) -> f32 {
+        from_bf16_bits(to_bf16_bits(value))
+    }
+
+    fn positions_buffer(ctx: &MusaContext, positions: &[u32]) -> MusaBuffer {
+        let bytes: Vec<u8> = positions
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let buffer = MusaBuffer::alloc_on(ctx, bytes.len()).expect("position buffer");
+        buffer.copy_from_host(&bytes).expect("upload positions");
+        buffer
+    }
+
+    /// The vision tower's 2-D RoPE was never covered by a device test. The
+    /// reference reproduces the kernel's f32 arithmetic and bf16 rounding;
+    /// `assert_tight` is the bf16-resolution check the 1%-of-peak gate lacked.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn vision_2d_rope_matches_a_host_reference() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (tokens, heads, head_dim) = (5usize, 2usize, 64usize);
+        let theta = 10000.0f32;
+        let input_values = values(tokens * heads * head_dim, 0x5eed_1234);
+        let input = upload(
+            &ctx,
+            &input_values,
+            Shape::new(vec![tokens, heads, head_dim]),
+        );
+        let positions: Vec<u32> = (0..tokens)
+            .flat_map(|token| [token as u32 % 3, token as u32 % 5])
+            .collect();
+        let pos_ids = positions_buffer(&ctx, &positions);
+        let output = apply_vision_2d(&ctx, &input, heads, head_dim, theta, &pos_ids)
+            .expect("vision 2D RoPE");
+        let got = read_back(&output);
+
+        let half_dim = head_dim / 2;
+        let axis_width = half_dim / 2;
+        let mut expected = vec![0.0f32; input_values.len()];
+        for token in 0..tokens {
+            for head in 0..heads {
+                let row = (token * heads + head) * head_dim;
+                for pair in 0..half_dim {
+                    let axis = if pair >= axis_width { 1 } else { 0 };
+                    let pair_in_axis = pair % axis_width;
+                    let exponent = -2.0f32 * pair_in_axis as f32 / half_dim as f32;
+                    let frequency = theta.powf(exponent);
+                    let angle = positions[token * 2 + axis] as f32 * frequency;
+                    let cosine = angle.cos();
+                    let sine = angle.sin();
+                    let first = rounded(input_values[row + pair]);
+                    let second = rounded(input_values[row + half_dim + pair]);
+                    expected[row + pair] = rounded(first * cosine - second * sine);
+                    expected[row + half_dim + pair] =
+                        rounded(second * cosine + first * sine);
+                }
+            }
+        }
+        assert_tight("vision 2D RoPE", &got, &expected);
+    }
+
+    /// Zero positions must be the identity: the rotation is exact and the
+    /// kernel's explicit f32 ops are the only arithmetic. This covers the
+    /// mRoPE launch and its section assignment without pinning a rotation.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn mrope_at_zero_positions_is_identity() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (tokens, heads, head_dim) = (5usize, 2usize, 64usize);
+        let input_values = values(tokens * heads * head_dim, 0x0bad_c0de);
+        let input = upload(
+            &ctx,
+            &input_values,
+            Shape::new(vec![tokens, heads, head_dim]),
+        );
+        let pos_ids = positions_buffer(&ctx, &vec![0u32; tokens * 3]);
+        let sections = [head_dim / 4, head_dim / 4, head_dim / 2];
+        let output = apply_mrope(
+            &ctx,
+            &input,
+            heads,
+            head_dim,
+            10000.0,
+            sections,
+            &pos_ids,
+        )
+        .expect("mRoPE");
+        let got = read_back(&output);
+        let expected: Vec<f32> = input_values.iter().map(|value| rounded(*value)).collect();
+        assert_tight("mRoPE at zero positions", &got, &expected);
     }
 }

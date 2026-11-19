@@ -1,5 +1,7 @@
 #pragma once
 
+#include "math.cuh"
+
 // Apply the vision tower's half-split 2-D rotary embedding to
 // `[tokens, heads, head_dim]`.  The first half of the rotary pairs uses the
 // first position column (height), and the second half uses the second column
@@ -572,11 +574,12 @@ __global__ void qkv_rope_bf16_kernel(const __mt_bfloat16* qkv,
   // call was **80% of this kernel**: 0.935 -> 0.184 ms per call at `[522, ...]`.
   // The table is filled by `rope_frequency_kernel` below, on the device, from
   // the same `powf` the kernel used to call -- so the values are identical and
-  // this changes no numbers. A host-side table would not be: `math.cuh`'s note
-  // about device and host transcendentals differing applies here too.
+  // this changes no numbers. A host-side table would not be: device and host
+  // libm transcendental results can differ, which is why the table stays on
+  // the device.
   const float rate = frequency[pair];
   float cosine_raw, sine_raw;
-  __sincosf(static_cast<float>(position) * rate, &sine_raw, &cosine_raw);
+  apxinf_sincosf(static_cast<float>(position) * rate, &sine_raw, &cosine_raw);
   const float cosine = round_bf16(cosine_raw);
   const float sine = round_bf16(sine_raw);
 

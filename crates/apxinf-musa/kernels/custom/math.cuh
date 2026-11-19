@@ -23,10 +23,45 @@ constexpr int kThreads = 256;
 // the limit costs occupancy at worst rather than coverage.
 constexpr int kMaxGridY = 65535;
 
+// Fast transcendentals are a property of one generation, not of this port.
+//
+// `__musa_exp_f`, `__musa_tanh_f` and `__sincosf` are the MP31 (S5000/S4000)
+// fast paths. On MP22 (M1000) the substitution that introduced them broke the
+// PI0.5 and GR00T numerics (5b7d172); reverting the group restored the Orin
+// gate. The vendored `mutlass::fast_tanh` already spells the rule as
+// `#if __MUSA_ARCH__ >= 310`; keep it in one place so a shared call site cannot
+// pick a generation-specific intrinsic by accident.
+//
+// `__MUSA_ARCH__` is defined only on the device pass (220 = mp_22, 310 = mp_31).
+__device__ __forceinline__ float apxinf_exp_f(float value) {
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ >= 310
+  return __musa_exp_f(value);
+#else
+  return expf(value);
+#endif
+}
+
+__device__ __forceinline__ float apxinf_tanh_f(float value) {
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ >= 310
+  return __musa_tanh_f(value);
+#else
+  return tanhf(value);
+#endif
+}
+
+__device__ __forceinline__ void apxinf_sincosf(float value, float* sine, float* cosine) {
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ >= 310
+  __sincosf(value, sine, cosine);
+#else
+  *sine = sinf(value);
+  *cosine = cosf(value);
+#endif
+}
+
 __device__ __forceinline__ float gelu_tanh(float value) {
   constexpr float kAlpha = 0.7978845608028654f;
   return 0.5f * value *
-         (1.0f + __musa_tanh_f(kAlpha * (value + 0.044715f * value * value * value)));
+         (1.0f + apxinf_tanh_f(kAlpha * (value + 0.044715f * value * value * value)));
 }
 
 // The static-FP8 quantizer's per-value arithmetic, shared by the standalone
