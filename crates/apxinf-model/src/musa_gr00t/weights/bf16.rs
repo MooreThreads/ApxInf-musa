@@ -18,9 +18,11 @@ impl Gr00tBf16LinearWeights {
         calibration_name: impl Into<String>,
         backend: &RuntimeBackend,
     ) -> Result<Self> {
+        let weight = backend.to_device(&weights.weight)?;
+        crate::musa_gr00t::backend::prepare_bf16_nn_weight(backend.context(), &weight)?;
         Ok(Self {
             weights: Gr00tLinearWeights {
-                weight: backend.to_device(&weights.weight)?,
+                weight,
                 bias: backend.to_device(&weights.bias)?,
             },
             calibration_name: calibration_name.into(),
@@ -33,6 +35,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
         super::super::model::calibration::observe(&self.calibration_name, input)?;
+        let _scope = super::super::backend::decode_scope();
         kernels::gemm::bf16(backend.context(), input, &self.weights.weight)
     }
 

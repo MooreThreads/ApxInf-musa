@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--precision", choices=("bf16", "fp8", "int8"), required=True)
+    parser.add_argument(
+        "--features",
+        choices=("musa", "musa-tilelang"),
+        default="musa",
+        help="Cargo feature set used by the project benchmark (default: musa)",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
@@ -108,7 +114,7 @@ def main() -> None:
             "-p",
             "apxinf-model",
             "--features",
-            "musa",
+            args.features,
             "--example",
             "gr00t_bench_musa",
             "--",

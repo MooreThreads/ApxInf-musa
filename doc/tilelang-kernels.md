@@ -19,10 +19,27 @@ TileLang installation and environment setup: see the [MUSA SDK TileLang document
 
 One file per operator family, exposing `OPS` (metadata: `id`, `type`, `shape`
 = `(m, n, k)`, `tile`, `flags`, `status`) and
-`build(op, entry_part, entry_reduce)` compiling the kernels through the
-TileLang JIT. `id` ordering decides the unique entry symbols (`kTl<N>_*`),
+`build(op, entries)` returning `BuildResult(kernels, scratch_bytes)`
+through the TileLang JIT. `kernels` maps the declared `stages` to JIT objects;
+`scratch_bytes` must match the static metadata, including on cached builds.
+The generator validates stage names and workspace size without branching on operator type. `id` ordering decides the unique entry symbols (`kTl<N>_*`),
 which gen.py renames on the generated sources — definitions never see them.
 Tuning results are edited directly in `tile` / `flags`.
+
+The source directory is loaded as the `apxinf_tilelang` package, with relative
+imports and a shared `BuildResult` in its `__init__.py`; the generator does not
+modify `sys.path`. BF16 projections are registered once in
+`_bf16_gemm/registry.py`. Algorithm builders and the GPU weight packer consume
+that complete operator description directly, without an intermediate plan or
+separate shape dispatch tables. INT8 metadata is also constructed completely
+before being exposed through `OPS`.
+
+BF16 GEMM algorithm names describe the calculation: `small-k` uses MMA for
+a small K; `split-k` computes K partitions and reduces them; `mma_16` and
+`mma_16x2` process one and two 16-row tiles per block; `mma_fma` uses MMA
+for the main rows and FMA for the tail; `fma` uses only FMA. Each builder
+lives in the correspondingly named file under `_bf16_gemm/` (`small_k.py`
+and `split_k.py` for the hyphenated names).
 
 ## Generation: `crates/apxinf-musa/tools/tilelang/gen.py`, driven from `build.rs`
 
@@ -51,7 +68,7 @@ or invoking mcc. This is native fallback, not a claim of new-architecture
 kernel support. Supported targets still require the TileLang toolchain.
 
 `inventory.json` records, per artifact: `id`, `type`, `shape`, `status`,
-`scratch_bytes` (`splits * m * n * 4`), `entries`, `def_hash`, `files` and the
+`scratch_bytes` (operator-declared workspace size), `entries`, `def_hash`, `files` and the
 `fnv64` output fingerprints — plus a global `generated_by`. Shapes must be
 unique; the generator asserts it.
 

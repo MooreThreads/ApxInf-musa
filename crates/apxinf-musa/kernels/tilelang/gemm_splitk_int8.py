@@ -10,30 +10,32 @@ KN 权重副本；partials INT32 [splits, m, n]；scales FP16（激活按行、�
 输出 BF16 [m, n]。
 """
 
+from . import BuildResult
+
+
+def _operator(name, k):
+    m, n, splits = 10, 1024, 4
+    return {
+        "id": name,
+        "type": "gemm-splitk-int8",
+        "supported_arches": ["mp_22"],
+        "shape": (m, n, k),
+        "tile": {"bm": 32, "bn": 128, "bk": 32, "splits": splits},
+        "flags": ["-Od3", "-O2"],
+        "status": "enabled",
+        "stages": ["part", "reduce"],
+        "scratch_bytes": splits * m * n * 4,
+    }
+
+
 OPS = [
-    {
-        "id": "pi05-int8-down",
-        "type": "gemm-splitk-int8",
-        "supported_arches": ["mp_22"],
-        "shape": (10, 1024, 4096),
-        "tile": {"bm": 32, "bn": 128, "bk": 32, "splits": 4},
-        "flags": ["-Od3", "-O2"],
-        "status": "enabled",
-    },
-    {
-        "id": "pi05-int8-attn-o",
-        "type": "gemm-splitk-int8",
-        "supported_arches": ["mp_22"],
-        "shape": (10, 1024, 2048),
-        "tile": {"bm": 32, "bn": 128, "bk": 32, "splits": 4},
-        "flags": ["-Od3", "-O2"],
-        "status": "enabled",
-    },
+    _operator("pi05-int8-down", 4096),
+    _operator("pi05-int8-attn-o", 2048),
 ]
 
 
-def build(op, entry_part, entry_reduce):
-    """编译单个算子，返回 (part, reduce) 两个 tilelang jit 对象。
+def build(op, entries):
+    """编译单个算子，返回统一的 BuildResult。
 
     入口符号唯一性由 tools/tilelang/gen.py 在生成源码上改名保证
     （call/init/get_last_error 与 kernel_kernel → {entry}_*），此处无需感知。
@@ -47,7 +49,7 @@ def build(op, entry_part, entry_reduce):
     bm, bn, bk = op["tile"]["bm"], op["tile"]["bn"], op["tile"]["bk"]
     flags = op["flags"]
 
-    @tilelang.jit(out_idx=[], target="musa", compile_flags=flags)
+    @tilelang.jit(out_idx=[], target="musa", execution_backend="cython", compile_flags=flags)
     def make_part():
         @T.prim_func
         def kernel(
@@ -59,15 +61,19 @@ def build(op, entry_part, entry_reduce):
                 aa = T.alloc_shared((bm, bk), "int8")
                 bb = T.alloc_shared((bk, bn), "int8")
                 cc = T.alloc_fragment((bm, bn), "int32")
+                padded_a = T.alias_buffer(A, (bm, k))
+                a_bounds = T.make_robust_desc(T.address_of(A[0, 0]), m * k)
                 T.clear(cc)
                 for i in T.Pipelined(T.ceildiv(k // splits, bk), num_stages=1):
-                    T.copy(A[0, split * (k // splits) + i * bk], aa)
+                    T.copy(padded_a[0, split * (k // splits) + i * bk], aa, src_robust_desc=a_bounds)
                     T.copy(B[split * (k // splits) + i * bk, bx * bn], bb)
                     T.gemm(aa, bb, cc, transpose_B=False)
-                T.copy(cc, P[split, 0, bx * bn])
+                for row, column in T.Parallel(bm, bn):
+                    if row < m:
+                        P[split, row, bx * bn + column] = cc[row, column]
         return kernel
 
-    @tilelang.jit(out_idx=[], target="musa", compile_flags=flags)
+    @tilelang.jit(out_idx=[], target="musa", execution_backend="cython", compile_flags=flags)
     def make_reduce():
         @T.prim_func
         def kernel(
@@ -90,4 +96,4 @@ def build(op, entry_part, entry_reduce):
                     C[row, col] = T.Cast("bfloat16", row_scaled * T.Cast("float32", b_scale[col]))
         return kernel
 
-    return make_part(), make_reduce()
+    return BuildResult({"part": make_part(), "reduce": make_reduce()}, splits * m * n * 4)

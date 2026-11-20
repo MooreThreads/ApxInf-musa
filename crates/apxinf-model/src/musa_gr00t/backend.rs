@@ -10,6 +10,7 @@ use apxinf_core::{DType, Device, Error, Graph, Result, Shape, Tensor};
 
 pub(crate) use apxinf_musa::MusaBuffer as DeviceBuffer;
 pub(crate) use apxinf_musa::MusaContext as Context;
+pub(crate) use apxinf_musa::kernels::gemm::{decode_scope, prepare_bf16_nn_weight};
 
 pub(crate) mod transfers {
     pub(crate) use apxinf_musa::transfers::{
@@ -107,6 +108,7 @@ impl RuntimeBackend {
     }
 
     pub(crate) fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let _scope = decode_scope();
         kernels::gemm::bf16(self.context(), a, b)
     }
 

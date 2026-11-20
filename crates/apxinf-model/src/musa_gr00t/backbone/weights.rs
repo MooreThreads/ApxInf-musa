@@ -99,6 +99,12 @@ impl Qwen3VLTextWeights {
 /// This deliberately lives inside the GR00T family instead of reaching into
 /// the standalone Qwen3-VL implementation. Packed projections are built by the
 /// precision-specific GR00T executor when its execution plan requires them.
+
+fn prepare_projection(backend: &RuntimeBackend, weight: &Tensor) -> Result<Tensor> {
+    let weight = backend.to_device(weight)?;
+    crate::musa_gr00t::backend::prepare_bf16_nn_weight(backend.context(), &weight)?;
+    Ok(weight)
+}
 pub(crate) fn transfer_weights(
     weights: &Qwen3VLTextWeights,
     backend: &RuntimeBackend,
@@ -109,16 +115,16 @@ pub(crate) fn transfer_weights(
         .map(|layer| {
             Ok(Qwen3VLLayer {
                 attn_norm_weight: backend.to_device(&layer.attn_norm_weight)?,
-                wq: backend.to_device(&layer.wq)?,
-                wk: backend.to_device(&layer.wk)?,
-                wv: backend.to_device(&layer.wv)?,
-                wo: backend.to_device(&layer.wo)?,
+                wq: prepare_projection(backend, &layer.wq)?,
+                wk: prepare_projection(backend, &layer.wk)?,
+                wv: prepare_projection(backend, &layer.wv)?,
+                wo: prepare_projection(backend, &layer.wo)?,
                 q_norm_weight: backend.to_device(&layer.q_norm_weight)?,
                 k_norm_weight: backend.to_device(&layer.k_norm_weight)?,
                 ffn_norm_weight: backend.to_device(&layer.ffn_norm_weight)?,
-                w_gate: backend.to_device(&layer.w_gate)?,
-                w_up: backend.to_device(&layer.w_up)?,
-                w_down: backend.to_device(&layer.w_down)?,
+                w_gate: prepare_projection(backend, &layer.w_gate)?,
+                w_up: prepare_projection(backend, &layer.w_up)?,
+                w_down: prepare_projection(backend, &layer.w_down)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;

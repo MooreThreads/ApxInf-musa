@@ -230,6 +230,15 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
 }
 
 /// Transfer all vision weights to the backend's device.
+
+fn prepare_projection(
+    backend: &super::super::backend::RuntimeBackend,
+    weight: &apxinf_core::Tensor,
+) -> Result<apxinf_core::Tensor> {
+    let weight = backend.to_device(weight)?;
+    crate::musa_gr00t::backend::prepare_bf16_nn_weight(backend.context(), &weight)?;
+    Ok(weight)
+}
 pub(crate) fn transfer_vision_weights(
     w: &Qwen3VLVisionWeights,
     backend: &super::super::backend::RuntimeBackend,
@@ -238,15 +247,15 @@ pub(crate) fn transfer_vision_weights(
         Ok(Qwen3VLVisionBlock {
             norm1_w: backend.to_device(&b.norm1_w)?,
             norm1_b: backend.to_device(&b.norm1_b)?,
-            qkv_w: backend.to_device(&b.qkv_w)?,
+            qkv_w: prepare_projection(backend, &b.qkv_w)?,
             qkv_b: backend.to_device(&b.qkv_b)?,
-            proj_w: backend.to_device(&b.proj_w)?,
+            proj_w: prepare_projection(backend, &b.proj_w)?,
             proj_b: backend.to_device(&b.proj_b)?,
             norm2_w: backend.to_device(&b.norm2_w)?,
             norm2_b: backend.to_device(&b.norm2_b)?,
-            fc1_w: backend.to_device(&b.fc1_w)?,
+            fc1_w: prepare_projection(backend, &b.fc1_w)?,
             fc1_b: backend.to_device(&b.fc1_b)?,
-            fc2_w: backend.to_device(&b.fc2_w)?,
+            fc2_w: prepare_projection(backend, &b.fc2_w)?,
             fc2_b: backend.to_device(&b.fc2_b)?,
         })
     };
@@ -254,9 +263,9 @@ pub(crate) fn transfer_vision_weights(
         Ok(Qwen3VLMerger {
             norm_w: backend.to_device(&m.norm_w)?,
             norm_b: backend.to_device(&m.norm_b)?,
-            fc1_w: backend.to_device(&m.fc1_w)?,
+            fc1_w: prepare_projection(backend, &m.fc1_w)?,
             fc1_b: backend.to_device(&m.fc1_b)?,
-            fc2_w: backend.to_device(&m.fc2_w)?,
+            fc2_w: prepare_projection(backend, &m.fc2_w)?,
             fc2_b: backend.to_device(&m.fc2_b)?,
         })
     };
@@ -271,7 +280,7 @@ pub(crate) fn transfer_vision_weights(
         .map(transfer_merger)
         .collect::<Result<Vec<_>>>()?;
     Ok(Qwen3VLVisionWeights {
-        patch_embed_weight: backend.to_device(&w.patch_embed_weight)?,
+        patch_embed_weight: prepare_projection(backend, &w.patch_embed_weight)?,
         patch_embed_bias: backend.to_device(&w.patch_embed_bias)?,
         pos_embed: backend.to_device(&w.pos_embed)?,
         blocks,
