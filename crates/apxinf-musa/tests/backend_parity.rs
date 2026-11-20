@@ -211,6 +211,12 @@ const KNOBS: &[Knob] = &[
                shape the tiles cannot serve is a configuration choice rather than a failure",
     },
     Knob {
+        name: "APXINF_TILELANG",
+        counterpart: None,
+        note: "=off disables every linked TileLang GEMM for the run (auto is the default); \
+               the build-time `tilelang` feature decides whether any is linked at all",
+    },
+    Knob {
         name: "APXINF_PI05_INT8_STATS",
         counterpart: None,
         note: "record per-row activation levels for the equalization table. Reads \
