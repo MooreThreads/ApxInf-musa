@@ -1104,11 +1104,17 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         self.backend.synchronize()?;
         drop(eager_output);
         let backend = Arc::clone(&self.backend);
+        if std::env::var_os("APXINF_TRACE_GEMM").is_some() {
+            eprintln!("[gemm-trace-capture] begin");
+        }
         let (graph, output) = super::backend::without_autotune(|| {
             backend.capture_graph(|| {
                 kernels::with_workspace(&workspace, || self.infer_device(&device_observation))
             })
         })?;
+        if std::env::var_os("APXINF_TRACE_GEMM").is_some() {
+            eprintln!("[gemm-trace-capture] end");
+        }
         Ok((
             key,
             Gr00tCapturedGraph {
@@ -3189,6 +3195,7 @@ fn qwen_matmul<L: DeviceLinearWeights>(
         return weights.forward(input, backend);
     }
     super::calibration::observe(name, input)?;
+    let _scope = super::super::backend::decode_scope();
     kernels::gemm::bf16(backend.context(), input, bf16_weight)
 }
 

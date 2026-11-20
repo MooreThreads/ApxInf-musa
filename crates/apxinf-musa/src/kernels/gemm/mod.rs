@@ -21,11 +21,29 @@ mod fp8;
 pub(crate) mod mp31_fp8;
 #[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
 mod qint8_tiles;
-mod w8a8;
 #[cfg(apxinf_musa_available)]
 mod tilelang;
+mod w8a8;
 
-pub use assembly::{prepare_bf16_nn_weight, prepare_bf16_nt_weight};
+fn prepare_bf16_weight_common(
+    ctx: &MusaContext,
+    weight: &Tensor,
+    native_prepare: impl FnOnce(&MusaContext, &Tensor) -> Result<()>,
+) -> Result<()> {
+    native_prepare(ctx, weight)?;
+    #[cfg(apxinf_musa_available)]
+    tilelang::prepare_bf16_weight(ctx, weight)?;
+    Ok(())
+}
+
+/// Prepare immutable BF16 KN weights for the enabled native operator sources.
+pub fn prepare_bf16_nn_weight(ctx: &MusaContext, weight: &Tensor) -> Result<()> {
+    prepare_bf16_weight_common(ctx, weight, assembly::prepare_bf16_nn_weight)
+}
+
+pub fn prepare_bf16_nt_weight(ctx: &MusaContext, weight: &Tensor) -> Result<()> {
+    prepare_bf16_weight_common(ctx, weight, assembly::prepare_bf16_nt_weight)
+}
 
 pub use bf16::{
     gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused, gemm_bf16_into,
@@ -35,15 +53,13 @@ pub use fp8::{gemm_fp8_bias_into, gemm_fp8_bias_residual_into, gemm_fp8_into};
 pub use mp31_fp8::prepare_fp8_weight;
 pub use qint8_tiles::serves as w8a8_tile_serves;
 pub use w8a8::{
-    norm_quantize_w8a8_activation,
     adaptive_gate_residual_rms_quantize_w8a8_activation,
-    adaptive_rms_quantize_w8a8_activation,
-    adaptive_layer_norm_quantize_w8a8_activation, decode_scope as w8a8_decode_scope,
-    decode_tiles_supported as w8a8_decode_supported, gemm_quantized_w8a8,
-    gemm_quantized_w8a8_into, gemm_w8a8 as w8a8, quantize_w8a8_activation,
-    quantize_w8a8_bias_gelu_activation, quantize_w8a8_geglu_activation,
-    quantize_w8a8_silu_mul_activation, W8A8Activation, W8A8DecodeScope, W8A8Layout, W8A8ScaleMode,
-    W8A8WeightView, SCALE_PAD as W8A8_SCALE_PAD,
+    adaptive_layer_norm_quantize_w8a8_activation, adaptive_rms_quantize_w8a8_activation,
+    decode_scope as w8a8_decode_scope, decode_tiles_supported as w8a8_decode_supported,
+    gemm_quantized_w8a8, gemm_quantized_w8a8_into, gemm_w8a8 as w8a8,
+    norm_quantize_w8a8_activation, quantize_w8a8_activation, quantize_w8a8_bias_gelu_activation,
+    quantize_w8a8_geglu_activation, quantize_w8a8_silu_mul_activation, W8A8Activation,
+    W8A8DecodeScope, W8A8Layout, W8A8ScaleMode, W8A8WeightView, SCALE_PAD as W8A8_SCALE_PAD,
 };
 
 /// Whether the compiled TileLang table serves a GEMM of these `(n, k)`
