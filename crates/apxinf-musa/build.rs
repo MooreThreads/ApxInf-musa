@@ -285,7 +285,7 @@ fn hash_bytes(hash: &mut u128, bytes: &[u8]) {
 const NON_CODE_EXTENSIONS: &[&str] = &[
     "md", "rst", "txt", "json", "toml", "ini", "cfg", "yaml", "yml", "csv", "log", "patch",
     "diff", "py", "sh", "bash", "png", "jpg", "jpeg", "svg", "pdf", "gitignore",
-
+];
 
 /// Whether a file can reach code generation, and so whether its bytes belong in
 /// the kernel build id.
