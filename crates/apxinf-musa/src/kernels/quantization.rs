@@ -51,13 +51,160 @@ pub fn quantize_bf16_e4m3(ctx: &MusaContext, input: &Tensor, scale: f32) -> Resu
     }
 }
 
-pub fn concat_rows_quantize_bf16_e4m3(
-    _ctx: &MusaContext,
-    _first: &Tensor,
-    _second: &Tensor,
-    _scale: f32,
+/// Concatenate two equally tall BF16 matrices along columns and quantize the
+/// result directly to E4M3 using the consumer's static per-tensor scale.
+pub fn concat_columns_quantize_bf16_e4m3(
+    ctx: &MusaContext,
+    first: &Tensor,
+    second: &Tensor,
+    scale: f32,
 ) -> Result<Tensor> {
-    Err(not_ported("quantization::concat_rows_quantize_bf16_e4m3"))
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (ctx, first, second, scale);
+        Err(not_ported("quantization::concat_columns_quantize_bf16_e4m3"))
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        use apxinf_core::{DType, Device, Error, Shape};
+        use super::contracts::{output_tensor, tensor_ptr};
+
+        let operation = "concat_columns_quantize_bf16_e4m3";
+        let expected = Device::Musa(ctx.device_id());
+        let first_dims = first.shape().dims();
+        let second_dims = second.shape().dims();
+        if first.dtype() != DType::BF16
+            || second.dtype() != DType::BF16
+            || first.device() != expected
+            || second.device() != expected
+            || first_dims.len() != 2
+            || second_dims.len() != 2
+            || first_dims[0] != second_dims[0]
+            || first_dims.iter().any(|dimension| *dimension == 0)
+            || second_dims.iter().any(|dimension| *dimension == 0)
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !scale.recip().is_finite()
+        {
+            return Err(Error::Other(format!(
+                "MUSA {operation} expects two non-empty BF16 matrices on {expected} with matching rows and a finite positive scale"
+            )));
+        }
+        let rows = first_dims[0];
+        let total_cols = first_dims[1]
+            .checked_add(second_dims[1])
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} column count overflow")))?;
+        let count = rows
+            .checked_mul(total_cols)
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} output size overflow")))?;
+        let bytes = count
+            .checked_mul(DType::F8E4M3.size_in_bytes())
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} output byte size overflow")))?;
+        let output = output_tensor(
+            ctx,
+            Shape::new(vec![rows, total_cols]),
+            DType::F8E4M3,
+            crate::workspace::output_buffer(ctx, bytes)?,
+        );
+        unsafe {
+            crate::ffi::check_runtime(
+                crate::ffi::custom::apxinf_musa_concat_columns_quantize_bf16_e4m3(
+                    tensor_ptr(first)?,
+                    tensor_ptr(second)?,
+                    tensor_ptr(&output)?,
+                    crate::kernels::contracts::checked_i32(operation, "rows", rows)?,
+                    crate::kernels::contracts::checked_i32(
+                        operation,
+                        "first_cols",
+                        first_dims[1],
+                    )?,
+                    crate::kernels::contracts::checked_i32(
+                        operation,
+                        "second_cols",
+                        second_dims[1],
+                    )?,
+                    scale,
+                    ctx.stream().handle(),
+                ),
+            )
+            .map_err(crate::error::musa_error)?;
+        }
+        Ok(output)
+    }
+}
+
+/// Concatenate two equally wide BF16 matrices along rows and quantize the
+/// result directly to E4M3 using the consumer's static per-tensor scale.
+pub fn concat_rows_quantize_bf16_e4m3(
+    ctx: &MusaContext,
+    first: &Tensor,
+    second: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (ctx, first, second, scale);
+        Err(not_ported("quantization::concat_rows_quantize_bf16_e4m3"))
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        use apxinf_core::{DType, Device, Error, Shape};
+        use super::contracts::{output_tensor, tensor_ptr};
+
+        let operation = "concat_rows_quantize_bf16_e4m3";
+        let expected = Device::Musa(ctx.device_id());
+        let first_dims = first.shape().dims();
+        let second_dims = second.shape().dims();
+        if first.dtype() != DType::BF16
+            || second.dtype() != DType::BF16
+            || first.device() != expected
+            || second.device() != expected
+            || first_dims.len() != 2
+            || second_dims.len() != 2
+            || first_dims[1] != second_dims[1]
+            || first_dims.iter().any(|dimension| *dimension == 0)
+            || second_dims.iter().any(|dimension| *dimension == 0)
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !scale.recip().is_finite()
+        {
+            return Err(Error::Other(format!(
+                "MUSA {operation} expects two non-empty BF16 matrices on {expected} with matching columns and a finite positive scale"
+            )));
+        }
+        let total_rows = first_dims[0]
+            .checked_add(second_dims[0])
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} row count overflow")))?;
+        let cols = first_dims[1];
+        let count = total_rows
+            .checked_mul(cols)
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} output size overflow")))?;
+        let bytes = count
+            .checked_mul(DType::F8E4M3.size_in_bytes())
+            .ok_or_else(|| Error::Other(format!("MUSA {operation} output byte size overflow")))?;
+        let output = output_tensor(
+            ctx,
+            Shape::new(vec![total_rows, cols]),
+            DType::F8E4M3,
+            crate::workspace::output_buffer(ctx, bytes)?,
+        );
+        unsafe {
+            crate::ffi::check_runtime(
+                crate::ffi::custom::apxinf_musa_concat_rows_quantize_bf16_e4m3(
+                    tensor_ptr(first)?,
+                    tensor_ptr(second)?,
+                    tensor_ptr(&output)?,
+                    crate::kernels::contracts::checked_i32(operation, "first_rows", first_dims[0])?,
+                    crate::kernels::contracts::checked_i32(operation, "second_rows", second_dims[0])?,
+                    crate::kernels::contracts::checked_i32(operation, "cols", cols)?,
+                    scale,
+                    ctx.stream().handle(),
+                ),
+            )
+            .map_err(crate::error::musa_error)?;
+        }
+        Ok(output)
+    }
 }
 
 /// Quantize a BF16 tensor to E4M3 one row at a time.

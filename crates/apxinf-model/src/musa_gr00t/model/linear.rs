@@ -112,6 +112,25 @@ pub(crate) trait DeviceLinearWeights: Debug {
         Ok(None)
     }
 
+    fn fused_gemm_bias_gelu(
+        &self,
+        _input: &Tensor,
+        _bias: &Tensor,
+        _output_scale: f32,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    fn fused_gemm_bias(
+        &self,
+        _input: &Tensor,
+        _bias: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     fn quantize_bias_gelu_tensor_input(
         &self,
         _input: &Tensor,

@@ -1264,8 +1264,7 @@ pub fn try_noncausal_batched_equal(
     n_heads: usize,
     head_dim: usize,
 ) -> Result<Option<Tensor>> {
-    if crate::MUSA_ARCH != "mp_22"
-        || !batched_equal_flash_shape(batch, tokens, n_heads, head_dim)
+    if !batched_equal_flash_shape(batch, tokens, n_heads, head_dim)
         || bf16_sdpa_mode() == Bf16SdpaMode::Legacy
     {
         return Ok(None);

@@ -257,7 +257,7 @@ For S5000, build with `APXINF_MUSA_ARCH=mp_31` and use `--precision fp8
 The activation calibration is static; runtime amax is not part of this path.
 Weights are quantized at load time, and NN/NT layout is selected in Rust.
 `auto` and `bf16` retain the existing execution. The initial policy selects
-17 shape classes; six variable-text rules use `128 < M <= 256`. Per-shape
+18 shape classes; six variable-text rules use `128 < M <= 256`. Per-shape
 microbenchmark benefit is not an end-to-end speed or model-quality guarantee.
 
 MP31 Norm producers feeding admitted FP8 GEMMs can emit E4M3 directly. They

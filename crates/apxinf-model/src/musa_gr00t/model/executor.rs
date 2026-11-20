@@ -1,4 +1,4 @@
-//! MUSA BF16 execution engine for NVIDIA GR00T N1.7.
+//! MUSA GR00T N1.7 execution engine for BF16, FP8, and INT8 paths.
 //!
 //! The public model-neutral [`crate::VlaRuntime`] adapter lives in
 //! shared `vla_runtime`; this module owns MUSA's GR00T device state and prepared
@@ -45,6 +45,7 @@ const INITIAL_GRAPH_WORKSPACE_BYTES: usize = 4usize << 30;
 const TEXT_MROPE_TABLE_CAPACITY_TOKENS: usize = 256;
 const USE_FUSED_FP8_RMS_NORM: bool = true;
 const USE_FUSED_FP8_VISION_LAYER_NORM: bool = true;
+const USE_FUSED_FP8_VISION_CONCAT_QUANT: bool = true;
 const USE_FUSED_SELF_QKV: bool = true;
 const USE_FUSED_ADAPTIVE_LAYER_NORM: bool = true;
 const USE_STRIDED_FUSED_QKV_ATTENTION: bool = true;
@@ -54,6 +55,18 @@ const USE_FUSED_FP8_BIAS_GELU_QUANT: bool = true;
 const USE_FUSED_FP8_SELF_QKV_BIAS: bool = true;
 const USE_FUSED_ADAPTIVE_LAYER_NORM_QUANT: bool = true;
 const USE_FUSED_FFN_BIAS_RESIDUAL: bool = true;
+
+fn use_fp8_gemm_bias_gelu() -> bool {
+    std::env::var("APXINF_MUSA_FP8_GEMM_BIAS_GELU")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+fn use_fp8_vision_gemm_bias_gelu() -> bool {
+    std::env::var("APXINF_MUSA_FP8_VISION_GEMM_BIAS_GELU")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false)
+}
 
 /// Precision-specific weight materialization and layer-composition policy.
 ///
@@ -1227,6 +1240,122 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             }
             kernels::activation::bias_gelu_bf16(self.backend.context(), input, Some(bias))
         };
+        let vision_matmul_bias_gelu =
+            |name: &str,
+             input: &Tensor,
+             _weight: &Tensor,
+             bias: &Tensor,
+             next_name: &str,
+             _next_weight: &Tensor,
+             next_bias: &Tensor| {
+                let Some(first) = self.backbone_linears.get(name) else {
+                    return Ok(None);
+                };
+                let Some(next) = self.backbone_linears.get(next_name) else {
+                    return Ok(None);
+                };
+                let Some(output_scale) = next.activation_scale() else {
+                    return Ok(None);
+                };
+                let Some(quantized) = first.fused_gemm_bias_gelu(
+                    input,
+                    bias,
+                    output_scale,
+                    &self.backend,
+                )? else {
+                    return Ok(None);
+                };
+                if let Some(output) = next.fused_gemm_bias(&quantized, next_bias, &self.backend)? {
+                    return Ok(Some(output));
+                }
+                let output = next.forward_quantized_tensor(&quantized, &self.backend)?;
+                kernels::elementwise::bias_bf16(
+                    self.backend.context(),
+                    &output,
+                    Some(next_bias),
+                )
+                .map(Some)
+            };
+        let vision_matmul_bias =
+            |name: &str, input: &Tensor, _weight: &Tensor, bias: &Tensor| {
+                if E::NAME != "fp8" || !fp8_switches::enabled("VISION_GEMM_BIAS") {
+                    return Ok(None);
+                }
+                let Some(linear) = self.backbone_linears.get(name) else {
+                    return Ok(None);
+                };
+                linear.fused_gemm_bias(input, bias, &self.backend)
+            };
+        let vision_residual_norm_matmul_bias_gelu =
+            |name: &str,
+             projection: &Tensor,
+             projection_bias: &Tensor,
+             residual: &Tensor,
+             norm_weight: &Tensor,
+             norm_bias: &Tensor,
+             eps: f32,
+             _weight: &Tensor,
+             fc1_bias: &Tensor,
+             next_name: &str,
+             _next_weight: &Tensor| {
+                let Some(first) = self.backbone_linears.get(name) else {
+                    return Ok(None);
+                };
+                let Some(next) = self.backbone_linears.get(next_name) else {
+                    return Ok(None);
+                };
+                let dims = projection.shape().dims();
+                let Some(input_scale) = first
+                    .fp8_input_scale(dims[0], dims[1])
+                else {
+                    return Ok(None);
+                };
+                let (hidden, normalized) = residual_norm_fp8(
+                    &self.backend,
+                    projection,
+                    Some(projection_bias),
+                    residual,
+                    kernels::norm::Fp8Norm::Layer {
+                        weight: norm_weight,
+                        bias: norm_bias,
+                    },
+                    false,
+                    eps,
+                    input_scale,
+                )?;
+                let Some(output_scale) = next.activation_scale() else {
+                    return Ok(None);
+                };
+                let Some(quantized) = first.fused_gemm_bias_gelu(
+                    &normalized,
+                    fc1_bias,
+                    output_scale,
+                    &self.backend,
+                )? else {
+                    return Ok(None);
+                };
+                let output = next.forward_quantized_tensor(&quantized, &self.backend)?;
+                Ok(Some((hidden, output)))
+            };
+        let use_fused_vision_concat_quant = USE_FUSED_FP8_VISION_CONCAT_QUANT
+            && E::NAME == "fp8"
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_VISION_CONCAT_QUANT").is_none();
+        let vision_concat_quant = |name: &str, first: &Tensor, second: &Tensor| {
+            if use_fused_vision_concat_quant {
+                if let Some(linear) = self.backbone_linears.get(name) {
+                    if let Some(scale) = linear.activation_scale() {
+                        return kernels::quantization::concat_rows_quantize_bf16_e4m3(
+                            self.backend.context(),
+                            first,
+                            second,
+                            scale,
+                        )
+                        .map(Some);
+                    }
+                }
+            }
+            Ok(None)
+        };
         let legacy_vision_residual_layer_norm =
             std::env::var_os("APXINF_GR00T_BF16_LEGACY_VISION_RESIDUAL_LN").is_some();
         let use_fused_bf16_vision_mlp_residual_norm = E::USE_FUSED_BF16_VISION_MLP_RESIDUAL_NORM
@@ -1249,12 +1378,27 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             &observation.image_grid_thw,
             positions,
             &vision_matmul,
+            if E::NAME == "fp8" && fp8_switches::enabled("VISION_GEMM_BIAS") {
+                Some(&vision_matmul_bias)
+            } else {
+                None
+            },
+            if use_fp8_gemm_bias_gelu() && use_fp8_vision_gemm_bias_gelu() {
+                Some(&vision_matmul_bias_gelu)
+            } else {
+                None
+            },
             Some(&vision_norm_matmul),
             Some(&vision_bias_gelu),
             None,
-            None,
+            Some(&vision_concat_quant),
             if fp8_vision_available {
                 Some(&vision_residual_norm_matmul)
+            } else {
+                None
+            },
+            if fp8_vision_available && use_fp8_gemm_bias_gelu() && use_fp8_vision_gemm_bias_gelu() {
+                Some(&vision_residual_norm_matmul_bias_gelu)
             } else {
                 None
             },
@@ -1427,10 +1571,25 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             .ok_or_else(|| {
                 Error::Other(format!("missing GR00T action time embedding {step_index}"))
             })?;
-        action_features = kernels::elementwise::concat_columns_bf16(
-            self.backend.context(),
-            &[&action_features, time_features],
-        )?;
+        action_features = match (
+            action_features.dtype(),
+            action_features.shape().dims(),
+            time_features.shape().dims(),
+            selected.action_encoder.time.activation_scale(),
+        ) {
+            (DType::BF16, [40, 1536], [40, 1536], Some(scale)) => {
+                kernels::quantization::concat_columns_quantize_bf16_e4m3(
+                    self.backend.context(),
+                    &action_features,
+                    time_features,
+                    scale,
+                )?
+            }
+            _ => kernels::elementwise::concat_columns_bf16(
+                self.backend.context(),
+                &[&action_features, time_features],
+            )?,
+        };
         action_features = linear_silu(
             &*self.backend,
             &action_features,
@@ -2298,6 +2457,19 @@ fn linear<L: DeviceLinearWeights>(
     kernels::elementwise::bias_bf16(backend.context(), &output, weights.bias())
 }
 
+fn linear_with_optional_fused_bias<L: DeviceLinearWeights>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    weights: &L,
+) -> Result<Tensor> {
+    if let Some(bias) = weights.bias() {
+        if let Some(output) = weights.fused_gemm_bias(input, bias, backend)? {
+            return Ok(output);
+        }
+    }
+    linear(backend, input, weights)
+}
+
 fn rms_norm(backend: &RuntimeBackend, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     kernels::norm::rms_bf16(backend.context(), input, weight, eps)
 }
@@ -2417,11 +2589,11 @@ fn forward_feed_forward<E: Gr00tPrecisionExecution>(
     input: &Tensor,
     weights: &Gr00tDeviceFeedForwardWeights<E>,
 ) -> Result<Tensor> {
-    let output = forward_feed_forward_projection(backend, input, weights)?;
-    if let Some(output) = weights.output.packed8_bias(&output, backend)? {
-        return Ok(output);
+    if let Some(output) = forward_feed_forward_fused_projection(backend, input, None, weights)? {
+        return kernels::elementwise::bias_bf16(backend.context(), &output, weights.output.bias());
     }
-    kernels::elementwise::bias_bf16(backend.context(), &output, weights.output.bias())
+    let hidden = forward_feed_forward_hidden_with_quantized_input(backend, input, None, weights)?;
+    linear_with_optional_fused_bias(backend, &hidden, &weights.output)
 }
 
 fn forward_feed_forward_projection<E: Gr00tPrecisionExecution>(
@@ -2438,6 +2610,46 @@ fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecuti
     quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
     weights: &Gr00tDeviceFeedForwardWeights<E>,
 ) -> Result<Tensor> {
+    if let Some(output) =
+        forward_feed_forward_fused_projection(backend, input, quantized_input, weights)?
+    {
+        return Ok(output);
+    }
+    let hidden = forward_feed_forward_hidden_with_quantized_input(backend, input, quantized_input, weights)?;
+    weights.output.forward(&hidden, backend)
+}
+
+fn forward_feed_forward_fused_projection<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
+    weights: &Gr00tDeviceFeedForwardWeights<E>,
+) -> Result<Option<Tensor>> {
+    let fused_quantized_bias_gelu = USE_FUSED_FP8_BIAS_GELU_QUANT
+        && E::NAME == "fp8"
+        && weights.output.supports_fused_bias_gelu_quantization();
+    if !fused_quantized_bias_gelu {
+        return Ok(None);
+    }
+    if use_fp8_gemm_bias_gelu() && quantized_input.is_none() {
+        let bias = weights.input.bias().ok_or_else(|| {
+            Error::Other("GR00T fused quantized bias GELU requires input bias".into())
+        })?;
+        if let Some(output_scale) = weights.output.activation_scale() {
+            if let Some(quantized) = weights.input.fused_gemm_bias_gelu(
+                input,
+                bias,
+                output_scale,
+                backend,
+            )? {
+                return weights
+                    .output
+                    .forward_quantized_tensor(&quantized, backend)
+                    .map(Some);
+            }
+        }
+    }
+
     let hidden = if let Some(quantized) = quantized_input {
         weights
             .input
@@ -2445,14 +2657,30 @@ fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecuti
     } else {
         weights.input.forward(input, backend)?
     };
-    if USE_FUSED_FP8_BIAS_GELU_QUANT && E::NAME != "int8" {
+    if fused_quantized_bias_gelu {
         let bias = weights.input.bias().ok_or_else(|| {
             Error::Other("GR00T fused quantized bias GELU requires input bias".into())
         })?;
         if let Some(output) = weights.output.fused_bias_gelu(&hidden, bias, backend)? {
-            return Ok(output);
+            return Ok(Some(output));
         }
     }
+    Ok(None)
+}
+
+fn forward_feed_forward_hidden_with_quantized_input<E: Gr00tPrecisionExecution>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
+    weights: &Gr00tDeviceFeedForwardWeights<E>,
+) -> Result<Tensor> {
+    let hidden = if let Some(quantized) = quantized_input {
+        weights
+            .input
+            .forward_reusable_quantized(quantized, backend)?
+    } else {
+        weights.input.forward(input, backend)?
+    };
     let hidden = if quantized_input.is_some() {
         kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
     } else {
@@ -2462,7 +2690,7 @@ fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecuti
             kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
         }
     };
-    weights.output.forward(&hidden, backend)
+    Ok(hidden)
 }
 
 fn forward_feed_forward_residual<E: Gr00tPrecisionExecution>(
@@ -2481,12 +2709,36 @@ fn forward_feed_forward_residual_with_quantized_input<E: Gr00tPrecisionExecution
     weights: &Gr00tDeviceFeedForwardWeights<E>,
     residual: &Tensor,
 ) -> Result<Tensor> {
-    let output = forward_feed_forward_projection_with_quantized_input(
+    if let Some(output) =
+        forward_feed_forward_fused_projection(backend, input, quantized_input, weights)?
+    {
+        if let Some(output) = weights.output.packed_bias_then_residual(
+            &output,
+            weights.output.bias(),
+            residual,
+            backend,
+        )? {
+            return Ok(output);
+        }
+        return kernels::fused::bias_then_residual_bf16(
+            backend.context(),
+            &output,
+            weights.output.bias(),
+            residual,
+        );
+    }
+    let hidden = forward_feed_forward_hidden_with_quantized_input(
         backend,
         input,
         quantized_input,
         weights,
     )?;
+    if let Some(bias) = weights.output.bias() {
+        if let Some(output) = weights.output.fused_gemm_bias(&hidden, bias, backend)? {
+            return backend.add(&output, residual);
+        }
+    }
+    let output = weights.output.forward(&hidden, backend)?;
     if let Some(output) = weights.output.packed_bias_then_residual(
         &output,
         weights.output.bias(),
@@ -2561,7 +2813,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                         )?
                     }
                 } else {
-                    linear(backend, query_input, fused_qkv)?
+                    linear_with_optional_fused_bias(backend, query_input, fused_qkv)?
                 };
                 let output = if USE_STRIDED_FUSED_QKV_ATTENTION {
                     noncausal_strided_qkv_attention::<E>(backend, &qkv, heads, head_dim)?
@@ -2576,7 +2828,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                     noncausal_attention::<E>(backend, &qkv.q, &qkv.k, &qkv.v, heads, head_dim)?
                 };
                 return if apply_output_bias {
-                    linear(backend, &output, &weights.output)
+                    linear_with_optional_fused_bias(backend, &output, &weights.output)
                 } else {
                     weights.output.forward(&output, backend)
                 };
@@ -2637,7 +2889,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         let value = value.reshape(vec![key_value_len, heads, head_dim])?;
         let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
         return if apply_output_bias {
-            linear(backend, &output, &weights.output)
+            linear_with_optional_fused_bias(backend, &output, &weights.output)
         } else {
             weights.output.forward(&output, backend)
         };
@@ -2667,7 +2919,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
     .reshape(vec![key_value_len, heads, head_dim])?;
     let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
     if apply_output_bias {
-        linear(backend, &output, &weights.output)
+        linear_with_optional_fused_bias(backend, &output, &weights.output)
     } else {
         weights.output.forward(&output, backend)
     }
@@ -2779,7 +3031,7 @@ fn forward_attention_with_prepared_key_value<E: Gr00tPrecisionExecution>(
         head_dim,
     )?;
     if apply_output_bias {
-        linear(backend, &output, &weights.output)
+        linear_with_optional_fused_bias(backend, &output, &weights.output)
     } else {
         weights.output.forward(&output, backend)
     }

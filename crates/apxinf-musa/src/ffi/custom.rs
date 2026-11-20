@@ -103,15 +103,39 @@ extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
-    pub fn apxinf_musa_mudnn_fp8_gemm(
+    pub fn apxinf_musa_concat_columns_quantize_bf16_e4m3(
+        first: *const c_void,
+        second: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        first_cols: i32,
+        second_cols: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn apxinf_musa_concat_rows_quantize_bf16_e4m3(
+        first: *const c_void,
+        second: *const c_void,
+        output: *mut c_void,
+        first_rows: i32,
+        second_rows: i32,
+        cols: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn apxinf_musa_mudnn_fp8_gemm_epilogue(
         activation: *const c_void,
         weight: *const c_void,
+        bias: *const c_void,
         output: *mut c_void,
         rows: i32,
         cols: i32,
         inner: i32,
         transpose: i32,
         scale: f32,
+        output_type: i32,
+        epilogue: i32,
+        output_scale: f32,
         stream: *mut c_void,
     ) -> i32;
     /// muDNN flash attention. Same status convention as the GEMM above.

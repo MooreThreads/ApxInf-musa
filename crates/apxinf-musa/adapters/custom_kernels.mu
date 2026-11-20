@@ -123,6 +123,54 @@ extern "C" musaError_t apxinf_musa_quantize_bf16_e4m3(
 #endif
 }
 
+namespace {
+dim3 row_grid(int rows, int cols);
+}
+
+extern "C" musaError_t apxinf_musa_concat_columns_quantize_bf16_e4m3(
+    const void* first, const void* second, void* output, int rows,
+    int first_cols, int second_cols, float scale, musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (!first || !second || !output || rows <= 0 || first_cols <= 0 ||
+      second_cols <= 0 || !std::isfinite(scale) || scale <= 0.0f ||
+      !std::isfinite(1.0f / scale) ||
+      static_cast<int64_t>(first_cols) + second_cols > INT32_MAX) {
+    return musaErrorInvalidValue;
+  }
+  const int total_cols = first_cols + second_cols;
+  concat_columns_quantize_bf16_e4m3_kernel<<<row_grid(rows, total_cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(first),
+      static_cast<const __mt_bfloat16*>(second),
+      static_cast<__mt_fp8_e4m3*>(output), rows, first_cols, second_cols,
+      1.0f / scale);
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
+}
+
+extern "C" musaError_t apxinf_musa_concat_rows_quantize_bf16_e4m3(
+    const void* first, const void* second, void* output, int first_rows,
+    int second_rows, int cols, float scale, musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (!first || !second || !output || first_rows <= 0 || second_rows <= 0 ||
+      cols <= 0 || !std::isfinite(scale) || scale <= 0.0f ||
+      !std::isfinite(1.0f / scale) ||
+      static_cast<int64_t>(first_rows) + second_rows > INT32_MAX) {
+    return musaErrorInvalidValue;
+  }
+  const int total_rows = first_rows + second_rows;
+  concat_rows_quantize_bf16_e4m3_kernel<<<row_grid(total_rows, cols), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(first),
+      static_cast<const __mt_bfloat16*>(second),
+      static_cast<__mt_fp8_e4m3*>(output), first_rows, second_rows, cols,
+      1.0f / scale);
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
+}
+
 // Grid size for a grid-stride elementwise launch.
 //
 // Capped rather than sized exactly: the loop covers any `count`, and M1000 has

@@ -290,6 +290,114 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
             .transpose()
     }
 
+    fn supports_fused_bias_gelu_quantization(&self) -> bool {
+        self.fuse_gelu && self.prepared.is_some()
+    }
+
+    fn fused_gemm_bias_gelu(
+        &self,
+        input: &Tensor,
+        bias: &Tensor,
+        output_scale: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        if !self.fuse_gelu || !output_scale.is_finite() || output_scale <= 0.0 {
+            return Ok(None);
+        }
+        let Some(prepared) = &self.prepared else {
+            return Ok(None);
+        };
+        let activation = if input.dtype() == DType::F8E4M3 {
+            input.clone()
+        } else if input.dtype() == DType::BF16 {
+            let dims = input.shape().dims();
+            let [rows, inner] = dims else {
+                return Ok(None);
+            };
+            if !prepared.policy.quantizes_input(*rows, *inner) {
+                return Ok(None);
+            }
+            kernels::quantization::quantize_bf16_e4m3(
+                backend.context(),
+                input,
+                prepared.activation_scale,
+            )?
+        } else {
+            return Ok(None);
+        };
+        let dims = activation.shape().dims();
+        let [rows, inner] = dims else {
+            return Ok(None);
+        };
+        if !prepared.policy.accepts_fp8(*rows, *inner) {
+            return Ok(None);
+        }
+        kernels::gemm::gemm_fp8_epilogue(
+            backend.context(),
+            &activation,
+            &prepared.weight,
+            prepared.policy.layout(),
+            prepared.product_scale,
+            kernels::gemm::Fp8Epilogue::GeluBias(bias),
+            kernels::gemm::Fp8Output::Fp8,
+            output_scale,
+        )
+        .map(Some)
+    }
+
+    fn fused_gemm_bias(
+        &self,
+        input: &Tensor,
+        bias: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        if !enabled("GEMM_BIAS") {
+            return Ok(None);
+        }
+        let Some(prepared) = &self.prepared else {
+            return Ok(None);
+        };
+        let activation = if input.dtype() == DType::F8E4M3 {
+            input.clone()
+        } else if input.dtype() == DType::BF16 {
+            let [rows, inner] = input.shape().dims() else {
+                return Ok(None);
+            };
+            if !prepared.policy.quantizes_input(*rows, *inner) {
+                return Ok(None);
+            }
+            kernels::quantization::quantize_bf16_e4m3(
+                backend.context(),
+                input,
+                prepared.activation_scale,
+            )?
+        } else {
+            return Ok(None);
+        };
+        let [rows, inner] = activation.shape().dims() else {
+            return Ok(None);
+        };
+        let layout = match prepared.weight.shape().dims() {
+            [_, weight_inner] if *weight_inner == *inner => kernels::gemm::Fp8Layout::Nt,
+            [weight_inner, _] if *weight_inner == *inner => kernels::gemm::Fp8Layout::Nn,
+            _ => return Ok(None),
+        };
+        if !prepared.policy.accepts_fp8(*rows, *inner) || bias.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        kernels::gemm::gemm_fp8_epilogue(
+            backend.context(),
+            &activation,
+            &prepared.weight,
+            layout,
+            prepared.product_scale,
+            kernels::gemm::Fp8Epilogue::Bias(bias),
+            kernels::gemm::Fp8Output::Bf16,
+            1.0,
+        )
+        .map(Some)
+    }
+
     fn quantize_bias_gelu_tensor_input(
         &self,
         input: &Tensor,

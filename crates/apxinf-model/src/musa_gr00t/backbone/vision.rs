@@ -33,6 +33,11 @@ pub struct VisionOutput {
 }
 
 pub(crate) type VisionMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
+pub(crate) type VisionMatmulBias<'a> =
+    dyn Fn(&str, &Tensor, &Tensor, &Tensor) -> Result<Option<Tensor>> + 'a;
+pub(crate) type VisionMatmulBiasGelu<'a> =
+    dyn Fn(&str, &Tensor, &Tensor, &Tensor, &str, &Tensor, &Tensor) -> Result<Option<Tensor>>
+        + 'a;
 pub(crate) type VisionNormMatmul<'a> =
     dyn Fn(&str, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<Tensor> + 'a;
 pub(crate) type VisionBiasGelu<'a> = dyn Fn(&str, &Tensor, &Tensor) -> Result<Tensor> + 'a;
@@ -41,6 +46,20 @@ pub(crate) type VisionConcatQuant<'a> =
 pub(crate) type VisionSegmentedAttention<'a> =
     dyn Fn(&Tensor, &Tensor, &Tensor, &[usize], usize, usize) -> Result<Option<Tensor>> + 'a;
 pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor, f32, &Tensor) -> Result<(Tensor, Tensor)>
+    + 'a;
+pub(crate) type VisionResidualNormMatmulBiasGelu<'a> = dyn Fn(
+        &str,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        &Tensor,
+        f32,
+        &Tensor,
+        &Tensor,
+        &str,
+        &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>>
     + 'a;
 pub(crate) type VisionBiasResidual<'a> =
     dyn Fn(&str, &Tensor, &Tensor, &Tensor) -> Result<Tensor> + 'a;
@@ -154,11 +173,14 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
     grid_thw: &[[u32; 3]],
     positions: &PreparedVisionPositions,
     matmul: &VisionMatmul<'_>,
+    matmul_bias: Option<&VisionMatmulBias<'_>>,
+    matmul_bias_gelu: Option<&VisionMatmulBiasGelu<'_>>,
     norm_matmul: Option<&VisionNormMatmul<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    residual_norm_matmul_bias_gelu: Option<&VisionResidualNormMatmulBiasGelu<'_>>,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
     allow_cached_residual_layer_norm: bool,
@@ -174,11 +196,14 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
         Some(&positions.embeddings),
         Some((&positions.position_ids, &positions.device_position_ids)),
         Some(matmul),
+        matmul_bias,
+        matmul_bias_gelu,
         norm_matmul,
         bias_gelu,
         segmented_attention,
         concat_quant,
         residual_norm_matmul,
+        residual_norm_matmul_bias_gelu,
         true,
         allow_gr00t_fused_mlp_residual_norm,
         bias_residual,
@@ -197,11 +222,14 @@ fn forward_impl(
     prepared_position_embeddings: Option<&Tensor>,
     prepared_position_ids: Option<(&[u32], &PreparedVisionPositionBuffer)>,
     matmul: Option<&VisionMatmul<'_>>,
+    matmul_bias: Option<&VisionMatmulBias<'_>>,
+    matmul_bias_gelu: Option<&VisionMatmulBiasGelu<'_>>,
     norm_matmul: Option<&VisionNormMatmul<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    residual_norm_matmul_bias_gelu: Option<&VisionResidualNormMatmulBiasGelu<'_>>,
     allow_gr00t_fused_qkv_rope: bool,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
@@ -444,12 +472,28 @@ fn forward_impl(
                 ))
             })?;
         let fc1_name = format!("backbone.vision.blocks.{i}.fc1");
-        // Output residual + pre-MLP LayerNorm + FC1. Quantized GR00T may
-        // explicitly replace the normalized BF16 intermediate with an FP8
-        // tensor; the default path and all existing operator dispatch remain
-        // unchanged when the callback is absent.
-        let (residual_hidden, h1) = if let Some(residual_norm_matmul) = residual_norm_matmul {
-            residual_norm_matmul(
+        let fc2_name = format!("backbone.vision.blocks.{i}.fc2");
+        let fused_mlp = if let Some(callback) = residual_norm_matmul_bias_gelu {
+            callback(
+                &fc1_name,
+                &attn_out,
+                &blk.proj_b,
+                &x,
+                &blk.norm2_w,
+                &blk.norm2_b,
+                eps,
+                &blk.fc1_w,
+                &blk.fc1_b,
+                &fc2_name,
+                &blk.fc2_w,
+            )?
+        } else {
+            None
+        };
+        let (residual_hidden, h2) = if let Some((hidden, output)) = fused_mlp {
+            (hidden, output)
+        } else if let Some(residual_norm_matmul) = residual_norm_matmul {
+            let (hidden, projected) = residual_norm_matmul(
                 &fc1_name,
                 &attn_out,
                 &blk.proj_b,
@@ -463,7 +507,12 @@ fn forward_impl(
                 Error::Other(format!(
                     "vision block {i} residual/norm/FC1 failed: {error}"
                 ))
-            })?
+            })?;
+            let activated = vision_bias_gelu(bias_gelu, b, &fc1_name, &projected, &blk.fc1_b)
+                .map_err(|error| Error::Other(format!("vision block {i} GELU failed: {error}")))?;
+            let output = vision_matmul(matmul, b, &fc2_name, &activated, &blk.fc2_w)
+                .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?;
+            (hidden, output)
         } else {
             let (hidden, normed) = apply_bias_residual_layer_norm(
                 b,
@@ -477,23 +526,32 @@ fn forward_impl(
             .map_err(|error| {
                 Error::Other(format!("vision block {i} residual/norm failed: {error}"))
             })?;
-            let h1 = vision_matmul(matmul, b, &fc1_name, &normed, &blk.fc1_w)
-                .map_err(|error| Error::Other(format!("vision block {i} FC1 failed: {error}")))?;
-            (hidden, h1)
+            let output = if let Some(callback) = matmul_bias_gelu {
+                callback(
+                    &fc1_name,
+                    &normed,
+                    &blk.fc1_w,
+                    &blk.fc1_b,
+                    &fc2_name,
+                    &blk.fc2_w,
+                    &blk.fc2_b,
+                )?
+            } else {
+                None
+            };
+            let output = if let Some(output) = output {
+                output
+            } else {
+                let projected = vision_matmul(matmul, b, &fc1_name, &normed, &blk.fc1_w)
+                    .map_err(|error| Error::Other(format!("vision block {i} FC1 failed: {error}")))?;
+                let activated = vision_bias_gelu(bias_gelu, b, &fc1_name, &projected, &blk.fc1_b)
+                    .map_err(|error| Error::Other(format!("vision block {i} GELU failed: {error}")))?;
+                vision_matmul(matmul, b, &fc2_name, &activated, &blk.fc2_w)
+                    .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?
+            };
+            (hidden, output)
         };
         x = residual_hidden;
-        // GELU after FC1.
-        let h1 = vision_bias_gelu(bias_gelu, b, &fc1_name, &h1, &blk.fc1_b)
-            .map_err(|error| Error::Other(format!("vision block {i} GELU failed: {error}")))?;
-        // FC2 + residual
-        let h2 = vision_matmul(
-            matmul,
-            b,
-            &format!("backbone.vision.blocks.{i}.fc2"),
-            &h1,
-            &blk.fc2_w,
-        )
-        .map_err(|error| Error::Other(format!("vision block {i} FC2 failed: {error}")))?;
         if (allow_gr00t_fused_mlp_residual_norm
             && fused_vision_mlp_residual_norm_shape_supported(n_patches, hidden, i, w.blocks.len()))
             || (use_cached_residual_layer_norm && i + 1 < w.blocks.len())
@@ -564,6 +622,8 @@ fn forward_impl(
         merge,
         eps,
         matmul,
+        matmul_bias,
+        matmul_bias_gelu,
         bias_gelu,
         norm_matmul,
     )?;
@@ -588,6 +648,8 @@ fn forward_impl(
             eps,
             index,
             matmul,
+            matmul_bias,
+            matmul_bias_gelu,
             bias_gelu,
             norm_matmul,
         )?;
@@ -636,6 +698,8 @@ fn merge_primary(
     merge: usize,
     eps: f32,
     matmul: Option<&VisionMatmul<'_>>,
+    matmul_bias: Option<&VisionMatmulBias<'_>>,
+    matmul_bias_gelu: Option<&VisionMatmulBiasGelu<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
     norm_matmul: Option<&VisionNormMatmul<'_>>,
 ) -> Result<Tensor> {
@@ -654,8 +718,40 @@ fn merge_primary(
         let merged = reshape_merge(&normed, n_patches, hidden, merge)?;
         vision_matmul(matmul, b, "backbone.vision.merger.fc1", &merged, &m.fc1_w)?
     };
-    let h = vision_bias_gelu(bias_gelu, b, "backbone.vision.merger.fc1", &h, &m.fc1_b)?;
-    let out = vision_matmul(matmul, b, "backbone.vision.merger.fc2", &h, &m.fc2_w)?;
+    let out = if let Some(callback) = matmul_bias_gelu {
+        if let Some(output) = callback(
+            "backbone.vision.merger.fc1",
+            &h,
+            &m.fc1_w,
+            &m.fc1_b,
+            "backbone.vision.merger.fc2",
+            &m.fc2_w,
+            &m.fc2_b,
+        )? {
+            return Ok(output);
+        } else {
+            let h = vision_bias_gelu(bias_gelu, b, "backbone.vision.merger.fc1", &h, &m.fc1_b)?;
+            if let Some(callback) = matmul_bias {
+                if let Some(output) = callback(
+                    "backbone.vision.merger.fc2",
+                    &h,
+                    &m.fc2_w,
+                    &m.fc2_b,
+                )? {
+                    return Ok(output);
+                }
+            }
+            vision_matmul(matmul, b, "backbone.vision.merger.fc2", &h, &m.fc2_w)?
+        }
+    } else {
+        let h = vision_bias_gelu(bias_gelu, b, "backbone.vision.merger.fc1", &h, &m.fc1_b)?;
+        if let Some(callback) = matmul_bias {
+            if let Some(output) = callback("backbone.vision.merger.fc2", &h, &m.fc2_w, &m.fc2_b)? {
+                return Ok(output);
+            }
+        }
+        vision_matmul(matmul, b, "backbone.vision.merger.fc2", &h, &m.fc2_w)?
+    };
     add_bias(b, &out, &m.fc2_b)
 }
 
@@ -670,6 +766,8 @@ fn merge_deepstack(
     eps: f32,
     index: usize,
     matmul: Option<&VisionMatmul<'_>>,
+    matmul_bias: Option<&VisionMatmulBias<'_>>,
+    matmul_bias_gelu: Option<&VisionMatmulBiasGelu<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
     norm_matmul: Option<&VisionNormMatmul<'_>>,
 ) -> Result<Tensor> {
@@ -693,20 +791,37 @@ fn merge_deepstack(
             &m.fc1_w,
         )?
     };
-    let h = vision_bias_gelu(
-        bias_gelu,
-        b,
-        &format!("backbone.vision.deepstack.{index}.fc1"),
-        &h,
-        &m.fc1_b,
-    )?;
-    let out = vision_matmul(
-        matmul,
-        b,
-        &format!("backbone.vision.deepstack.{index}.fc2"),
-        &h,
-        &m.fc2_w,
-    )?;
+    let fc1_name = format!("backbone.vision.deepstack.{index}.fc1");
+    let fc2_name = format!("backbone.vision.deepstack.{index}.fc2");
+    let out = if let Some(callback) = matmul_bias_gelu {
+        if let Some(output) = callback(
+            &fc1_name,
+            &h,
+            &m.fc1_w,
+            &m.fc1_b,
+            &fc2_name,
+            &m.fc2_w,
+            &m.fc2_b,
+        )? {
+            return Ok(output);
+        } else {
+            let h = vision_bias_gelu(bias_gelu, b, &fc1_name, &h, &m.fc1_b)?;
+            if let Some(callback) = matmul_bias {
+                if let Some(output) = callback(&fc2_name, &h, &m.fc2_w, &m.fc2_b)? {
+                    return Ok(output);
+                }
+            }
+            vision_matmul(matmul, b, &fc2_name, &h, &m.fc2_w)?
+        }
+    } else {
+        let h = vision_bias_gelu(bias_gelu, b, &fc1_name, &h, &m.fc1_b)?;
+        if let Some(callback) = matmul_bias {
+            if let Some(output) = callback(&fc2_name, &h, &m.fc2_w, &m.fc2_b)? {
+                return Ok(output);
+            }
+        }
+        vision_matmul(matmul, b, &fc2_name, &h, &m.fc2_w)?
+    };
     add_bias(b, &out, &m.fc2_b)
 }
 
@@ -973,12 +1088,7 @@ fn segmented_vision_sdpa(
         return vision_attention(b, q, k, v, segment_lengths[0], n_heads, head_dim);
     }
     #[cfg(feature = "musa")]
-    let _ = (
-        output_name,
-        segmented_attention,
-        concat_quant,
-        allow_batched_segmented_attention,
-    );
+    let _ = (output_name, segmented_attention);
     let row_width = n_heads
         .checked_mul(head_dim)
         .ok_or_else(|| Error::Other("Qwen3-VL attention row width overflow".into()))?;
@@ -1048,6 +1158,13 @@ fn segmented_vision_sdpa(
                 b, &q_segment, &k_segment, &v_segment, row_count, n_heads, head_dim,
             )?);
             first_row += row_count;
+        }
+        if segments.len() == 2 {
+            if let Some(concat_quant) = concat_quant {
+                if let Some(output) = concat_quant(output_name, &segments[0], &segments[1])? {
+                    return Ok(output);
+                }
+            }
         }
         let mut output = segments.remove(0);
         for segment in segments {

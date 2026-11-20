@@ -9,6 +9,18 @@ pub enum Fp8Layout {
     Nt,
 }
 
+pub enum Fp8Epilogue<'a> {
+    Default,
+    Bias(&'a Tensor),
+    GeluBias(&'a Tensor),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8Output {
+    Bf16,
+    Fp8,
+}
+
 pub fn gemm_fp8(
     ctx: &MusaContext,
     activation: &Tensor,
@@ -16,9 +28,31 @@ pub fn gemm_fp8(
     layout: Fp8Layout,
     scale: f32,
 ) -> Result<Tensor> {
+    gemm_fp8_epilogue(
+        ctx,
+        activation,
+        weight,
+        layout,
+        scale,
+        Fp8Epilogue::Default,
+        Fp8Output::Bf16,
+        1.0,
+    )
+}
+
+pub fn gemm_fp8_epilogue(
+    ctx: &MusaContext,
+    activation: &Tensor,
+    weight: &Tensor,
+    layout: Fp8Layout,
+    scale: f32,
+    epilogue: Fp8Epilogue<'_>,
+    output_kind: Fp8Output,
+    output_scale: f32,
+) -> Result<Tensor> {
     #[cfg(not(apxinf_musa_available))]
     {
-        let _ = (ctx, activation, weight, layout, scale);
+        let _ = (ctx, activation, weight, layout, scale, epilogue, output_kind, output_scale);
         Err(crate::kernels::not_ported("gemm_fp8"))
     }
     #[cfg(apxinf_musa_available)]
@@ -28,6 +62,8 @@ pub fn gemm_fp8(
             || (ctx.caps().compute_major, ctx.caps().compute_minor) != (3, 1)
             || !scale.is_finite()
             || scale <= 0.0
+            || !output_scale.is_finite()
+            || output_scale <= 0.0
         {
             return Err(Error::Other(
                 "FP8 GEMM requires MP31 and a finite positive scale".into(),
@@ -59,17 +95,38 @@ pub fn gemm_fp8(
             n: cols,
             k: inner,
         })?;
-        let output = output_tensor_dims(ctx, &[rows, cols], DType::BF16)?;
+        let (bias, epilogue_code) = match epilogue {
+            Fp8Epilogue::Default => (None, 0),
+            Fp8Epilogue::Bias(bias) => (Some(bias), 1),
+            Fp8Epilogue::GeluBias(bias) => (Some(bias), 2),
+        };
+        if let Some(bias) = bias {
+            if bias.dtype() != DType::BF16
+                || bias.device() != Device::Musa(ctx.device_id())
+                || bias.shape().dims() != [cols]
+            {
+                return Err(Error::Other("FP8 GEMM epilogue requires a BF16 bias vector".into()));
+            }
+        }
+        let output_dtype = match output_kind {
+            Fp8Output::Bf16 => DType::BF16,
+            Fp8Output::Fp8 => DType::F8E4M3,
+        };
+        let output = output_tensor_dims(ctx, &[rows, cols], output_dtype)?;
         let status = unsafe {
-            crate::ffi::custom::apxinf_musa_mudnn_fp8_gemm(
+            crate::ffi::custom::apxinf_musa_mudnn_fp8_gemm_epilogue(
                 tensor_ptr(activation)?,
                 tensor_ptr(weight)?,
+                bias.map(tensor_ptr).transpose()?.unwrap_or(std::ptr::null_mut()),
                 tensor_ptr(&output)?,
                 checked_i32("fp8", "rows", rows)?,
                 checked_i32("fp8", "cols", cols)?,
                 checked_i32("fp8", "inner", inner)?,
                 i32::from(layout == Fp8Layout::Nt),
                 scale,
+                i32::from(output_kind == Fp8Output::Fp8),
+                epilogue_code,
+                output_scale,
                 ctx.stream().handle(),
             )
         };

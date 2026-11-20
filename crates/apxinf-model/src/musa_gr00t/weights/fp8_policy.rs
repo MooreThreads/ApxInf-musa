@@ -24,6 +24,7 @@ pub(super) const RULES: &[Rule] = &[
     rule(129, 256, 6144, 2048, Fp8Layout::Nn),
     rule(129, 256, 8192, 2048, Fp8Layout::Nt),
     rule(512, 512, 1024, 1536, Fp8Layout::Nt),
+    rule(512, 512, 1024, 1024, Fp8Layout::Nn),
     rule(512, 512, 1024, 4096, Fp8Layout::Nt),
     rule(512, 512, 3072, 1024, Fp8Layout::Nt),
     rule(512, 512, 4096, 1024, Fp8Layout::Nt),
@@ -117,15 +118,16 @@ mod tests {
 
     #[test]
     fn rules_are_unique_and_exclude_low_gain_shapes() {
-        assert_eq!(RULES.len(), 17);
+        assert_eq!(RULES.len(), 18);
         for (index, rule) in RULES.iter().enumerate() {
             assert!(RULES[index + 1..]
                 .iter()
                 .all(|other| (rule.cols, rule.inner) != (other.cols, other.inner)));
         }
-        for (rows, cols, inner) in [(41, 1536, 1536), (17, 1536, 2048), (512, 1024, 1024)] {
+        for (rows, cols, inner) in [(41, 1536, 1536), (17, 1536, 2048)] {
             assert!(!candidate(cols, inner).is_some_and(|rule| rule.matches_rows(rows)));
         }
+        assert!(candidate(1024, 1024).is_some_and(|rule| rule.matches_rows(512)));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::tuning::{TuningDb, TuningMode, TuningPaths};
 mod qint8_tiles;
 mod bf16;
 mod fp8;
-pub use fp8::{gemm_fp8, Fp8Layout};
+pub use fp8::{gemm_fp8, gemm_fp8_epilogue, Fp8Epilogue, Fp8Layout, Fp8Output};
 pub(crate) mod assembly;
 mod w8a8;
 

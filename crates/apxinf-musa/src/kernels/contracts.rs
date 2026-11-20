@@ -107,7 +107,7 @@ pub(super) fn require_matching_bf16(
 }
 
 pub(super) fn checked_bytes(dtype: DType, dims: &[usize], operation: &str) -> Result<usize> {
-    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::F8E4M3) {
         return Err(Error::Other(format!(
             "{operation} does not support {dtype}"
         )));

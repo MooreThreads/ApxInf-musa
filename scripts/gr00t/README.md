@@ -41,7 +41,7 @@ value-based semantics; older builds used presence-based disabling.
 
 | Variable suffix after `APXINF_GR00T_DISABLE_FP8_` | Disabled path / fallback |
 | --- | --- |
-| `GEMM` | All selective FP8 linears; retain BF16 weights and computation |
+| `GEMM` | Selective FP8 GEMMs and static FP8 weights; fall back to BF16 |
 | `NORM` | All direct FP8 Norm outputs; BF16 Norm and existing GEMM policy |
 | `RMS_NORM` | Text RMSNorm direct FP8 output, including shared Q/K/V |
 | `VISION_NORM` | Vision LayerNorm/residual-LayerNorm direct FP8 output |
@@ -67,7 +67,8 @@ The old broad attribution of vision FC2 quantization savings to Q10 is not
 supported by the current call graph. `ACTIVATION` now supports the missing
 strict Q10 A/B, leaving identical FP8 GEMMs, scales and Norm paths on both sides.
 Norm switches can also disable fusion-only GEMMs or coupled sharing and must
-not be interpreted as an isolated Norm-kernel A/B. No new kernels are added.
+not be interpreted as an isolated Norm-kernel A/B. These switches only select
+the existing implementation paths and do not change BF16 models.
 
 Use the local LIBERO **training demonstration** dataset, not the official
 benchmark fixture. The default selects three distinct episodes per task and

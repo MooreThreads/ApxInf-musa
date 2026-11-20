@@ -19,6 +19,8 @@
 #include <mudnn.h>
 #include <musa_runtime.h>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -103,20 +105,25 @@ struct Fp8Matmul {
   md::MatMulLtParam parameters;
   Scratch scratch;
   std::unique_ptr<void, FreeBuffer> constants;
-  Fp8Matmul(int rows, int cols, int inner, bool transpose, musaStream_t stream)
+  Fp8Matmul(int rows, int cols, int inner, bool transpose, int output_type,
+            int epilogue, float output_scale, musaStream_t stream)
       : scratch(stream) {
     void* allocation = nullptr;
     const size_t bytes = 4 * sizeof(float) + size_t(cols) * 2;
     if (musaMalloc(&allocation, bytes) != musaSuccess)
       throw StatusError{kStatusAllocationFailed};
     constants.reset(allocation);
-    const float units[] = {1, 1, 1, 1};
+    if (output_type != 0 && output_type != 1) throw StatusError{kStatusInvalidArgument};
+    if (epilogue < 0 || epilogue > 2 || !std::isfinite(output_scale) || output_scale <= 0)
+      throw StatusError{kStatusInvalidArgument};
+    const float units[] = {1, 1, 1, output_type == 1 ? output_scale : 1.0f};
     if (musaMemset(allocation, 0, bytes) != musaSuccess ||
         musaMemcpy(allocation, units, sizeof(units), musaMemcpyHostToDevice) != musaSuccess)
       throw StatusError{kStatusUnknown};
     check(activation.SetType(md::Tensor::Type::FP8_E4M3));
     check(weight.SetType(md::Tensor::Type::FP8_E4M3));
-    check(output.SetType(md::Tensor::Type::BFLOAT16));
+    check(output.SetType(output_type == 1 ? md::Tensor::Type::FP8_E4M3
+                                          : md::Tensor::Type::BFLOAT16));
     check(bias.SetType(md::Tensor::Type::BFLOAT16));
     check(activation.SetNdInfo({1, rows, inner}));
     if (transpose) check(weight.SetNdInfo({1, cols, inner}));
@@ -130,11 +137,16 @@ struct Fp8Matmul {
       check(scales[index].SetAddr(static_cast<float*>(allocation) + index));
     }
     check(parameters.SetScale(scales[0], scales[1], scales[2], scales[3]));
-    check(parameters.SetEpilogue(md::MatMulLtParam::MatMulLtEpilogueMode::MATMULLT_EPILOGUE_DEFAULT));
+    const auto mode = epilogue == 0
+        ? md::MatMulLtParam::MatMulLtEpilogueMode::MATMULLT_EPILOGUE_DEFAULT
+        : epilogue == 1
+            ? md::MatMulLtParam::MatMulLtEpilogueMode::MATMULLT_EPILOGUE_BIAS
+            : md::MatMulLtParam::MatMulLtEpilogueMode::MATMULLT_EPILOGUE_GELU_BIAS;
+    check(parameters.SetEpilogue(mode));
     check(operation.SetTranspose(false, transpose));
     check(operation.SetComputeMode(md::BatchMatMul::ComputeMode::TENSOR));
     check(operation.SetBeta(0));
-    check(operation.SetGamma(0));
+    check(operation.SetGamma(epilogue == 0 ? 0 : 1));
   }
 };
 #endif
@@ -216,7 +228,7 @@ struct GeneralFlash {
 struct Stream {
   md::Handle handle;
 #ifdef APXINF_MUSA_MP31_FP8
-  std::map<std::tuple<int,int,int,bool>,std::unique_ptr<Fp8Matmul>> fp8_matmuls;
+  std::map<std::tuple<int,int,int,bool,int,int,unsigned>,std::unique_ptr<Fp8Matmul>> fp8_matmuls;
 #endif
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
@@ -283,9 +295,10 @@ void record_failure(int status, const char* what) {
 }
 }
 
-extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* activation, const void* weight,
-    void* output, int rows, int cols, int inner, int transpose, float scale,
-    musaStream_t stream) {
+extern "C" int apxinf_musa_mudnn_fp8_gemm_epilogue(
+    const void* activation, const void* weight, const void* bias, void* output,
+    int rows, int cols, int inner, int transpose, float scale, int output_type,
+    int epilogue, float output_scale, musaStream_t stream) {
 #ifdef APXINF_MUSA_MP31_FP8
   if (!activation || !weight || !output || rows <= 0 || cols <= 0 || inner <= 0 ||
       (transpose != 0 && transpose != 1) || !std::isfinite(scale) || scale <= 0) {
@@ -294,17 +307,23 @@ extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* activation, const void* we
   }
   try {
     auto& current = state(stream);
-    const auto key = std::make_tuple(rows, cols, inner, bool(transpose));
+    uint32_t output_scale_bits;
+    std::memcpy(&output_scale_bits, &output_scale, sizeof(output_scale_bits));
+    const auto key = std::make_tuple(rows, cols, inner, bool(transpose), output_type,
+                                     epilogue, static_cast<unsigned>(output_scale_bits));
     auto found = current.fp8_matmuls.find(key);
     if (found == current.fp8_matmuls.end()) {
       if (capturing(stream)) throw StatusError{kStatusCaptureInProgress};
       found = current.fp8_matmuls.emplace(key,
-          std::make_unique<Fp8Matmul>(rows, cols, inner, bool(transpose), stream)).first;
+          std::make_unique<Fp8Matmul>(rows, cols, inner, bool(transpose), output_type,
+                                      epilogue, output_scale, stream)).first;
     }
     auto& plan = *found->second;
     check(plan.activation.SetAddr(const_cast<void*>(activation)));
     check(plan.weight.SetAddr(const_cast<void*>(weight)));
     check(plan.output.SetAddr(output));
+    check(plan.bias.SetAddr(const_cast<void*>(bias ? bias :
+        static_cast<const void*>(static_cast<const char*>(plan.constants.get()) + 4 * sizeof(float)))));
     check(plan.operation.SetAlpha(scale));
     plan.scratch.cursor = 0;
     check(plan.operation.RunLt(current.handle, plan.output, plan.activation, plan.weight,
@@ -322,6 +341,14 @@ extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* activation, const void* we
   record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM requires an MP31 build");
   return kStatusInvalidArgument;
 #endif
+}
+
+extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* activation, const void* weight,
+    void* output, int rows, int cols, int inner, int transpose, float scale,
+    musaStream_t stream) {
+  return apxinf_musa_mudnn_fp8_gemm_epilogue(
+      activation, weight, nullptr, output, rows, cols, inner, transpose, scale,
+      0, 0, 1.0f, stream);
 }
 
 extern "C" int apxinf_musa_mudnn_bf16_gemm(const void* a,const void* w,void* y,
