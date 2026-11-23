@@ -66,7 +66,7 @@ struct KernelTree {
 const KERNEL_INPUT_TREES: &[KernelTree] = &[
     KernelTree {
         path: "adapters",
-        recursive: false,
+        recursive: true,
         compiled: &["mu"],
         includes: &[
             "kernels/mutlass_fmha/tools",

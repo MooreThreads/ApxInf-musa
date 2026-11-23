@@ -1,3 +1,4 @@
+use crate::kv_cache::MusaKvCache;
 use crate::ops;
 use crate::{MusaBuffer, MusaContext};
 use apxinf_core::{
@@ -45,26 +46,7 @@ impl MusaBackend {
             }
         }
         let out = self.output(a)?;
-        let aa = MusaBuffer::from_tensor(a).map_err(Error::Other)?;
-        let oo = MusaBuffer::from_tensor(&out).map_err(Error::Other)?;
-        let bb = b
-            .map(|x| MusaBuffer::from_tensor(x).map_err(Error::Other))
-            .transpose()?;
-        #[cfg(apxinf_musa_available)]
-        unsafe {
-            crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_point(
-                aa.ptr(),
-                bb.as_ref().map_or(std::ptr::null_mut(), |x| x.ptr()),
-                oo.ptr(),
-                a.shape().numel() as i32,
-                op,
-                factor,
-                self.ctx.stream().handle(),
-            ))
-            .map_err(Error::Other)?;
-        }
-        #[cfg(not(apxinf_musa_available))]
-        return Err(Self::unsupported("portable pointwise"));
+        ops::portable_point(&self.ctx, a, b, &out, op, factor)?;
         Ok(out)
     }
     fn device_u32(&self, values: &[u32]) -> Result<MusaBuffer> {
@@ -72,103 +54,6 @@ impl MusaBackend {
         let bytes: &[u8] = bytemuck::cast_slice(values);
         b.copy_from_host(bytes).map_err(Error::Other)?;
         Ok(b)
-    }
-}
-
-struct LayerCache {
-    k: MusaBuffer,
-    v: MusaBuffer,
-}
-struct MusaKvCache {
-    ctx: std::sync::Arc<MusaContext>,
-    layers: Vec<Option<LayerCache>>,
-    n_kv_heads: usize,
-    head_dim: usize,
-    max_seq: usize,
-    seq_len: usize,
-}
-impl MusaKvCache {
-    fn new(
-        ctx: &std::sync::Arc<MusaContext>,
-        n: usize,
-        kh: usize,
-        d: usize,
-        max: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            ctx: ctx.clone(),
-            layers: (0..n).map(|_| None).collect(),
-            n_kv_heads: kh,
-            head_dim: d,
-            max_seq: max,
-            seq_len: 0,
-        })
-    }
-}
-impl KvCache for MusaKvCache {
-    fn append(&mut self, layer: usize, k: &Tensor, v: &Tensor, n: usize) -> Result<()> {
-        if layer >= self.layers.len() || n == 0 || n > self.max_seq.saturating_sub(self.seq_len) {
-            return Err(Error::Other("MUSA KV append exceeds cache".into()));
-        }
-        if k.dtype() != DType::BF16
-            || v.dtype() != DType::BF16
-            || k.shape().dims() != [n, self.n_kv_heads, self.head_dim]
-            || v.shape() != k.shape()
-        {
-            return Err(Error::Other("MUSA KV append shape/dtype mismatch".into()));
-        }
-        let bytes = self.max_seq * self.n_kv_heads * self.head_dim * 2;
-        if self.layers[layer].is_none() {
-            self.layers[layer] = Some(LayerCache {
-                k: MusaBuffer::alloc_on(&self.ctx, bytes).map_err(Error::Other)?,
-                v: MusaBuffer::alloc_on(&self.ctx, bytes).map_err(Error::Other)?,
-            });
-        }
-        let cache = self.layers[layer].as_ref().unwrap();
-        let kb = MusaBuffer::from_tensor(k).map_err(Error::Other)?;
-        let vb = MusaBuffer::from_tensor(v).map_err(Error::Other)?;
-        let off = self.seq_len * self.n_kv_heads * self.head_dim * 2;
-        let kd = cache
-            .k
-            .view(off, n * self.n_kv_heads * self.head_dim * 2)
-            .map_err(Error::Other)?;
-        let vd = cache
-            .v
-            .view(off, n * self.n_kv_heads * self.head_dim * 2)
-            .map_err(Error::Other)?;
-        kd.copy_from_device_async(
-            &kb,
-            n * self.n_kv_heads * self.head_dim * 2,
-            self.ctx.stream(),
-        )
-        .map_err(Error::Other)?;
-        vd.copy_from_device_async(
-            &vb,
-            n * self.n_kv_heads * self.head_dim * 2,
-            self.ctx.stream(),
-        )
-        .map_err(Error::Other)?;
-        Ok(())
-    }
-    fn advance(&mut self, n: usize) {
-        self.seq_len += n
-    }
-    fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-    fn clear(&mut self) -> Result<()> {
-        self.seq_len = 0;
-        self.layers.iter_mut().for_each(|x| *x = None);
-        Ok(())
-    }
-    fn n_layers(&self) -> usize {
-        self.layers.len()
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 
@@ -338,20 +223,7 @@ impl Backend for MusaBackend {
         let mut o = self
             .ctx
             .allocate_output(Shape::new(vec![ids.len(), *d]), DType::BF16)?;
-        let tb = MusaBuffer::from_tensor(t).map_err(Error::Other)?;
-        let ob = MusaBuffer::from_tensor(&o).map_err(Error::Other)?;
-        #[cfg(apxinf_musa_available)]
-        unsafe {
-            crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_embedding(
-                tb.ptr(),
-                ib.ptr(),
-                ob.ptr(),
-                ids.len() as i32,
-                *d as i32,
-                self.ctx.stream().handle(),
-            ))
-            .map_err(Error::Other)?;
-        }
+        ops::portable_embedding(&self.ctx, t, &ib, &o, ids.len(), *d)?;
         Ok(o)
     }
     fn sdpa_decode(
@@ -431,25 +303,7 @@ impl MusaBackend {
         let n = i.shape().numel();
         let pb = self.device_u32(p)?;
         let mut o = self.output(i)?;
-        let a = MusaBuffer::from_tensor(i).map_err(Error::Other)?;
-        let ob = MusaBuffer::from_tensor(&o).map_err(Error::Other)?;
-        #[cfg(apxinf_musa_available)]
-        unsafe {
-            crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_rope(
-                a.ptr(),
-                ob.ptr(),
-                pb.ptr(),
-                n as i32,
-                h as i32,
-                d as i32,
-                theta,
-                mode,
-                sh as i32,
-                sw as i32,
-                self.ctx.stream().handle(),
-            ))
-            .map_err(Error::Other)?;
-        }
+        ops::portable_rope(&self.ctx, i, &o, &pb, h, d, theta, mode, sh, sw)?;
         Ok(o)
     }
     fn attention_call(
@@ -465,28 +319,7 @@ impl MusaBackend {
         d: usize,
         causal: bool,
     ) -> Result<()> {
-        let qb = MusaBuffer::from_tensor(q).map_err(Error::Other)?;
-        let kb = MusaBuffer::from_tensor(k).map_err(Error::Other)?;
-        let vb = MusaBuffer::from_tensor(v).map_err(Error::Other)?;
-        let ob = MusaBuffer::from_tensor(o).map_err(Error::Other)?;
-        #[cfg(apxinf_musa_available)]
-        unsafe {
-            crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_attention(
-                qb.ptr(),
-                kb.ptr(),
-                vb.ptr(),
-                ob.ptr(),
-                nq as i32,
-                nk as i32,
-                h as i32,
-                kh as i32,
-                d as i32,
-                causal as i32,
-                self.ctx.stream().handle(),
-            ))
-            .map_err(Error::Other)?;
-        }
-        Ok(())
+        ops::portable_attention(&self.ctx, q, k, v, o, nq, nk, h, kh, d, causal)
     }
     fn sdpa(
         &self,

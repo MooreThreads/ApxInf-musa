@@ -21,8 +21,10 @@ mod gather;
 mod gemm;
 mod norm;
 mod pointwise;
+mod portable;
 mod quantization;
 mod rope;
+#[path = "gemm/w8a8.rs"]
 pub mod w8a8;
 
 pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
@@ -30,8 +32,7 @@ pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gemm::{
     gemm, gemm_ada_gate_residual_rms_norm, gemm_bias_gelu, gemm_bias_residual, gemm_fp8_qkv_rope,
-    gemm_geglu,
-    prepare_fp8_weight, GegluWeightLayout, GemmAdaGateResidualRmsNormArgs, GemmArgs,
+    gemm_geglu, prepare_fp8_weight, GegluWeightLayout, GemmAdaGateResidualRmsNormArgs, GemmArgs,
     GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
 };
 pub use norm::{
@@ -41,6 +42,10 @@ pub use norm::{
     RmsNormArgs,
 };
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
+pub(crate) use portable::{
+    attention as portable_attention, embedding as portable_embedding, point as portable_point,
+    rope as portable_rope,
+};
 pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{rope, RopeArgs, RopeSemantic};
 

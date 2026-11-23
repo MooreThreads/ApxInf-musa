@@ -21,6 +21,7 @@ pub mod context;
 pub mod device_caps;
 mod error;
 mod backend;
+mod kv_cache;
 // Not `pub`: this is the raw `extern "C"` surface, and the crate's rule is
 // that `ffi` is the only module allowed to declare one. Exporting it would let
 // a dependent crate call `musaFree`-class symbols and then read the contracts

@@ -79,11 +79,8 @@ pub fn gemm_geglu(
     weight: W8A8WeightView<'_>,
     out: &mut Tensor,
 ) -> Result<()> {
-    let quantized = gemm_kernels::quantize_w8a8_geglu_activation(
-        ctx,
-        gate_up,
-        weight.equalization_inv_c,
-    )?;
+    let quantized =
+        gemm_kernels::quantize_w8a8_geglu_activation(ctx, gate_up, weight.equalization_inv_c)?;
     gemm_quantized(ctx, &quantized, weight, out)
 }
 

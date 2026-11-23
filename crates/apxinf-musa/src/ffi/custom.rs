@@ -1100,11 +1100,3 @@ pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<()
         format!("{}: {}", operation(), mudnn_detail(status))
     })
 }
-
-#[cfg(apxinf_musa_available)]
-extern "C" {
- pub fn apxinf_musa_portable_point(a:*const c_void,b:*const c_void,o:*mut c_void,n:i32,op:i32,f:f32,s:*mut c_void)->musaError_t;
- pub fn apxinf_musa_portable_rope(a:*const c_void,o:*mut c_void,p:*const c_void,n:i32,h:i32,d:i32,theta:f32,mode:i32,sh:i32,sw:i32,s:*mut c_void)->musaError_t;
- pub fn apxinf_musa_portable_attention(q:*const c_void,k:*const c_void,v:*const c_void,o:*mut c_void,nq:i32,nk:i32,h:i32,kh:i32,d:i32,causal:i32,s:*mut c_void)->musaError_t;
- pub fn apxinf_musa_portable_embedding(a:*const c_void,p:*const c_void,o:*mut c_void,n:i32,d:i32,s:*mut c_void)->musaError_t;
-}
