@@ -121,43 +121,22 @@ fn require_workspace(operation: &str, required: usize, limit: usize) -> Result<(
 }
 
 /// Reject a scale an E4M3 output cannot honour.
-///
-/// The dequantization contract is `real = e4m3 * scale`, so the scale must be
-/// finite and positive; zero or negative would make the reciprocal in the
-/// quantizer meaningless.
 fn require_positive_output_scale(operation: &str, output_scale: f32) -> Result<()> {
     if !output_scale.is_finite() || output_scale <= 0.0 {
-        return Err(Error::Other(format!(
-            "MUSA {operation} needs a finite positive output_scale for an E4M3 output, got {output_scale}"
-        )));
+        return Err(Error::Other(format!("MUSA {operation} needs a finite positive output_scale for an E4M3 output, got {output_scale}")));
     }
     Ok(())
 }
 
-/// The output form a post-op was validated for.
-///
-/// Validating before the vendor GEMM means an illegal dtype or scale fails
-/// without launching a full-size contraction, and leaves nothing half-recorded
-/// in a captured traversal.
 #[derive(Clone, Copy)]
-enum ScaledOutput {
-    Bf16,
-    /// E4M3 with the validated dequantization scale.
-    E4m3(f32),
-}
+enum ScaledOutput { Bf16, E4m3(f32) }
 
 fn require_scaled_output(out: &Tensor, scale: f32, operation: &str) -> Result<ScaledOutput> {
     match out.dtype() {
-        DType::BF16 => {
-            require_unit_output_scale(operation, scale)?;
-            Ok(ScaledOutput::Bf16)
-        }
-        DType::F8E4M3 => {
-            require_positive_output_scale(operation, scale)?;
-            Ok(ScaledOutput::E4m3(scale))
-        }
-        dtype => Err(Error::Other(format!(
-            "MUSA {operation} out expects BF16 or F8E4M3, got {dtype}"
-        ))),
+        DType::BF16 => { require_unit_output_scale(operation, scale)?; Ok(ScaledOutput::Bf16) }
+        DType::F8E4M3 => { require_positive_output_scale(operation, scale)?; Ok(ScaledOutput::E4m3(scale)) }
+        dtype => Err(Error::Other(format!("MUSA {operation} out expects BF16 or F8E4M3, got {dtype}"))),
     }
 }
+
+pub mod w4a16;

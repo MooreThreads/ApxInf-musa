@@ -14,6 +14,8 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    pub fn apxinf_musa_w4_decode_kn(packed: *const c_void, scales: *const c_void, scratch: *mut c_void, n: i32, k: i32, stream: *mut c_void) -> musaError_t;
+
     #[cfg(apxinf_musa_mutlass_fmha)]
     pub fn apxinf_musa_mp31_attention_prepare() -> musaError_t;
     #[cfg(apxinf_musa_mutlass_fmha)]

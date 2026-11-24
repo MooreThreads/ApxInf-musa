@@ -167,18 +167,10 @@ def parse_args() -> argparse.Namespace:
                         help="checkpoint directory holding model.safetensors")
     parser.add_argument("--device", default="musa:0", help="MUSA device (default: musa:0)")
     parser.add_argument("--model-variant", default="bf16",
-                        choices=("bf16", "fp8_static", "int8_dynamic", "int8_dynamic_no_encode"),
-                        help="PI0.5 variant. `fp8_static` is the mp_31 E4M3 route and needs "
-                             "`--calibration` (or a calibration.json beside the checkpoint); "
-                             "`int8_dynamic` quantizes every projection an embedded s8mma tile "
-                             "can serve (the ViT patch embedding and the action head stay BF16) "
-                             "and needs APXINF_INT8_EQUALIZATION for the language layers to "
-                             "clear the gate; `int8_dynamic_no_encode` keeps those four language "
-                             "projections in BF16 instead")
+                        choices=("bf16", "fp8_static", "int8_dynamic", "int8_dynamic_no_encode", "w4a16_bf16_expert"),
+                        help="PI0.5 model variant")
     parser.add_argument("--calibration", default=None,
-                        help="FP8 calibration profile path, or `uniform:<scale>` for a "
-                             "scale-only bring-up run (default: the checkpoint's "
-                             "calibration.json for fp8_static)")
+                        help="FP8 calibration profile path")
     parser.add_argument("--reference", type=pathlib.Path, default=None,
                         help="torch-eager-gold.v1 bundle; given, its frames are the workload "
                         "and the L0 call is scored against it, omitted, the layers run on "

@@ -357,3 +357,5 @@ mod tests {
         assert!(model.infer(&tensor(), &ids, 1, &tensor()).is_err());
     }
 }
+
+pub(in crate::musa_pi05) use model::build_w4_model;

@@ -307,15 +307,14 @@ impl Pi05Config {
     }
 
     /// Reservation for the static-FP8 graph: the BF16 arena, unchanged.
-    ///
-    /// The composed operators allocate extra BF16 scratch the BF16 route does
-    /// not: `gemm_bias_gelu` holds the GEMM result and the activated result
-    /// before quantizing, and the norm variants hold their normalized BF16
-    /// output alongside the E4M3 copy. The measured configurations fit inside
-    /// the doubled BF16 reservation; a new image size or view count should be
-    /// measured before it is treated as supported.
     pub fn graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
         self.graph_workspace_bytes_bf16(token_count)
+    }
+
+    /// W4 uses no activation quantization or global dequantization scratch.
+    pub fn graph_workspace_bytes_w4a16(&self, token_count: usize) -> Result<usize> {
+        self.graph_workspace_bytes(token_count)?.checked_add(256 * 1024 * 1024)
+            .ok_or_else(|| Error::Other("W4 workspace overflow".into()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -532,10 +531,12 @@ pub enum ModelVariantChoice {
     /// expert do not. Everything downstream (dispatch, kernels, captures) is
     /// shared with `int8_dynamic`; only weight preparation differs.
     Int8DynamicNoEncode,
+    W4A16Bf16Expert,
 }
 impl ModelVariantChoice {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::W4A16Bf16Expert => "w4a16_bf16_expert",
             Self::Auto => "auto",
             Self::Bf16 => "bf16",
             Self::Fp8Static => "fp8_static",
@@ -573,6 +574,7 @@ impl std::str::FromStr for ModelVariantChoice {
     type Err = apxinf_core::Error;
     fn from_str(value: &str) -> apxinf_core::Result<Self> {
         match value {
+            "w4a16_bf16_expert" => Ok(Self::W4A16Bf16Expert),
             "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
             "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
             "int8_dynamic_no_encode" => Ok(Self::Int8DynamicNoEncode),

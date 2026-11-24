@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use apxinf_core::{Error, Result};
 
@@ -21,6 +21,7 @@ thread_local! {
 #[derive(Debug)]
 pub struct MusaStream {
     handle: AtomicPtr<c_void>,
+    generation: AtomicU64,
 }
 
 // SAFETY: a MUSA stream handle is an opaque driver object; the runtime
@@ -42,6 +43,7 @@ impl MusaStream {
     pub fn new() -> Result<Self> {
         Ok(Self {
             handle: AtomicPtr::new(Self::create()?),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -56,24 +58,18 @@ impl MusaStream {
             fn drop(&mut self) {
                 OVERRIDES.with(|overrides| {
                     let mut overrides = overrides.borrow_mut();
-                    if let Some(previous) = self.1 {
-                        overrides.insert(self.0, previous);
-                    } else {
-                        overrides.remove(&self.0);
-                    }
+                    if let Some(previous) = self.1 { overrides.insert(self.0, previous); }
+                    else { overrides.remove(&self.0); }
                 });
             }
         }
-
         let key = self.handle.load(Ordering::Acquire) as usize;
-        let previous = OVERRIDES.with(|overrides| {
-            overrides
-                .borrow_mut()
-                .insert(key, stream.handle.load(Ordering::Acquire))
-        });
+        let previous = OVERRIDES.with(|overrides| overrides.borrow_mut().insert(key, stream.handle.load(Ordering::Acquire)));
         let _restore = Restore(key, previous);
         operation()
     }
+
+    pub(crate) fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
 
     pub fn handle(&self) -> *mut c_void {
         let handle = self.handle.load(Ordering::Acquire);
@@ -116,6 +112,7 @@ impl MusaStream {
     pub fn replace(&self) -> Result<()> {
         let fresh = Self::create()?;
         self.release(self.handle.swap(fresh, Ordering::AcqRel));
+        self.generation.fetch_add(1, Ordering::AcqRel);
         // What the failed end left in the slot, and whatever the destroy added,
         // describe a stream that no longer exists; the next launch on the
         // replacement would inherit it as its own verdict.

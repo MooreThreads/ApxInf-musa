@@ -39,10 +39,14 @@ pub struct CapturedGraph {
     context: Arc<MusaContext>,
     _resources: Vec<Rc<dyn Any>>,
     _capture_stream: Option<MusaStream>,
+    stream_identity: (u64, u64),
 }
 
 impl Graph for CapturedGraph {
     fn replay(&self) -> Result<()> {
+        if self.context.scratch_identity() != self.stream_identity {
+            return Err(Error::Other("captured graph context/stream generation changed".into()));
+        }
         unsafe {
             ffi::check_runtime(ffi::musa::musaGraphLaunch(
                 self.executable,
@@ -186,7 +190,9 @@ pub fn capture(
         }
         return Err(Error::Other(error));
     }
+    let stream_identity = context.scratch_identity();
     Ok(CapturedGraph {
+        stream_identity,
         executable,
         graph,
         context,
@@ -293,6 +299,7 @@ pub fn capture_isolated<T>(
     };
     Ok((
         CapturedGraph {
+            stream_identity: context.scratch_identity(),
             executable,
             graph,
             context,
