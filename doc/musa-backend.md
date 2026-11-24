@@ -302,6 +302,43 @@ not speed. The capture's arena is not CUDA's either — a measured INT8 capture
 touches 3.84 GB, so the reservation is the BF16 one rather than the doubled one
 upstream keeps for its INT32 accumulator and verifier.
 
+The arena is pooled and the reservation is a ladder, not a constant.
+`GraphWorkspace` reuses a slice once the last tensor reading it drops
+(cuda-new's generation-tagged lease free list), and `capture_infer_impl` tries
+`required/8` and doubles up to the modeled bound, retrying only on
+`"workspace exhausted"` and capturing on the session that succeeded; the eager
+path runs the same ladder because an eager plan retains its session. On M1000
+(int8_dynamic, 3 views, 10 tokens) the modeled 5.64 GiB becomes a 704.5 MiB
+arena with a 105.0 MiB live peak, and the steady device footprint falls from
+11.1 to 6.0 GiB. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
+allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
+capacity/used/peak/attempts.
+
+### Streaming int8 loads
+
+A real-checkpoint `int8_dynamic` load never materializes the whole host model.
+`CheckpointReader` opens SafeTensors shard headers only and reads one tensor's
+bytes on demand; `Int8DynamicWeights::from_checkpoint` feeds those tensors
+through `WeightSource` one layer at a time, folds them in F32, quantizes and
+uploads them, then drops the host copy before the next layer. The reader shares
+header parsing and the sharded index's wrong-shard, duplicate, missing and
+unsafe-path checks with the whole-file loader, and it rejects a non-forward or
+overflowing `data_offsets` entry before any tensor is exposed. The streaming
+path runs the same shape validation as `Pi05Weights::from_map`, including the
+six checkpoint-wide tensors (`token_embedding`, `multimodal_projector`,
+`action_in_proj`, `action_out_proj`, `time_mlp_in`, `time_mlp_out`); only the
+order in which checks are reached differs, because the streaming builder
+validates each tensor when it takes it. `bf16_to_device` copies a tensor
+already in BF16 straight to the device rather than round-tripping through F32;
+`Pi05Weights` and the BF16 path are unchanged. On M1000 with
+`pi05_libero_pytorch` (two camera views), the measured host peak falls from
+14.1 GiB to 2.1 GiB while the device weights and the L0 actions stay
+bit-identical; the largest remaining transients are the token embedding and the
+language gate/up group's F32 staging. Loading stays synchronous per group, so
+capture and replay are unchanged. `CheckpointReader` reads with
+`FileExt::read_exact_at`, so the loader targets Unix; CI is Linux and the MLX
+target is macOS.
+
 ### FP8 (static E4M3)
 
 The verified MP31 decode O/down projections also reduce FP32 split-K partials
@@ -462,6 +499,7 @@ without its KN pack stays on the native route with a one-time warning
 rather than failing the call. `APXINF_TILELANG=off` empties the route at run time — the
 feature-off semantics, no rebuild. The first dispatch prints one line
 (`TileLang route:` …), so a run's route adoption is visible in its log.
+
 
 
 ## GR00T N1.7 on MUSA

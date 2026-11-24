@@ -4,17 +4,68 @@ use crate::musa_pi05::backend::{
     ExecutionSession,
 };
 use crate::musa_pi05::model::Pi05Model;
-use crate::musa_pi05::model::{ModelOperation, ModelVariant, PrepareBlocks, WorkspaceRequirements};
+use crate::musa_pi05::model::{ModelOperation, ModelVariant, PrepareBlocks};
 use crate::musa_pi05::{Pi05Config, Pi05ImageLayout};
 use apxinf_core::{Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
-fn allocate_session(
-    requirements: &WorkspaceRequirements,
-    device: usize,
-) -> Result<ExecutionSession> {
-    ExecutionSession::with_capacity(requirements.bytes, device)
+/// Capacities the capture and eager paths try in order.
+///
+/// The first rung is an eighth of the modeled reservation (floored), doubling
+/// until the proven reservation. The ladder never asks for more than today's
+/// bump allocation, so a final exhaustion is a real regression rather than a
+/// sizing guess.
+pub(super) fn workspace_capacities(required_bytes: usize) -> Vec<usize> {
+    const FLOOR: usize = 256 << 20;
+    if required_bytes <= FLOOR {
+        return vec![required_bytes];
+    }
+    let mut capacities = Vec::new();
+    let mut capacity = (required_bytes / 8).max(FLOOR);
+    while capacity < required_bytes {
+        capacities.push(capacity);
+        capacity = match capacity.checked_mul(2) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    if capacities.last().copied() != Some(required_bytes) {
+        capacities.push(required_bytes);
+    }
+    capacities
 }
+
+/// The ladder's retry predicate. The bump and pool paths share this prefix.
+pub(super) fn is_workspace_exhaustion(error: &Error) -> bool {
+    error.to_string().contains("workspace exhausted")
+}
+
+/// One line per successful plan, so the allocator decision is auditable.
+pub(super) fn report_workspace(
+    session: &ExecutionSession,
+    attempts: usize,
+    token_count: usize,
+) {
+    if !workspace_report_enabled() {
+        return;
+    }
+    let workspace = session.workspace();
+    eprintln!(
+        "[apxinf] PI0.5 graph workspace: capacity={} used={} peak={} attempts={} tokens={} pool={}",
+        workspace.capacity(),
+        workspace.used(),
+        workspace.peak_used(),
+        attempts,
+        token_count,
+        workspace.pooling(),
+    );
+}
+
+fn workspace_report_enabled() -> bool {
+    static REPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORT.get_or_init(|| std::env::var("APXINF_MUSA_WORKSPACE_REPORT").as_deref() == Ok("1"))
+}
+
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
@@ -202,30 +253,17 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             ));
         }
         backend::synchronize(backend)?;
-        let session = allocate_session(
-            &self.model.workspace_requirements(token_count)?,
-            self.ctx().device_id(),
-        )?;
-        // Warm-up and capture resolve providers under the same rule. Left on,
-        // autotuning would measure the warm-up's shapes and change the provider
-        // between the two traversals — the record capture bakes would then be
-        // of a dispatch that no longer happens.
-        let captured_output = std::cell::RefCell::new(None);
-        let (eager_output, graph) = backend::without_autotune(|| {
-            let eager_output = ops::prepare_with_session(&session, || {
-                self.infer_captured_inputs(
-                    &patches,
-                    raw_images.as_ref(),
-                    raw_image_layout,
-                    token_ids,
-                    token_count,
-                    noise,
-                )
-            })?;
-            backend::synchronize(backend)?;
-
-            let graph = capture_cuda_graph(self.ctx(), || {
-                let output = ops::with_session(&session, || {
+        let required = self.model.workspace_requirements(token_count)?.bytes;
+        let capacities = workspace_capacities(required);
+        let mut last_exhaustion = None;
+        for (attempt, &capacity) in capacities.iter().enumerate() {
+            let session = ExecutionSession::with_capacity(capacity, self.ctx().device_id())?;
+            // Warm-up and capture resolve providers under the same rule. Left on,
+            // autotuning would measure the warm-up's shapes and change the provider
+            // between the two traversals — the record capture bakes would then be
+            // of a dispatch that no longer happens.
+            let prepared = backend::without_autotune(|| {
+                ops::prepare_with_session(&session, || {
                     self.infer_captured_inputs(
                         &patches,
                         raw_images.as_ref(),
@@ -234,29 +272,65 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                         token_count,
                         noise,
                     )
-                })?;
-                captured_output.replace(Some(output));
-                Ok(())
+                })
+            });
+            let eager_output = match prepared {
+                Ok(output) => output,
+                Err(error) if is_workspace_exhaustion(&error) => {
+                    last_exhaustion = Some(error);
+                    // The failed traversal may still have work in flight; order
+                    // it before releasing the arena it wrote into.
+                    backend::synchronize(backend)?;
+                    drop(session);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            backend::synchronize(backend)?;
+
+            let captured_output = std::cell::RefCell::new(None);
+            let graph = backend::without_autotune(|| {
+                capture_cuda_graph(self.ctx(), || {
+                    let output = ops::with_session(&session, || {
+                        self.infer_captured_inputs(
+                            &patches,
+                            raw_images.as_ref(),
+                            raw_image_layout,
+                            token_ids,
+                            token_count,
+                            noise,
+                        )
+                    })?;
+                    captured_output.replace(Some(output));
+                    Ok(())
+                })
             })?;
-            Ok::<_, Error>((eager_output, graph))
-        })?;
-        drop(eager_output);
-        let output = captured_output
-            .into_inner()
-            .ok_or_else(|| Error::Other("PI0.5 graph capture produced no output tensor".into()))?;
-        Ok(CapturedGraph {
-            graph: Box::new(graph),
-            output,
-            patches,
-            raw_images,
-            raw_image_layout,
-            noise: noise.clone(),
-            token_ids: token_ids.clone(),
-            token_count,
-            backend: Arc::clone(&self.backend),
-            _fixed: Box::new(Arc::clone(&self.model)),
-            session,
-        })
+            drop(eager_output);
+            let output = captured_output.into_inner().ok_or_else(|| {
+                Error::Other("PI0.5 graph capture produced no output tensor".into())
+            })?;
+            report_workspace(&session, attempt + 1, token_count);
+            return Ok(CapturedGraph {
+                graph: Box::new(graph),
+                output,
+                patches,
+                raw_images,
+                raw_image_layout,
+                noise: noise.clone(),
+                token_ids: token_ids.clone(),
+                token_count,
+                backend: Arc::clone(&self.backend),
+                _fixed: Box::new(Arc::clone(&self.model)),
+                session,
+            });
+        }
+        Err(Error::Other(format!(
+            "PI0.5 graph workspace exhausted at {required} bytes after {} attempts: {}",
+            capacities.len(),
+            last_exhaustion
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown error".into())
+        )))
     }
 
     pub fn capture_infer(
@@ -354,4 +428,23 @@ pub(super) fn capture_loaded(
         count: spec.token_count,
         noise,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_capacity_ladder_is_ascending_and_ends_at_the_reservation() {
+        let required = 5_909_589_760;
+        assert_eq!(
+            workspace_capacities(required),
+            vec![738_698_720, 1_477_397_440, 2_954_794_880, 5_909_589_760]
+        );
+    }
+
+    #[test]
+    fn a_reservation_below_the_floor_is_its_own_capacity() {
+        assert_eq!(workspace_capacities(1 << 20), vec![1 << 20]);
+    }
 }
