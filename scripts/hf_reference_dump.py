@@ -164,6 +164,8 @@ def greedy_generate(model, input_ids, n_new, extra_forward_kwargs=None):
                 tokens[:, -1:],
                 use_cache=True,
                 past_key_values=past_key_values,
+                # Physical KV index; Qwen3-VL applies its own multimodal RoPE delta.
+                cache_position=torch.tensor([tokens.shape[1] - 1], device=tokens.device),
             )
         past_key_values = out.past_key_values
         next_id = int(out.logits[0, -1, :].argmax().item())
