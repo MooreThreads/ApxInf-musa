@@ -17,6 +17,9 @@ use super::source::WeightSource;
 
 pub(super) const ROOT: &str = "paligemma_with_expert";
 
+/// The namespace a LeRobot export may wrap every key in.
+pub(super) const MODEL_PREFIX: &str = "model.";
+
 #[derive(Debug)]
 pub struct LinearWeights {
     /// Physical `[in, out]` matrix used by row-major GEMM.
@@ -396,10 +399,7 @@ pub(in crate::musa_pi05) fn take_linear(
     Ok(LinearWeights { weight, bias })
 }
 
-pub(in crate::musa_pi05) fn take(
-    source: &mut impl WeightSource,
-    name: &str,
-) -> Result<Tensor> {
+pub(in crate::musa_pi05) fn take(source: &mut impl WeightSource, name: &str) -> Result<Tensor> {
     WeightSource::take(source, name)
 }
 
@@ -437,8 +437,7 @@ pub(in crate::musa_pi05) fn take_patch_embedding(
 ) -> Result<LinearWeights> {
     let patch_weight_name = format!("{vision_prefix}.embeddings.patch_embedding.weight");
     let patch_weight = take(source, &patch_weight_name)?;
-    let expected_patch_elements =
-        config.vision_width * 3 * config.patch_size * config.patch_size;
+    let expected_patch_elements = config.vision_width * 3 * config.patch_size * config.patch_size;
     if patch_weight.numel() != expected_patch_elements {
         return Err(Error::Other(format!(
             "{patch_weight_name}: expected {expected_patch_elements} elements, got {}",
@@ -485,9 +484,7 @@ pub(in crate::musa_pi05) fn take_multimodal_projector(
     )
 }
 
-pub(in crate::musa_pi05) fn take_token_embedding(
-    source: &mut impl WeightSource,
-) -> Result<Tensor> {
+pub(in crate::musa_pi05) fn take_token_embedding(source: &mut impl WeightSource) -> Result<Tensor> {
     take_any(
         source,
         &[
@@ -508,8 +505,7 @@ pub(in crate::musa_pi05) fn take_language_layer(
     // multiply can round channels near -1 to zero, and it gives the packed
     // QKV/gate-up matrix a much worse tensor scale; after the fold the norm
     // multipliers become `ones` below.
-    let attention_scale =
-        add_one(take(source, &format!("{p}.input_layernorm.weight"))?)?;
+    let attention_scale = add_one(take(source, &format!("{p}.input_layernorm.weight"))?)?;
     let mlp_scale = add_one(take(
         source,
         &format!("{p}.post_attention_layernorm.weight"),
@@ -545,10 +541,7 @@ pub(in crate::musa_pi05) fn take_action_layer(
     Ok(ActionLayerWeights {
         input_norm: take_ada_norm(source, &format!("{p}.input_layernorm"))?,
         attention: take_attention(source, &p)?,
-        post_attention_norm: take_ada_norm(
-            source,
-            &format!("{p}.post_attention_layernorm"),
-        )?,
+        post_attention_norm: take_ada_norm(source, &format!("{p}.post_attention_layernorm"))?,
         mlp: take_mlp(source, &p)?,
     })
 }
@@ -580,11 +573,12 @@ pub(in crate::musa_pi05) fn take_action_glue(
 
 /// Whether a checkpoint's keys are wrapped in a `model.` namespace.
 ///
-/// The map path rewrites the keys; the streaming reader cannot, so it asks the
-/// same question from the header keys and prefixes every lookup instead.
+/// Both loaders ask the same question from the header keys; the map path
+/// rewrites its keys, and the streaming path builds a canonical-key map with
+/// [`canonical_lerobot_key`] so a mixed checkpoint resolves the same way.
 pub(super) fn needs_model_prefix_strip<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     let canonical_prefix = format!("{ROOT}.");
-    let wrapped_prefix = format!("model.{ROOT}.");
+    let wrapped_prefix = format!("{MODEL_PREFIX}{ROOT}.");
     let mut canonical = false;
     let mut wrapped = false;
     for key in keys {
@@ -597,16 +591,19 @@ pub(super) fn needs_model_prefix_strip<'a>(keys: impl Iterator<Item = &'a str>) 
     !canonical && wrapped
 }
 
+/// The canonical name a checkpoint key maps to: the LeRobot `model.` namespace
+/// is stripped when the checkpoint uses it, and left alone otherwise.
+pub(super) fn canonical_lerobot_key(name: &str) -> &str {
+    name.strip_prefix(MODEL_PREFIX).unwrap_or(name)
+}
+
 pub(super) fn normalize_lerobot_prefix(tensors: &mut HashMap<String, Tensor>) {
     if !needs_model_prefix_strip(tensors.keys().map(String::as_str)) {
         return;
     }
     *tensors = std::mem::take(tensors)
         .into_iter()
-        .map(|(name, tensor)| {
-            let name = name.strip_prefix("model.").unwrap_or(&name).to_owned();
-            (name, tensor)
-        })
+        .map(|(name, tensor)| (canonical_lerobot_key(&name).to_owned(), tensor))
         .collect();
 }
 
@@ -900,7 +897,12 @@ pub(in crate::musa_pi05) fn validate_action_layer(
     validate_mlp("action", index, config, &layer.mlp)
 }
 
-pub(in crate::musa_pi05) fn expect_linear(name: &str, linear: &LinearWeights, input: usize, output: usize) -> Result<()> {
+pub(in crate::musa_pi05) fn expect_linear(
+    name: &str,
+    linear: &LinearWeights,
+    input: usize,
+    output: usize,
+) -> Result<()> {
     expect_shape(name, &linear.weight, &[input, output])?;
     if let Some(bias) = &linear.bias {
         expect_shape(&format!("{name}.bias"), bias, &[output])?;
@@ -908,7 +910,11 @@ pub(in crate::musa_pi05) fn expect_linear(name: &str, linear: &LinearWeights, in
     Ok(())
 }
 
-pub(in crate::musa_pi05) fn expect_shape(name: &str, tensor: &Tensor, expected: &[usize]) -> Result<()> {
+pub(in crate::musa_pi05) fn expect_shape(
+    name: &str,
+    tensor: &Tensor,
+    expected: &[usize],
+) -> Result<()> {
     if tensor.shape().dims() != expected {
         return Err(Error::Other(format!(
             "PI0.5 {name}: expected shape {expected:?}, got {:?}",
@@ -991,12 +997,10 @@ mod tests {
     fn validate_glue_rejects_each_bad_tensor_by_name() {
         let config = Pi05Config::default();
 
-        let error = validate_token_embedding(
-            &config,
-            &Tensor::from_f32(vec![1, 1], &[0.0]).unwrap(),
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            validate_token_embedding(&config, &Tensor::from_f32(vec![1, 1], &[0.0]).unwrap())
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("token_embedding"), "{error}");
 
         let error = validate_multimodal_projector(&config, &bad_linear())
@@ -1009,27 +1013,55 @@ mod tests {
         let action_out = linear(width, config.action_dim);
         let time_mlp_in = linear(width, width);
         let time_mlp_out = linear(width, width);
-        assert!(
-            validate_action_glue(&config, &action_in, &action_out, &time_mlp_in, &time_mlp_out)
-                .is_ok()
-        );
+        assert!(validate_action_glue(
+            &config,
+            &action_in,
+            &action_out,
+            &time_mlp_in,
+            &time_mlp_out
+        )
+        .is_ok());
 
         for (name, result) in [
             (
                 "action_in_proj",
-                validate_action_glue(&config, &bad_linear(), &action_out, &time_mlp_in, &time_mlp_out),
+                validate_action_glue(
+                    &config,
+                    &bad_linear(),
+                    &action_out,
+                    &time_mlp_in,
+                    &time_mlp_out,
+                ),
             ),
             (
                 "action_out_proj",
-                validate_action_glue(&config, &action_in, &bad_linear(), &time_mlp_in, &time_mlp_out),
+                validate_action_glue(
+                    &config,
+                    &action_in,
+                    &bad_linear(),
+                    &time_mlp_in,
+                    &time_mlp_out,
+                ),
             ),
             (
                 "time_mlp_in",
-                validate_action_glue(&config, &action_in, &action_out, &bad_linear(), &time_mlp_out),
+                validate_action_glue(
+                    &config,
+                    &action_in,
+                    &action_out,
+                    &bad_linear(),
+                    &time_mlp_out,
+                ),
             ),
             (
                 "time_mlp_out",
-                validate_action_glue(&config, &action_in, &action_out, &time_mlp_in, &bad_linear()),
+                validate_action_glue(
+                    &config,
+                    &action_in,
+                    &action_out,
+                    &time_mlp_in,
+                    &bad_linear(),
+                ),
             ),
         ] {
             let error = result.unwrap_err().to_string();

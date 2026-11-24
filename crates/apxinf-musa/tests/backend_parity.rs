@@ -201,8 +201,9 @@ const KNOBS: &[Knob] = &[
     Knob {
         name: "APXINF_MUSA_WORKSPACE_POOL",
         counterpart: None,
-        note: "=0 restores the monotonic arena allocator; unset or any other value \
-               reuses a slice once the last tensor reading it drops",
+        note: "=0 restores the monotonic arena allocator and uses the full \
+               reservation (no ladder); unset or any other value reuses a slice \
+               once the last tensor reading it drops",
     },
     Knob {
         name: "APXINF_MUSA_WORKSPACE_REPORT",

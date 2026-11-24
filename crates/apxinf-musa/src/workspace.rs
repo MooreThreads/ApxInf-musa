@@ -26,6 +26,13 @@ use crate::error::musa_error;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
+/// Prefix shared by every allocator exhaustion error.
+///
+/// The PI0.5 capacity ladder retries on this message, so the bump and pool
+/// allocators must produce the same text; [`is_workspace_exhaustion`] is the
+/// one place that recognizes it.
+pub const WORKSPACE_EXHAUSTED: &str = "static inference workspace exhausted";
+
 /// State of the pooled allocator.
 ///
 /// A lease returns its extent when the last tensor reading the slice drops, so
@@ -118,9 +125,10 @@ impl GraphWorkspace {
         self.storage.len()
     }
 
-    /// Address high-water of the last traversal: the furthest byte any slice
-    /// reached. With pooling this is what a fixed reservation has to cover;
-    /// on the bump path it is also the final offset.
+    /// Requested-byte high-water of the last traversal: the furthest byte any
+    /// slice asked for. It excludes the per-allocation alignment and slack, so
+    /// it is a usage diagnostic, not a reservation size; on the bump path it is
+    /// also the final offset.
     pub fn used(&self) -> usize {
         match &self.allocator {
             Allocator::Bump { offset } => offset.get(),
@@ -197,10 +205,7 @@ impl GraphWorkspace {
             .and_then(|value| value.checked_add(slack))
             .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
         if end > self.storage.len() {
-            return Err(Error::Other(format!(
-                "static inference workspace exhausted: need {end} bytes, capacity is {} bytes",
-                self.storage.len()
-            )));
+            return Err(exhaustion_error(end, self.storage.len()));
         }
         offset.set(end);
         self.storage.view(start, bytes).map_err(musa_error)
@@ -213,12 +218,8 @@ impl GraphWorkspace {
     ) -> Result<MusaBuffer> {
         let extent = align_extent(bytes)?;
         let mut guard = lock_state(state)?;
-        let start = take_free_block(&mut guard.free_blocks, extent).ok_or_else(|| {
-            Error::Other(format!(
-                "static inference workspace exhausted: need {extent} bytes, capacity is {} bytes",
-                self.storage.len()
-            ))
-        })?;
+        let start = take_free_block(&mut guard.free_blocks, extent)
+            .ok_or_else(|| exhaustion_error(extent, self.storage.len()))?;
         guard.active_allocations = guard
             .active_allocations
             .checked_add(1)
@@ -326,13 +327,25 @@ fn release_extent(
 
 /// The pooled allocator reuses slices whose tensors have dropped; `=0` restores
 /// the proven monotonic allocator without a rebuild.
-fn workspace_pool_enabled() -> bool {
+pub fn workspace_pool_enabled() -> bool {
     static POOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
         std::env::var("APXINF_MUSA_WORKSPACE_POOL")
             .map(|value| value != "0")
             .unwrap_or(true)
     })
+}
+
+/// Whether `error` is an allocator exhaustion error, the only failure the PI0.5
+/// capacity ladder retries.
+pub fn is_workspace_exhaustion(error: &Error) -> bool {
+    error.to_string().contains(WORKSPACE_EXHAUSTED)
+}
+
+fn exhaustion_error(need: usize, capacity: usize) -> Error {
+    Error::Other(format!(
+        "{WORKSPACE_EXHAUSTED}: need {need} bytes, capacity is {capacity} bytes"
+    ))
 }
 
 struct ExecutionSessionInner {
@@ -603,10 +616,12 @@ enum OutputFill {
 
 fn output_fill() -> OutputFill {
     static FILL: std::sync::OnceLock<OutputFill> = std::sync::OnceLock::new();
-    *FILL.get_or_init(|| match std::env::var("APXINF_MUSA_OUTPUT_FILL").as_deref() {
-        Ok("poison") => OutputFill::Poison,
-        _ => OutputFill::Dirty,
-    })
+    *FILL.get_or_init(
+        || match std::env::var("APXINF_MUSA_OUTPUT_FILL").as_deref() {
+            Ok("poison") => OutputFill::Poison,
+            _ => OutputFill::Dirty,
+        },
+    )
 }
 
 /// Session-aware allocation for direct-launch operators. During an execution
@@ -627,7 +642,9 @@ pub(crate) fn output_buffer(ctx: &MusaContext, bytes: usize) -> Result<MusaBuffe
                 }
             }
         } else {
-            unsafe { &*inner }.workspace.allocate(bytes, ctx.device_id())
+            unsafe { &*inner }
+                .workspace
+                .allocate(bytes, ctx.device_id())
         }
     })
 }
@@ -676,7 +693,10 @@ mod tests {
 
         let (used, message) = session
             .prepare(|| {
-                session.workspace().allocate(1024, device).expect("outer allocation");
+                session
+                    .workspace()
+                    .allocate(1024, device)
+                    .expect("outer allocation");
                 assert_eq!(session.workspace().used(), 1024);
 
                 let nested = session.run(|| Ok(()));
@@ -708,16 +728,8 @@ mod tests {
     fn a_shape_outside_the_prepare_traversal_is_refused() {
         let workspace = GraphWorkspace::new(1 << 20, 0).expect("host arena");
         let session = ExecutionSession::new(workspace);
-        let gemm = OperationShape::Gemm {
-            m: 8,
-            n: 32,
-            k: 16,
-        };
-        let narrower = OperationShape::Gemm {
-            m: 4,
-            n: 32,
-            k: 16,
-        };
+        let gemm = OperationShape::Gemm { m: 8, n: 32, k: 16 };
+        let narrower = OperationShape::Gemm { m: 4, n: 32, k: 16 };
         let attention = OperationShape::Attention {
             queries: 16,
             keys: 24,
@@ -791,7 +803,10 @@ mod tests {
             "only what was prepared under capture is kept, and only once"
         );
         assert!(Rc::ptr_eq(
-            &retained[0].clone().downcast::<u32>().expect("the retained u32"),
+            &retained[0]
+                .clone()
+                .downcast::<u32>()
+                .expect("the retained u32"),
             &inside
         ));
     }
@@ -808,7 +823,10 @@ mod tests {
             .prepare(|| ctx.allocate_output(shape.clone(), DType::BF16).map(|_| ()))
             .expect("a prepared traversal");
         let inside = session.workspace().used();
-        assert!(inside > 0, "the session must have taken arena for the output");
+        assert!(
+            inside > 0,
+            "the session must have taken arena for the output"
+        );
 
         ctx.allocate_output(shape, DType::BF16)
             .expect("an eager output");
@@ -858,8 +876,7 @@ mod tests {
 
     #[test]
     fn merge_adjacent_free_blocks_coalesces_on_both_sides() {
-        let mut blocks =
-            BTreeMap::from([(0usize, 256usize), (256, 512), (768, 128), (1024, 64)]);
+        let mut blocks = BTreeMap::from([(0usize, 256usize), (256, 512), (768, 128), (1024, 64)]);
         merge_adjacent_free_blocks(&mut blocks);
         assert_eq!(
             blocks,
@@ -892,6 +909,19 @@ mod tests {
         assert_eq!(state.active_allocations, 0);
         assert_eq!(state.live_requested_bytes, 0);
         assert_eq!(state.free_blocks.get(&0), Some(&256));
+    }
+
+    #[test]
+    fn exhaustion_errors_are_recognized_by_the_ladder_predicate() {
+        let exhaustion = exhaustion_error(1024, 512);
+        assert!(is_workspace_exhaustion(&exhaustion));
+        assert!(
+            exhaustion.to_string().starts_with(WORKSPACE_EXHAUSTED),
+            "both allocators must share the ladder's prefix: {exhaustion}"
+        );
+        assert!(!is_workspace_exhaustion(&Error::Other(
+            "static inference workspace is on MUSA 1".into()
+        )));
     }
 
     #[test]
@@ -967,10 +997,7 @@ mod tests {
         session
             .prepare(|| {
                 drop(held);
-                session
-                    .workspace()
-                    .allocate(1 << 20, device)
-                    .map(|_| ())
+                session.workspace().allocate(1 << 20, device).map(|_| ())
             })
             .expect("the stale lease must not fragment the pool");
     }

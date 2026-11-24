@@ -304,15 +304,25 @@ upstream keeps for its INT32 accumulator and verifier.
 
 The arena is pooled and the reservation is a ladder, not a constant.
 `GraphWorkspace` reuses a slice once the last tensor reading it drops
-(cuda-new's generation-tagged lease free list), and `capture_infer_impl` tries
-`required/8` and doubles up to the modeled bound, retrying only on
-`"workspace exhausted"` and capturing on the session that succeeded; the eager
-path runs the same ladder because an eager plan retains its session. On M1000
-(int8_dynamic, 3 views, 10 tokens) the modeled 5.64 GiB becomes a 704.5 MiB
-arena with a 105.0 MiB live peak, and the steady device footprint falls from
-11.1 to 6.0 GiB. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
-allocator; `APXINF_MUSA_WORKSPACE_REPORT=1` prints
-capacity/used/peak/attempts.
+(cuda-new's generation-tagged lease free list). `with_capacity_ladder` starts
+at `max(required/8, 256 MiB)`, doubles, and ends at the modeled bound; a
+modeled bound at or below 256 MiB is a single rung. Only a
+`"static inference workspace exhausted"` error advances the ladder: the
+prepare traversal is retried on the next rung, and the plan is committed on
+the rung that prepared. Any other error is final, and a capture failure is
+never retried. The eager path runs the same ladder because an eager plan
+retains its session. On M1000 (int8_dynamic, 3 views, 10 tokens) the modeled
+5.50 GiB (5,909,589,760 bytes) becomes a 704.5 MiB arena — exactly its eighth,
+so the first rung held — and the steady device footprint falls from 11.1 to
+6.0 GiB. The report separates two marks: `used` (109.6 MiB) is the
+requested-byte high-water of the traversal, while `peak` (105.0 MiB) is the
+most requested bytes live at once (`peak_used()`); neither includes the
+per-allocation alignment and slack, so they are usage diagnostics rather than
+reservation sizes. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
+allocator, which never reuses a dropped slice: every rung below `required`
+would exhaust, so the ladder collapses to the single modeled rung.
+`APXINF_MUSA_WORKSPACE_REPORT=1` prints one line per successful plan (`graph`
+or `eager`) with capacity/used/peak/attempts/tokens/pool.
 
 ### Streaming int8 loads
 
@@ -499,8 +509,6 @@ without its KN pack stays on the native route with a one-time warning
 rather than failing the call. `APXINF_TILELANG=off` empties the route at run time — the
 feature-off semantics, no rebuild. The first dispatch prints one line
 (`TileLang route:` …), so a run's route adoption is visible in its log.
-
-
 
 ## GR00T N1.7 on MUSA
 
