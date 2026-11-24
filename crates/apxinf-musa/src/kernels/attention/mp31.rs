@@ -70,7 +70,8 @@ pub(crate) fn prepare(
 }
 
 /// `geometry` is the validated query tokens, heads, head dim, cache rows and valid KV rows.
-/// The MQA caller has already checked dtype, contiguous storage and output coverage.
+/// The MQA caller has already checked dtype, contiguous storage, output coverage and
+/// the output's quantizer: `inverse_output_scale > 0` writes the merged row as E4M3.
 pub(crate) fn try_launch(
     ctx: &MusaContext,
     q: &Tensor,
@@ -79,6 +80,7 @@ pub(crate) fn try_launch(
     out: &mut Tensor,
     geometry: [usize; 5],
     workspace_limit: usize,
+    inverse_output_scale: f32,
 ) -> Result<bool> {
     #[cfg(apxinf_musa_mutlass_fmha)]
     {
@@ -148,6 +150,7 @@ pub(crate) fn try_launch(
                 base,
                 stats,
                 output,
+                inverse_output_scale,
                 ctx.stream().handle(),
             ))
         }
@@ -156,7 +159,16 @@ pub(crate) fn try_launch(
     }
     #[cfg(not(apxinf_musa_mutlass_fmha))]
     {
-        let _ = (ctx, q, k, v, out, geometry, workspace_limit);
+        let _ = (
+            ctx,
+            q,
+            k,
+            v,
+            out,
+            geometry,
+            workspace_limit,
+            inverse_output_scale,
+        );
         Ok(false)
     }
 }
@@ -304,7 +316,8 @@ mod tests {
                 &v,
                 &mut out,
                 [10, 8, 256, rows, rows],
-                WORKSPACE_BYTES - 1
+                WORKSPACE_BYTES - 1,
+                0.0
             )
             .unwrap());
             let session = ExecutionSession::with_capacity(1024 * 1024, device).unwrap();

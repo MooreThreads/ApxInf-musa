@@ -23,20 +23,25 @@ __global__ void pack_direct_weight(const uint8_t *input, uint8_t *packed,
 #endif
 }
 
-template <int WARPS = 8>
+// A warp owns PER contiguous K chunks.  One GROUP issues every A and weight
+// load before its MMAs, so a single memory latency covers the group instead of
+// being exposed per chunk; the production 16-warp launch has PER == GROUP == 2.
+template <int WARPS = 16>
 __global__ __launch_bounds__(WARPS * 32, 1) void direct_qkv_rope(
     const uint8_t *a, const uint8_t *packed, const __mt_bfloat16 *bias,
     __mt_bfloat16 *q, __mt_bfloat16 *k, __mt_bfloat16 *v,
     const float *frequency, int position_offset, int kv_output_offset, float alpha) {
 #if __MUSA_ARCH__ == 310
-  constexpr int K = 1024, CHUNKS = K / 32, PER = (CHUNKS + WARPS - 1) / WARPS;
+  constexpr int K = 1024, CHUNKS = K / 32, PER = CHUNKS / WARPS, GROUP = 2;
+  static_assert(CHUNKS % WARPS == 0 && PER % GROUP == 0,
+                "warps must tile the K chunks in whole prefetch groups");
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int head = blockIdx.x / 8, pair_base = (blockIdx.x % 8) * 16;
   const int nt = head * 16 + blockIdx.x % 8;
-  const int first = warp * PER, last = min(first + PER, CHUNKS);
+  const int first = warp * PER;
   const int row = lane / 4, col = (lane % 4) * 4;
   float accum0[8] = {}, accum1[8] = {};
-  for (int kc = first; kc < last; ++kc) {
+  auto load_a = [&](int kc) {
     const uint8_t *r0 = a + row * K + kc * 32 + col;
     int4 av = make_int4(*(const uint32_t *)r0, *(const uint32_t *)(r0 + 16), 0, 0);
     if (row < 2) {
@@ -44,10 +49,25 @@ __global__ __launch_bounds__(WARPS * 32, 1) void direct_qkv_rope(
       av.z = *(const uint32_t *)r1;
       av.w = *(const uint32_t *)(r1 + 16);
     }
-    const int4 b0 = __ldg(((const int4 *)(packed + (nt * CHUNKS + kc) * 512)) + lane);
-    const int4 b1 = __ldg(((const int4 *)(packed + ((nt + 8) * CHUNKS + kc) * 512)) + lane);
-    DirectAtom::fma((int *)accum0, (const int *)&av, (const int *)&b0, (int *)accum0);
-    DirectAtom::fma((int *)accum1, (const int *)&av, (const int *)&b1, (int *)accum1);
+    return av;
+  };
+#pragma unroll
+  for (int g = 0; g < PER; g += GROUP) {
+    int4 av[GROUP], b0[GROUP], b1[GROUP];
+#pragma unroll
+    for (int i = 0; i < GROUP; ++i)
+      av[i] = load_a(first + g + i);
+#pragma unroll
+    for (int i = 0; i < GROUP; ++i) {
+      const int kc = first + g + i;
+      b0[i] = __ldg(((const int4 *)(packed + (nt * CHUNKS + kc) * 512)) + lane);
+      b1[i] = __ldg(((const int4 *)(packed + ((nt + 8) * CHUNKS + kc) * 512)) + lane);
+    }
+#pragma unroll
+    for (int i = 0; i < GROUP; ++i) {
+      DirectAtom::fma((int *)accum0, (const int *)&av[i], (const int *)&b0[i], (int *)accum0);
+      DirectAtom::fma((int *)accum1, (const int *)&av[i], (const int *)&b1[i], (int *)accum1);
+    }
   }
   __shared__ float partial[WARPS][512];
 #pragma unroll

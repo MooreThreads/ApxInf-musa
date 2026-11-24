@@ -3,6 +3,59 @@
 #include "geglu.cuh"
 
 namespace apxinf_mp31 {
+template <class Tile, int BN>
+__device__ void store_projection_partial(const float *acc, float *partial, int m, int n) {
+  auto coords = typename Tile::Mma{}.get_thread_slice(threadIdx.x).partition_C(
+      mute::make_identity_tensor(mute::Shape<mute::Int<16>, mute::Int<BN>>{}));
+#pragma unroll
+  for (int j = 0; j < 16 * BN / 128; ++j) {
+    int r = mute::get<0>(coords(j)), c = blockIdx.x * BN + mute::get<1>(coords(j));
+    if (r < m && c < n)
+      partial[(blockIdx.y * m + r) * n + c] = acc[j];
+  }
+}
+
+// Each K partition fits one or two tiles. Issue all descriptor loads up front
+// so the SQMMA squad can consume them without a separate producer squad.
+template <int Tiles>
+__global__ __launch_bounds__(128) void e4m3_projection_partial(
+    __attribute__((grid_constant)) const MUtensorDescriptor ad,
+    __attribute__((grid_constant)) const MUtensorDescriptor bd, float *partial, int m, int n) {
+#if __MUSA_ARCH__ == 310
+  constexpr int BN = 64, BK = 256;
+  using Tile = Fp8Tile<16, BN, BK>;
+  extern __shared__ __align__(4096) uint8_t storage[];
+  auto *weights = (E4m3 *)storage;
+  auto *activations = weights + Tiles * BN * BK;
+  __musa_async_bar_record(Tiles);
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int t = 0; t < Tiles; ++t)
+      __musa_async_init_arrival(t + 1, 1, 0);
+  }
+  __syncthreads_lm();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int t = 0; t < Tiles; ++t) {
+      const int k_offset = (blockIdx.y * Tiles + t) * BK;
+      __musa_async_add_trans(t + 1, (16 + BN) * BK);
+      load<mute::TME::CacheHint::CACHE_PERSIST, mute::TME::CacheHint::CACHE_PERSIST>(
+          ad, t + 1, activations + t * 16 * BK, k_offset, 0, BK, 16);
+      load<mute::TME::CacheHint::CACHE_ONCE, mute::TME::CacheHint::CACHE_NONE>(
+          bd, t + 1, weights + t * BN * BK, k_offset, blockIdx.x * BN, BK, BN);
+      __musa_async_arrive(t + 1);
+    }
+  }
+  float acc[16 * BN / 128] = {};
+#pragma unroll
+  for (int t = 0; t < Tiles; ++t) {
+    __musa_async_wait(t + 1, 0);
+    Tile::run(activations + t * 16 * BK, weights + t * BN * BK, acc);
+  }
+  store_projection_partial<Tile, BN>(acc, partial, m, n);
+#endif
+}
+
 template <int BN, int BK, int ST, int SP, bool QUANT>
 __global__ __launch_bounds__(256, 1) void partial_gemm(__attribute__((grid_constant))
                                                        const MUtensorDescriptor ad,
@@ -67,18 +120,8 @@ __global__ __launch_bounds__(256, 1) void partial_gemm(__attribute__((grid_const
     __musa_async_wait(last % ST + ST + 1, (last / ST) & 1);
   }
   __syncthreads_lm();
-  if (threadIdx.x < 128) {
-    auto coords =
-        typename Tile::Mma{}
-            .get_thread_slice(threadIdx.x)
-            .partition_C(mute::make_identity_tensor(mute::Shape<mute::Int<16>, mute::Int<BN>>{}));
-#pragma unroll
-    for (int j = 0; j < 16 * BN / 128; ++j) {
-      int r = mute::get<0>(coords(j)), c = blockIdx.x * BN + mute::get<1>(coords(j));
-      if (r < m && c < n)
-        partial[(blockIdx.y * m + r) * n + c] = acc[j];
-    }
-  }
+  if (threadIdx.x < 128)
+    store_projection_partial<Tile, BN>(acc, partial, m, n);
 #endif
 }
 } // namespace apxinf_mp31

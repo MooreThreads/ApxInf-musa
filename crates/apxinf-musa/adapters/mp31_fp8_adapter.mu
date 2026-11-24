@@ -175,10 +175,12 @@ extern "C" musaError_t apxinf_musa_mp31_fp8_projection_norm(
         <<<dim3(w->n / 64, 8), 256, 80 * 256, stream>>>(
             ad, w->descriptor, (const apxinf_mp31::Bf16 *)a, partial, m, w->n, w->k,
             inverse_input_scale);
+  else if (w->k == 2048)
+    apxinf_mp31::e4m3_projection_partial<1><<<dim3(w->n / 64, 8), 128, 80 * 256, stream>>>(
+        ad, w->descriptor, partial, m, w->n);
   else
-    apxinf_mp31::partial_gemm<64, 256, 1, 8, false>
-        <<<dim3(w->n / 64, 8), 256, 80 * 256, stream>>>(
-            ad, w->descriptor, nullptr, partial, m, w->n, w->k, 1.f);
+    apxinf_mp31::e4m3_projection_partial<2><<<dim3(w->n / 64, 8), 128, 80 * 512, stream>>>(
+        ad, w->descriptor, partial, m, w->n);
   auto status = musaGetLastError();
   if (status != musaSuccess)
     return status;

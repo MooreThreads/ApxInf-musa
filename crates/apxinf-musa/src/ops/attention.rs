@@ -1,6 +1,6 @@
 //! Dense attention contracts.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::{require_deterministic, require_unit_output_scale, require_workspace};
 use crate::kernels::attention as kernels;
@@ -107,7 +107,21 @@ impl<'a> AttentionArgs<'a> {
 }
 
 pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
-    require_unit_output_scale("attention", args.output_scale)?;
+    // A BF16 output keeps the unit-scale contract; an E4M3 output carries the
+    // static quantizer the following projection would otherwise apply itself.
+    let quantized = args.out.dtype() == DType::F8E4M3;
+    if quantized {
+        if !args.output_scale.is_finite()
+            || args.output_scale <= 0.0
+            || !(1.0 / args.output_scale).is_finite()
+        {
+            return Err(Error::Other(
+                "MUSA attention needs a finite positive output_scale for an E4M3 output".into(),
+            ));
+        }
+    } else {
+        require_unit_output_scale("attention", args.output_scale)?;
+    }
     if args.mask == AttentionMask::Causal {
         return Err(not_ported("causal attention"));
     }
@@ -133,6 +147,11 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
     let mut query = args.query.reshape(vec![batch * tokens, heads, head_dim])?;
     let mut out = args.out.reshape(vec![batch * tokens, heads, head_dim])?;
     if args.key.shape().dims() == query_dims {
+        if quantized {
+            return Err(Error::Other(
+                "MUSA attention writes E4M3 only for decode-shaped MQA".into(),
+            ));
+        }
         let [key_batch, key_tokens, key_heads, key_dim] = args.key.shape().dims() else {
             unreachable!("shape compared above");
         };
@@ -166,16 +185,30 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
         // accepted rank describes the same bytes of one contiguous buffer.
         let key = args.key.reshape(vec![key_tokens, head_dim])?;
         let value = args.value.reshape(vec![key_tokens, head_dim])?;
-        kernels::mqa_bf16_into_with_workspace(
-            ctx,
-            &mut query,
-            &key,
-            &value,
-            &mut out,
-            key_tokens,
-            admitted.tactic,
-            admitted.workspace_limit,
-        )
+        if quantized {
+            kernels::mqa_fp8_into_with_workspace(
+                ctx,
+                &mut query,
+                &key,
+                &value,
+                &mut out,
+                key_tokens,
+                1.0 / args.output_scale,
+                admitted.tactic,
+                admitted.workspace_limit,
+            )
+        } else {
+            kernels::mqa_bf16_into_with_workspace(
+                ctx,
+                &mut query,
+                &key,
+                &value,
+                &mut out,
+                key_tokens,
+                admitted.tactic,
+                admitted.workspace_limit,
+            )
+        }
     }
 }
 

@@ -335,6 +335,32 @@ On S5000, muDNN measured 1.6-2.7x the muBLAS FP8 time on qkv, o and down,
 equal on up, and matched at the test's cosine 0.9999 gate (not byte equality);
 muBLAS is not part of the route.
 
+`ops::gemm_bias_residual` selects muDNN's bias+residual epilogue on this route
+whenever the site carries a bias: `alpha*a*b + residual + bias` runs in one f32
+epilogue with a single BF16 rounding, so the composed BF16 scratch and the
+separate `bias_residual` producer disappear. The 27 vision fc2 sites
+(`512x4304x1152`) are the whole population on S5000; a paired ABBA measured
+23.105/23.122 -> 23.026/23.016 ms p50 (cosine 0.99946 -> 0.99932, max_abs
+0.0424 -> 0.0455, both inside their gates), and the captured graph loses 27
+launches per replay. The prefix MLP down projection has no bias in the
+checkpoint and keeps the composed producer: muDNN's epilogue has no null-bias
+form.
+
+The action chain's decode attention merges its split-KV partials directly into
+the E4M3 row the following O projection reads, and that projection consumes the
+row through TMA (`Fp8UnitScale`) instead of quantizing a BF16 copy. The stored
+bytes are identical to merging to BF16 and quantizing the copy; a paired ABBA
+measured 22.879/22.953 -> 22.496/22.481 ms p50 (-0.383 ms, -1.67%, cosine
+0.99931780 unchanged). An E4M3 attention output is admitted only for
+decode-shaped MQA and requires a finite positive `output_scale`; every other
+attention call keeps the unit-scale BF16 contract. The action O and down
+projections also moved to a single 128-thread SQMMA squad that issues the one or
+two K tiles per partition up front (projection+norm 10.622 -> 9.111 and
+12.273 -> 10.748 us), and `direct_qkv_rope` groups two K chunks of A and weight
+loads ahead of the MMAs (-0.281 ms, -1.21%, byte-identical). The launch
+contract and stress test are in
+[the MP31 FP8 kernel notes](../crates/apxinf-musa/kernels/mp31_fp8/README.md).
+
 Static-FP8 preparation keeps the CUDA artifact contract:
 
 - weights: one per-tensor absmax scale, host F32 amax -> F16 rounding ->
@@ -552,6 +578,14 @@ at 16.6234/16.6530 ms against 16.8673/16.6839 ms on the three-GEMM path; the
 three-GEMM form still runs for BF16 and for a calibration whose Q/K/V
 activation scales differ. The per-stage ledger and probes are
 in `devlocal/gr00t/`.
+
+The packed split also folds into the Q/K RMSNorm and mRoPE kernel for up to 256
+tokens with 16 Q heads, 8 KV heads and head dimension 128: one warp per
+`(token, head)` reads the wide projection, rotates Q/K and copies V, so the
+separate `split_qkv_uneven_bf16` launch disappears. The outputs are
+byte-identical; the fp8/require-graph median moved 17.004 -> 16.581 ms p50 on
+musa:5 and 17.158 -> 17.052 on musa:4 (three processes each, cosine 0.99994476
+unchanged).
 
 The current dev-Yi pass moved FP8 18.541 -> **17.46 ms** (p50, four runs
 17.44-17.75, Orin fixture, cosine 0.9999584, relative L2 0.009127, max_abs

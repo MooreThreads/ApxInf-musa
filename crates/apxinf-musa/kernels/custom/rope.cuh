@@ -398,35 +398,47 @@ __global__ void build_mrope_rotation_table_f32_kernel(
 // cross-lane exchange. The row is rounded to BF16 before rotation so this
 // preserves the fallback's arithmetic boundary: f32 squares,
 // `bf16(input * inv_rms * weight)`, f32 rotation, BF16 out.
+template <bool Packed>
 __global__ void qk_rms_norm_mrope_precomputed_bf16_warp_kernel(
     const __mt_bfloat16* query_input, const __mt_bfloat16* query_weight,
     __mt_bfloat16* query_output, const __mt_bfloat16* key_input,
     const __mt_bfloat16* key_weight, __mt_bfloat16* key_output,
     const float* rotation_table, int tokens, int query_heads, int key_heads,
-    int head_dim, float eps) {
+    int head_dim, float eps, __mt_bfloat16* value_output) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int total_heads = query_heads + key_heads;
+  const int total_heads = query_heads + (Packed ? 2 : 1) * key_heads;
   const int row = static_cast<int>(blockIdx.x) * (blockDim.x >> 5) + warp;
   if (row >= tokens * total_heads) return;
 
   const int token = row / total_heads;
   const int combined_head = row - token * total_heads;
+  const int64_t packed_base = static_cast<int64_t>(row) * head_dim;
+  if constexpr (Packed) {
+    if (combined_head >= query_heads + key_heads) {
+      const int v_head = combined_head - query_heads - key_heads;
+      const int64_t dst = (static_cast<int64_t>(token) * key_heads + v_head) * head_dim;
+      for (int col = lane; col < head_dim; col += 32)
+        value_output[dst + col] = query_input[packed_base + col];
+      return;
+    }
+  }
   const bool is_query = combined_head < query_heads;
   const int heads = is_query ? query_heads : key_heads;
   const int head = is_query ? combined_head : combined_head - query_heads;
-  const __mt_bfloat16* input = is_query ? query_input : key_input;
+  const __mt_bfloat16* input = (Packed || is_query) ? query_input : key_input;
   const __mt_bfloat16* weight = is_query ? query_weight : key_weight;
   __mt_bfloat16* output = is_query ? query_output : key_output;
   const int64_t base =
       (static_cast<int64_t>(token) * heads + head) * head_dim;
+  input += Packed ? packed_base : base;
   const int half_dim = head_dim / 2;
   const int first = 2 * lane;
 
-  const float a0 = __bfloat162float(input[base + first]);
-  const float a1 = __bfloat162float(input[base + first + 1]);
-  const float b0 = __bfloat162float(input[base + half_dim + first]);
-  const float b1 = __bfloat162float(input[base + half_dim + first + 1]);
+  const float a0 = __bfloat162float(input[first]);
+  const float a1 = __bfloat162float(input[first + 1]);
+  const float b0 = __bfloat162float(input[half_dim + first]);
+  const float b1 = __bfloat162float(input[half_dim + first + 1]);
   // The weight and the rotation table are row-independent; reading them before
   // the shuffle reduction overlaps those loads with it. The arithmetic is
   // unchanged.

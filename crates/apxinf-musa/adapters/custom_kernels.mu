@@ -1647,6 +1647,19 @@ extern "C" musaError_t apxinf_musa_build_mrope_rotation_table_f32(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_packed_qkv_rms_mrope(
+    const void* packed, const void* q_weight, const void* k_weight, const void* rotations,
+    void* q, void* k, void* v, int tokens, float eps, musaStream_t stream) {
+  // Four warps per block, one warp per (token, head). The packed geometry
+  // has 16 Q heads, 8 K heads, and 8 V heads of width 128.
+  qk_rms_norm_mrope_precomputed_bf16_warp_kernel<true><<<tokens * 8, 128, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(packed), static_cast<const __mt_bfloat16*>(q_weight),
+      static_cast<__mt_bfloat16*>(q), nullptr, static_cast<const __mt_bfloat16*>(k_weight),
+      static_cast<__mt_bfloat16*>(k), static_cast<const float*>(rotations),
+      tokens, 16, 8, 128, eps, static_cast<__mt_bfloat16*>(v));
+  return musaGetLastError();
+}
+
 extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
     const void* query, const void* query_weight, void* query_output,
     const void* key, const void* key_weight, void* key_output,
@@ -1661,7 +1674,7 @@ extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
   }
   const int rows = tokens * (query_heads + key_heads);
   const int warps = block_threads / 32;
-  qk_rms_norm_mrope_precomputed_bf16_warp_kernel<<<
+  qk_rms_norm_mrope_precomputed_bf16_warp_kernel<false><<<
       dim3(static_cast<unsigned int>((rows + warps - 1) / warps)),
       block_threads, 0, stream>>>(
       static_cast<const __mt_bfloat16*>(query),
@@ -1671,7 +1684,7 @@ extern "C" musaError_t apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
       static_cast<const __mt_bfloat16*>(key_weight),
       static_cast<__mt_bfloat16*>(key_output),
       static_cast<const float*>(rotation_table), tokens, query_heads,
-      key_heads, head_dim, eps);
+      key_heads, head_dim, eps, nullptr);
   return musaGetLastError();
 }
 

@@ -9,7 +9,7 @@ use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::contracts::{
     bf16_tensor, e4m3_tensor, f32_tensor, require_dtype_on, require_optional_vector_bf16,
-    require_output_tensor,
+    require_output_dtype_tensor, require_output_tensor,
 };
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, checked_i64, optional_tensor_ptr, tensor_ptr};
@@ -317,6 +317,59 @@ pub(crate) fn mqa_bf16_into_with_workspace(
     tactic: TacticDispatch,
     workspace_limit: usize,
 ) -> Result<()> {
+    mqa_into_with_workspace(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        key_tokens,
+        None,
+        tactic,
+        workspace_limit,
+    )
+}
+
+/// [`mqa_bf16_into_with_workspace`] for the static-FP8 path: the merged decode
+/// row is stored as E4M3 through the following projection's own input
+/// quantizer, so that projection reads it as FP8 instead of re-quantizing a
+/// BF16 copy. Byte-identical to the composed pair.
+pub(crate) fn mqa_fp8_into_with_workspace(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    key_tokens: usize,
+    inverse_output_scale: f32,
+    tactic: TacticDispatch,
+    workspace_limit: usize,
+) -> Result<()> {
+    mqa_into_with_workspace(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        key_tokens,
+        Some(inverse_output_scale),
+        tactic,
+        workspace_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mqa_into_with_workspace(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    key_tokens: usize,
+    quantized: Option<f32>,
+    tactic: TacticDispatch,
+    workspace_limit: usize,
+) -> Result<()> {
     let (tokens, heads, head_dim) = require_3d_bf16(ctx, q, "mqa", "q")?;
     if (heads, head_dim) != (ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM) {
         return Err(Error::Other(format!(
@@ -357,7 +410,24 @@ pub(crate) fn mqa_bf16_into_with_workspace(
             "MUSA mqa needs 0 < key_tokens <= {available}, got {key_tokens}"
         )));
     }
-    require_output_tensor(ctx, output, &[tokens, heads, head_dim], "mqa", "out")?;
+    match quantized {
+        Some(inverse_scale) => {
+            if !inverse_scale.is_finite() || inverse_scale <= 0.0 {
+                return Err(Error::Other(
+                    "MUSA mqa needs a finite positive output quantizer".into(),
+                ));
+            }
+            require_output_dtype_tensor(
+                ctx,
+                output,
+                &[tokens, heads, head_dim],
+                DType::F8E4M3,
+                "mqa",
+                "out",
+            )?;
+        }
+        None => require_output_tensor(ctx, output, &[tokens, heads, head_dim], "mqa", "out")?,
+    }
     crate::workspace::note_shape(crate::workspace::OperationShape::Attention {
         queries: tokens,
         keys: key_tokens,
@@ -373,8 +443,14 @@ pub(crate) fn mqa_bf16_into_with_workspace(
         output,
         [tokens, heads, head_dim, available, key_tokens],
         workspace_limit,
+        quantized.unwrap_or(0.0),
     )? {
         return Ok(());
+    }
+    if quantized.is_some() {
+        return Err(Error::Other(
+            "MUSA mqa writes an E4M3 output only on the MP31 native route".into(),
+        ));
     }
     launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens, tactic)
 }

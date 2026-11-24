@@ -3,6 +3,7 @@
 // the MATE fallback.
 #pragma once
 #include <musa_runtime.h>
+#include "../custom/math.cuh"
 #include <mute/arch/copy_mp31_tme.hpp>
 // Keep one MUTLASS revision across the backend. TileLang uses the newer name.
 namespace mute {
@@ -149,9 +150,12 @@ __global__ __launch_bounds__(256, 1) void attention_partials(
 
 #endif
 }
+// `inverse_scale` is the next projection's input quantizer, the same one its
+// BF16 producer applies to this row, so the E4M3 store here is byte-identical
+// to merging to BF16 and letting that producer quantize from memory.
 template <int SP, bool QUANT = false>
 __global__ void merge_partials(const float *part, const float *stats, void *out,
-                               int t, float scale) {
+                               int t, float inverse_scale) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   if (x >= t * 8 * 256)
     return;
@@ -182,8 +186,7 @@ __global__ void merge_partials(const float *part, const float *stats, void *out,
   }
   bfloat16_t b = bfloat16_t(y);
   if constexpr (QUANT)
-    ((fp8_e4_t *)out)[x] =
-        fp8_e4_t(fminf(448.f, fmaxf(-448.f, float(b) / scale)));
+    ((uint8_t *)out)[x] = quantize_e4m3_value(float(b), inverse_scale);
   else
     ((bfloat16_t *)out)[x] = b;
 }
