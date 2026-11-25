@@ -322,7 +322,10 @@ reservation sizes. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
 allocator, which never reuses a dropped slice: every rung below `required`
 would exhaust, so the ladder collapses to the single modeled rung.
 `APXINF_MUSA_WORKSPACE_REPORT=1` prints one line per successful plan (`graph`
-or `eager`) with capacity/used/peak/attempts/tokens/pool.
+or `eager`) with capacity/used/peak/attempts/tokens/pool. The arena rounds its
+requested capacity up to the 256-byte alignment before allocating; `capacity()`
+reports the rounded size, so a request whose aligned extent equals the capacity
+it was handed fits on both allocators.
 
 ### Streaming int8 loads
 
@@ -333,7 +336,10 @@ through `WeightSource` one layer at a time, folds them in F32, quantizes and
 uploads them, then drops the host copy before the next layer. The reader shares
 header parsing and the sharded index's wrong-shard, duplicate, missing and
 unsafe-path checks with the whole-file loader, and it rejects a non-forward or
-overflowing `data_offsets` entry before any tensor is exposed. The streaming
+overflowing `data_offsets` entry before any tensor is exposed. Header parsing
+also requires each entry's `data_offsets` extent to equal
+`dtype.size_in_bytes() * product(shape)`; a truncated or padded range is
+refused before any bytes are read. The streaming
 path runs the same shape validation as `Pi05Weights::from_map`, including the
 six checkpoint-wide tensors (`token_embedding`, `multimodal_projector`,
 `action_in_proj`, `action_out_proj`, `time_mlp_in`, `time_mlp_out`); only the
@@ -400,7 +406,12 @@ bytes are identical to merging to BF16 and quantizing the copy; a paired ABBA
 measured 22.879/22.953 -> 22.496/22.481 ms p50 (-0.383 ms, -1.67%, cosine
 0.99931780 unchanged). An E4M3 attention output is admitted only for
 decode-shaped MQA and requires a finite positive `output_scale`; every other
-attention call keeps the unit-scale BF16 contract. The action O and down
+attention call keeps the unit-scale BF16 contract. When the native MP31
+geometry does not apply — for example at the default `action_horizon=50` KV
+length — `allow_fallback` serves the same E4M3 contract by running the BF16
+MQA route into a workspace temporary and then applying the fixed-scale E4M3
+quantizer; `allow_fallback=false` still refuses the substitute by name. The
+action O and down
 projections also moved to a single 128-thread SQMMA squad that issues the one or
 two K tiles per partition up front (projection+norm 10.622 -> 9.111 and
 12.273 -> 10.748 us), and `direct_qkv_rope` groups two K chunks of A and weight
@@ -438,7 +449,8 @@ head_dim=256, valid_kv=532)`, the MP31 native BF16 QK/PV path is enabled by
 default. It uses BN64 with fixed-order split-KV=5 reduction. K/V descriptors
 expose the logical 532 rows; TME zero-fills the final tile. Declaring 576
 rows would read past the logical tensors and can propagate poisoned values.
-Unsupported shapes keep the MATE fallback.
+Unsupported shapes keep the MATE fallback; an E4M3 output on those shapes is
+the MATE/BF16 result passed through the fixed-scale quantizer.
 
 Barrier initialization is performed by one elected thread. A single producer
 warp registers DMA transactions and arrives at the corresponding barriers;

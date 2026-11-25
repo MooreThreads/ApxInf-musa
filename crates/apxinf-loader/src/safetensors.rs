@@ -440,13 +440,39 @@ fn parse_shard_header(path: &Path) -> Result<(File, ShardHeader), String> {
                 "tensor '{name}': data_offsets [{start}, {end}] exceed file size {file_len}"
             ));
         }
+        // SafeTensors packs the data buffer densely: one entry's byte range is
+        // exactly the dtype extent times the element count. Check it here,
+        // before any byte is read, so the whole-file and streaming readers
+        // reject a truncated or padded range with the same error. Fold with
+        // checked arithmetic; `Shape::numel()` uses `product()`, which wraps in
+        // release builds.
+        let expected = info
+            .shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |bytes, dimension| {
+                bytes.checked_mul(*dimension)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "tensor '{name}': shape {:?} overflows its byte size",
+                    info.shape
+                )
+            })?;
+        let len = abs_end - abs_start;
+        if len != expected {
+            return Err(format!(
+                "tensor '{name}': data_offsets [{start}, {end}] span {len} bytes, but {} {:?} \
+                 needs {expected} bytes",
+                info.dtype, info.shape
+            ));
+        }
         entries.push((
             name.clone(),
             TensorRange {
                 dtype,
                 shape: info.shape,
                 abs_start,
-                len: abs_end - abs_start,
+                len,
             },
         ));
     }
@@ -994,6 +1020,33 @@ mod tests {
             .err()
             .expect("a reversed range must be rejected");
         assert_eq!(reader_error, load_error);
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_a_range_that_is_not_the_dtype_extent() {
+        for (header, body) in [
+            // F32 [2] needs 8 bytes; this range is truncated.
+            (
+                r#"{"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}}"#,
+                vec![0u8; 4],
+            ),
+            // The same tensor with four bytes too many.
+            (
+                r#"{"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 12]}}"#,
+                vec![0u8; 12],
+            ),
+        ] {
+            let bytes = make_safetensors_with_raw_header(header, &body);
+            let mut tmp = NamedTempFile::new().unwrap();
+            tmp.write_all(&bytes).unwrap();
+
+            let load_error = load(tmp.path()).unwrap_err();
+            assert!(load_error.contains("needs 8 bytes"), "{load_error}");
+            let reader_error = CheckpointReader::open(tmp.path())
+                .err()
+                .expect("a range that is not the dtype extent must be rejected");
+            assert_eq!(reader_error, load_error);
+        }
     }
 
     #[test]

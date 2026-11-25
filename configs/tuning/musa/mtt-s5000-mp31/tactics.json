@@ -1,7 +1,7 @@
 {
   "device_name": "MTT S5000",
   "mp": 31,
-  "kernel_build_id": "musa-kb3-051796cf3a14d34839ae86bcbcdb07e4",
+  "kernel_build_id": "musa-kb3-1c95c9cfeca00f6a0d9e957f8aa6a879",
   "library_versions": {
     "musa": 50200,
     "mublas_lt": 101300,

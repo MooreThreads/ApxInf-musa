@@ -3,6 +3,14 @@
 #include "geglu.cuh"
 
 namespace apxinf_mp31 {
+// The projection tile geometry. The device schedule and the adapter's dynamic
+// shared-memory request are both derived from these, so they cannot drift.
+inline constexpr int kProjectionBn = 64;
+inline constexpr int kProjectionBk = 256;
+constexpr int projection_smem_bytes(int tiles) {
+  return tiles * (16 + kProjectionBn) * kProjectionBk;
+}
+
 template <class Tile, int BN>
 __device__ void store_projection_partial(const float *acc, float *partial, int m, int n) {
   auto coords = typename Tile::Mma{}.get_thread_slice(threadIdx.x).partition_C(
@@ -22,7 +30,7 @@ __global__ __launch_bounds__(128) void e4m3_projection_partial(
     __attribute__((grid_constant)) const MUtensorDescriptor ad,
     __attribute__((grid_constant)) const MUtensorDescriptor bd, float *partial, int m, int n) {
 #if __MUSA_ARCH__ == 310
-  constexpr int BN = 64, BK = 256;
+  constexpr int BN = kProjectionBn, BK = kProjectionBk;
   using Tile = Fp8Tile<16, BN, BK>;
   extern __shared__ __align__(4096) uint8_t storage[];
   auto *weights = (E4m3 *)storage;

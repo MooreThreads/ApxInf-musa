@@ -21,10 +21,12 @@ pub enum AttentionMask {
 /// are both satisfied.
 #[derive(Clone, Debug)]
 pub struct AttentionPolicy {
-    /// Bounds the bytes the operator allocates for itself. Attention writes only
-    /// the caller's output and allocates no intermediate, so any limit —
-    /// including zero — is satisfied. Vendor-library internal workspaces are
-    /// outside this backend's accounting.
+    /// Bounds the bytes the operator allocates for itself. BF16 attention writes
+    /// only the caller's output and allocates no intermediate, so any limit —
+    /// including zero — is satisfied. An E4M3 output that misses the MP31
+    /// native geometry additionally allocates one BF16 temporary, bounded by
+    /// this limit. Vendor-library internal workspaces are outside this
+    /// backend's accounting.
     pub workspace_limit: usize,
     /// `false` requires the measured packed decode route for a decode-shaped
     /// call, per build: the assembly build's packed decode kernel, or the
@@ -62,8 +64,9 @@ impl AttentionPolicy {
     /// Validate every field and keep only what execution must honour.
     fn admit(&self, operation: &str) -> Result<AdmittedAttentionPolicy> {
         require_deterministic(operation, self.deterministic)?;
-        // The composed path needs no intermediate. Native candidates separately
-        // check their prepared scratch against the admitted per-call limit.
+        // The composed BF16 path needs no intermediate. Native candidates and
+        // the E4M3 fallback separately check their scratch against the admitted
+        // per-call limit.
         require_workspace(operation, 0, self.workspace_limit)?;
         Ok(AdmittedAttentionPolicy {
             tactic: if self.allow_fallback {

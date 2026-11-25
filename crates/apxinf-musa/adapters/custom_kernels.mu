@@ -24,6 +24,7 @@
 // it; `MusaAllocation`'s two `musaFree` sites are the only ones, and both clear.
 
 #include <musa_runtime.h>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1650,6 +1651,13 @@ extern "C" musaError_t apxinf_musa_build_mrope_rotation_table_f32(
 extern "C" musaError_t apxinf_musa_packed_qkv_rms_mrope(
     const void* packed, const void* q_weight, const void* k_weight, const void* rotations,
     void* q, void* k, void* v, int tokens, float eps, musaStream_t stream) {
+  // `tokens * 24` is the kernel's row index (16 Q + 8 K + 8 V heads); keep it
+  // inside `int`. The Rust wrapper further caps tokens at the rotation-table
+  // capacity (256), which is a caller contract, not an ABI one.
+  if (packed == nullptr || q_weight == nullptr || k_weight == nullptr ||
+      rotations == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+      tokens <= 0 || tokens > INT_MAX / 24 || !(eps > 0.0f))
+    return musaErrorInvalidValue;
   // Four warps per block, one warp per (token, head). The packed geometry
   // has 16 Q heads, 8 K heads, and 8 V heads of width 128.
   qk_rms_norm_mrope_precomputed_bf16_warp_kernel<true><<<tokens * 8, 128, 0, stream>>>(

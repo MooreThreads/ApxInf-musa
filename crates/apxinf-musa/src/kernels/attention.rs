@@ -333,7 +333,10 @@ pub(crate) fn mqa_bf16_into_with_workspace(
 /// [`mqa_bf16_into_with_workspace`] for the static-FP8 path: the merged decode
 /// row is stored as E4M3 through the following projection's own input
 /// quantizer, so that projection reads it as FP8 instead of re-quantizing a
-/// BF16 copy. Byte-identical to the composed pair.
+/// BF16 copy. Byte-identical to the composed pair. Geometries the MP31 native
+/// route does not cover fall back to a BF16 MQA plus the fixed-scale quantizer
+/// when the caller allows a fallback; `RequireExact` keeps the native-route
+/// error.
 pub(crate) fn mqa_fp8_into_with_workspace(
     ctx: &MusaContext,
     q: &Tensor,
@@ -356,6 +359,20 @@ pub(crate) fn mqa_fp8_into_with_workspace(
         tactic,
         workspace_limit,
     )
+}
+
+/// Refuse an E4M3 output when the caller requires the MP31 native route.
+///
+/// The BF16 substitute is byte-identical on the fallback contract, but
+/// `RequireExact` promises the measured MP31 route and must not silently take
+/// a different kernel. `AllowFallback` accepts it; production PI0.5 uses that.
+fn require_fp8_native_route(tactic: TacticDispatch) -> Result<()> {
+    if tactic.requires_exact() {
+        return Err(Error::Other(
+            "MUSA mqa writes an E4M3 output only on the MP31 native route".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,12 +464,34 @@ fn mqa_into_with_workspace(
     )? {
         return Ok(());
     }
-    if quantized.is_some() {
-        return Err(Error::Other(
-            "MUSA mqa writes an E4M3 output only on the MP31 native route".into(),
-        ));
+    let Some(inverse_scale) = quantized else {
+        return launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens, tactic);
+    };
+    require_fp8_native_route(tactic)?;
+    let bytes = super::contracts::checked_bytes(
+        DType::BF16,
+        &[tokens, heads, head_dim],
+        "MUSA mqa fallback",
+    )?;
+    if bytes > workspace_limit {
+        return Err(Error::Other(format!(
+            "MUSA mqa fallback needs {bytes} bytes of its own workspace, above the caller's \
+             workspace_limit {workspace_limit}"
+        )));
     }
-    launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens, tactic)
+    let mut bf16_output = bf16_tensor(ctx, &[tokens, heads, head_dim])?;
+    launch_mqa(
+        ctx,
+        q,
+        k,
+        v,
+        &bf16_output,
+        tokens,
+        available,
+        key_tokens,
+        tactic,
+    )?;
+    super::quantization::quantize_fixed_e4m3_inverse(ctx, &bf16_output, output, inverse_scale)
 }
 
 /// The launch, split by whether this build has a MUSA toolkit.
@@ -2307,11 +2346,12 @@ mod tests {
     //! Needs a MUSA device, so it is `#[ignore]`d:
     //! `cargo test -p apxinf-musa --lib -- --ignored --nocapture`.
 
-    use apxinf_core::{DType, Shape};
+    use apxinf_core::{DType, Shape, Tensor};
 
     use crate::context::MusaContext;
     use crate::kernels::attention::{
-        mha_bf16, mqa_bf16, mqa_bf16_into, mqa_bf16_into_with, split_qkv_bias_bf16,
+        mha_bf16, mqa_bf16, mqa_bf16_into, mqa_bf16_into_with, mqa_bf16_into_with_workspace,
+        mqa_fp8_into_with_workspace, split_qkv_bias_bf16,
     };
     use crate::kernels::attention::{ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM, VISION_HEAD_DIM};
     use crate::kernels::test_support::{
@@ -3116,6 +3156,98 @@ mod tests {
             );
         }
     }
+
+    /// The E4M3 contract on a geometry the MP31 native route does not cover:
+    /// BF16 attention into a workspace temporary, then the fixed-scale
+    /// quantizer. Byte-identical to the composed path by construction.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn mqa_fp8_falls_back_to_bf16_then_the_fixed_quantizer() {
+        use crate::kernels::contracts::{bf16_tensor, e4m3_tensor};
+        use crate::kernels::quantization::quantize_fixed_e4m3;
+
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        // 20 KV rows is not the MP31 native geometry, so both calls must take
+        // the BF16 substitute.
+        let (tokens, capacity, key_tokens) = (10usize, 20usize, 20usize);
+        let dims = [tokens, ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM];
+        let width = ASSEMBLY_HEADS * ASSEMBLY_HEAD_DIM;
+        let q = upload(
+            &ctx,
+            &values(tokens * width, 0x9e37_79b9),
+            Shape::new(dims.to_vec()),
+        );
+        let k = upload(
+            &ctx,
+            &values(capacity * ASSEMBLY_HEAD_DIM, 0x85eb_ca6b),
+            Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+        );
+        let v = upload(
+            &ctx,
+            &values(capacity * ASSEMBLY_HEAD_DIM, 0xc2b2_ae35),
+            Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+        );
+
+        let inverse_scale = 0.125f32;
+        let mut got = e4m3_tensor(&ctx, &dims).expect("e4m3 output");
+        mqa_fp8_into_with_workspace(
+            &ctx,
+            &q,
+            &k,
+            &v,
+            &mut got,
+            key_tokens,
+            inverse_scale,
+            TacticDispatch::AllowFallback,
+            usize::MAX,
+        )
+        .expect("the BF16 fallback");
+
+        let mut merged = bf16_tensor(&ctx, &dims).expect("bf16 output");
+        mqa_bf16_into_with_workspace(
+            &ctx,
+            &q,
+            &k,
+            &v,
+            &mut merged,
+            key_tokens,
+            TacticDispatch::AllowFallback,
+            usize::MAX,
+        )
+        .expect("bf16 mqa");
+        let mut expected = e4m3_tensor(&ctx, &dims).expect("e4m3 reference");
+        quantize_fixed_e4m3(&ctx, &merged, &mut expected, 1.0 / inverse_scale)
+            .expect("reference quantize");
+        ctx.stream().synchronize().expect("synchronise");
+
+        let bytes = |tensor: &Tensor| {
+            crate::transfers::to_cpu(tensor)
+                .expect("to_cpu")
+                .as_f8_e4m3()
+                .expect("e4m3")
+                .to_vec()
+        };
+        assert_eq!(bytes(&got), bytes(&expected));
+        assert!(
+            bytes(&got).iter().any(|&byte| byte != 0),
+            "the fallback wrote nothing"
+        );
+
+        let mut exact = e4m3_tensor(&ctx, &dims).expect("e4m3 exact");
+        let error = mqa_fp8_into_with_workspace(
+            &ctx,
+            &q,
+            &k,
+            &v,
+            &mut exact,
+            key_tokens,
+            inverse_scale,
+            TacticDispatch::RequireExact,
+            usize::MAX,
+        )
+        .expect_err("RequireExact must not take the BF16 substitute");
+        assert!(error.to_string().contains("MP31 native route"), "{error}");
+    }
 }
 
 /// The D256 fallback rule, without a device.
@@ -3172,5 +3304,17 @@ mod route_tests {
     #[test]
     fn allowing_fallback_accepts_the_mutlass_substitute() {
         assert!(require_mutlass_decode(20, 532, TacticDispatch::AllowFallback).is_ok());
+    }
+
+    #[test]
+    fn an_e4m3_output_is_refused_when_the_native_route_is_required() {
+        let error = require_fp8_native_route(TacticDispatch::RequireExact)
+            .expect_err("the BF16 substitute is not the MP31 native route");
+        assert!(error.to_string().contains("MP31 native route"), "{error}");
+    }
+
+    #[test]
+    fn an_e4m3_output_accepts_the_bf16_substitute_when_fallback_is_allowed() {
+        assert!(require_fp8_native_route(TacticDispatch::AllowFallback).is_ok());
     }
 }

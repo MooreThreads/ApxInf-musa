@@ -3397,6 +3397,9 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         };
         (query, key, value)
     };
+    // The packed projection is dead once q/k/v exist; releasing it now returns
+    // its pooled arena slice for the rest of the layer.
+    drop(packed);
     let attention =
         kernels::attention::causal_gqa_prefill_bf16(backend.context(), &query, &key, &value)?
             .ok_or_else(|| {

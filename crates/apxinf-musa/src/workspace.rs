@@ -98,6 +98,9 @@ impl GraphWorkspace {
                 "static inference workspace capacity must be non-zero".into(),
             ));
         }
+        // The pool allocates in 256-byte extents. Reserve the rounded size so a
+        // request whose aligned extent equals the capacity it was handed fits.
+        let capacity_bytes = align_extent_with_slack(capacity_bytes, 0)?;
         let storage = MusaBuffer::alloc(capacity_bytes, device).map_err(musa_error)?;
         let allocator = if pooled {
             Allocator::Pool {
@@ -1050,5 +1053,28 @@ mod tests {
                 Ok(())
             })
             .expect("traversal");
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn an_unaligned_capacity_admits_its_aligned_extent() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        for pooled in [true, false] {
+            // 1025 rounds to 1280; the request's aligned extent is 1280.
+            let workspace =
+                GraphWorkspace::new_with_allocator(1025, device, pooled).expect("workspace");
+            assert_eq!(workspace.capacity(), 1280);
+            workspace
+                .allocate(1025, device)
+                .expect("a request equal to the aligned capacity");
+            drop(workspace);
+
+            let workspace =
+                GraphWorkspace::new_with_allocator(1025, device, pooled).expect("workspace");
+            workspace
+                .allocate(1280, device)
+                .expect("the rounded capacity");
+        }
     }
 }
