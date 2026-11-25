@@ -3297,38 +3297,6 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         .transpose()?
     };
     let fused_qkv_name = format!("{prefix}.fused_qkv");
-    let (query, key, value) = if let (Some(fused), Some(input)) =
-        (linears.get(&fused_qkv_name), &shared_qkv_input)
-    {
-        // One wide GEMM replaces the three per-projection GEMMs. The three
-        // consumers read the same normalized input and share its activation
-        // scale (the calibration profile gives them identical amax), so the
-        // fused weight's group-max scale is the only change; the packed output
-        // is split in one launch, which is cheaper than three strided copies.
-        let packed = fused.forward_quantized_tensor(input, backend)?;
-        let kv_width = text.n_kv_heads * text.head_dim;
-        kernels::elementwise::split_qkv_uneven_bf16(
-            backend.context(),
-            &packed,
-            text.n_heads * text.head_dim,
-            kv_width,
-            kv_width,
-        )?
-    } else {
-        // BF16, or a calibration whose Q/K/V activation scales differ, so the
-        // shared quantized input the fused projection needs does not exist.
-        let normalized = normalized.as_ref().ok_or_else(|| {
-            Error::Other(format!("BF16 QKV input is unavailable for {prefix}"))
-        })?;
-        (
-            qwen_matmul(backend, linears, &query_name, normalized, &layer.wq)?,
-            qwen_matmul(backend, linears, &key_name, normalized, &layer.wk)?,
-            qwen_matmul(backend, linears, &value_name, normalized, &layer.wv)?,
-        )
-    };
-    let query = query.reshape(vec![sequence_len * text.n_heads, text.head_dim])?;
-    let key = key.reshape(vec![sequence_len * text.n_kv_heads, text.head_dim])?;
-    let value = value.reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
     let use_fused_qk_rms_mrope = use_fused_qk_rms_mrope
         && sequence_len > 128
         && sequence_len <= TEXT_MROPE_TABLE_CAPACITY_TOKENS
@@ -3336,48 +3304,102 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         && text.n_kv_heads == 8
         && text.head_dim == 128
         && rotation_table.is_some();
-    let (query, key) = if use_fused_qk_rms_mrope {
-        kernels::rope::rms_norm_apply_mrope_qk_precomputed(
+    let packed =
+        if let (Some(fused), Some(input)) = (linears.get(&fused_qkv_name), &shared_qkv_input) {
+            // One wide GEMM replaces the three per-projection GEMMs. The three
+            // consumers read the same normalized input and share its activation
+            // scale (the calibration profile gives them identical amax), so the
+            // fused weight's group-max scale is the only change; the packed output
+            // is split in one launch, which is cheaper than three strided copies.
+            Some(fused.forward_quantized_tensor(input, backend)?)
+        } else {
+            None
+        };
+    let (query, key, value) = if let (Some(packed), Some(table)) = (
+        packed.as_ref(),
+        rotation_table.filter(|_| use_fused_qk_rms_mrope),
+    ) {
+        let qkv = kernels::rope::packed_qkv_rms_mrope(
             backend.context(),
-            &query,
+            packed,
             &layer.q_norm_weight,
-            &key,
             &layer.k_norm_weight,
-            sequence_len,
-            text.n_heads,
-            text.n_kv_heads,
-            text.head_dim,
+            table,
             text.rms_norm_eps,
-            rotation_table.ok_or_else(|| {
-                Error::Other("GR00T fused Q/K mRoPE rotation table is unavailable".into())
-            })?,
-            128,
-        )?
+        )?;
+        (qkv.q, qkv.k, qkv.v)
     } else {
-        let query = rms_norm(backend, &query, &layer.q_norm_weight, text.rms_norm_eps)?
-            .reshape(vec![sequence_len, text.n_heads, text.head_dim])?;
-        let key = rms_norm(backend, &key, &layer.k_norm_weight, text.rms_norm_eps)?
-            .reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
-        let query = kernels::rope::apply_mrope(
-            backend.context(),
-            &query,
-            text.n_heads,
-            text.head_dim,
-            text.rope_theta,
-            text.mrope_section,
-            position_ids,
-        )?;
-        let key = kernels::rope::apply_mrope(
-            backend.context(),
-            &key,
-            text.n_kv_heads,
-            text.head_dim,
-            text.rope_theta,
-            text.mrope_section,
-            position_ids,
-        )?;
-        (query, key)
+        let (query, key, value) = if let Some(packed) = packed.as_ref() {
+            let kv_width = text.n_kv_heads * text.head_dim;
+            kernels::elementwise::split_qkv_uneven_bf16(
+                backend.context(),
+                packed,
+                text.n_heads * text.head_dim,
+                kv_width,
+                kv_width,
+            )?
+        } else {
+            // BF16, or a calibration whose Q/K/V activation scales differ, so the
+            // shared quantized input the fused projection needs does not exist.
+            let normalized = normalized.as_ref().ok_or_else(|| {
+                Error::Other(format!("BF16 QKV input is unavailable for {prefix}"))
+            })?;
+            (
+                qwen_matmul(backend, linears, &query_name, normalized, &layer.wq)?,
+                qwen_matmul(backend, linears, &key_name, normalized, &layer.wk)?,
+                qwen_matmul(backend, linears, &value_name, normalized, &layer.wv)?,
+            )
+        };
+        let query = query.reshape(vec![sequence_len * text.n_heads, text.head_dim])?;
+        let key = key.reshape(vec![sequence_len * text.n_kv_heads, text.head_dim])?;
+        let value = value.reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
+        let (query, key) = if use_fused_qk_rms_mrope {
+            kernels::rope::rms_norm_apply_mrope_qk_precomputed(
+                backend.context(),
+                &query,
+                &layer.q_norm_weight,
+                &key,
+                &layer.k_norm_weight,
+                sequence_len,
+                text.n_heads,
+                text.n_kv_heads,
+                text.head_dim,
+                text.rms_norm_eps,
+                rotation_table.ok_or_else(|| {
+                    Error::Other("GR00T fused Q/K mRoPE rotation table is unavailable".into())
+                })?,
+                128,
+            )?
+        } else {
+            let query = rms_norm(backend, &query, &layer.q_norm_weight, text.rms_norm_eps)?
+                .reshape(vec![sequence_len, text.n_heads, text.head_dim])?;
+            let key = rms_norm(backend, &key, &layer.k_norm_weight, text.rms_norm_eps)?
+                .reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
+            let query = kernels::rope::apply_mrope(
+                backend.context(),
+                &query,
+                text.n_heads,
+                text.head_dim,
+                text.rope_theta,
+                text.mrope_section,
+                position_ids,
+            )?;
+            let key = kernels::rope::apply_mrope(
+                backend.context(),
+                &key,
+                text.n_kv_heads,
+                text.head_dim,
+                text.rope_theta,
+                text.mrope_section,
+                position_ids,
+            )?;
+            (query, key)
+        };
+        (query, key, value)
     };
+    // The packed projection is dead once q/k/v exist; releasing it now returns
+    // its pooled arena slice for the rest of the layer.
+    drop(packed);
     let attention =
         kernels::attention::causal_gqa_prefill_bf16(backend.context(), &query, &key, &value)?
             .ok_or_else(|| {

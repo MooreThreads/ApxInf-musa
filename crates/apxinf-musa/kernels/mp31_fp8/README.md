@@ -97,3 +97,15 @@ poison, alpha/scale, shape-switch and 18000-replay test with:
 APXINF_MUSA_BENCH_DEVICE=5 cargo test --release -p apxinf-musa --lib \
   projection_norm_alpha_scales_poison_graph_and_shapes -- --ignored --nocapture
 ```
+
+### E4M3 action projection
+
+For the prepared E4M3 action O and down projections, each of the eight K
+partitions contains one or two 256-element tiles. A 128-thread SQMMA squad
+issues the activation and weight TME transfers up front using a completion
+barrier per tile. It writes the row-major FP32 partition buffer consumed by
+`partial_norm<8>`. BF16 inputs use the variant that quantizes activations during the load.
+The tile width and K depth are namespace constants (`kProjectionBn` /
+`kProjectionBk`); the adapter's dynamic shared memory is
+`projection_smem_bytes(Tiles)`, with `(16 + BN) * BK` per tile, so the schedule
+and the launch cannot drift.

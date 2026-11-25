@@ -31,6 +31,7 @@ extern "C" {
         partials: *mut f32,
         stats: *mut f32,
         output: *mut c_void,
+        inverse_output_scale: f32,
         stream: *mut c_void,
     ) -> musaError_t;
     #[cfg(apxinf_musa_mutlass_fmha)]
@@ -933,6 +934,20 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
+    /// Split a packed QKV projection, then fuse Q/K RMSNorm and multimodal
+    /// RoPE using a prepared FP32 table. V is copied through unchanged.
+    pub fn apxinf_musa_packed_qkv_rms_mrope(
+        packed: *const c_void,
+        q_weight: *const c_void,
+        k_weight: *const c_void,
+        rotations: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        tokens: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
     /// Fused Q/K RMSNorm and multimodal RoPE using a prepared FP32 table.
     pub fn apxinf_musa_qk_rms_norm_mrope_precomputed_bf16(
         query: *const c_void,

@@ -186,6 +186,14 @@ repeats warmup until tuning generation stabilizes; one invocation is not a
 universal readiness guarantee. Capture and eager call the same model semantics.
 Update captured input contents in place and replay through the prepared object.
 
+Workspace capacity is a plan-time decision, not a constant. A backend whose
+arena can reuse dropped slices (MUSA's `GraphWorkspace` pool) sizes it with a
+capacity ladder: try a small reservation, retry only on `workspace exhausted`,
+and capture on the session that succeeded; the eager prepared plan runs the
+same ladder because it retains its session. Synchronize and drop a failed
+attempt before the next rung so two arenas never coexist, and report the final
+capacity and attempt count.
+
 Preparation must exercise the real model computation. A method that only validates a
 configuration object is not execution preparation. If graph capture is
 unsupported for a required operation, record the exact operation and failure;

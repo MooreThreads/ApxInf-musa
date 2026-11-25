@@ -385,29 +385,40 @@ impl Pi05ModelRunner {
         token_ids: DeviceBuffer,
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
-        let session = ExecutionSession::with_capacity(
-            self.model.workspace_requirements(spec.token_count)?.bytes,
-            self.backend.device_id(),
+        let required = self.model.workspace_requirements(spec.token_count)?.bytes;
+        let (inputs, _session) = super::prepare::with_capacity_ladder(
+            &self.backend,
+            "eager",
+            required,
+            spec.token_count,
+            |session| {
+                // The caller's buffers are driver allocations; clone them so a
+                // failed rung leaves the next attempt whole.
+                let inputs = EagerInputs {
+                    patches: patches.clone(),
+                    raw_images: raw_images.clone(),
+                    noise: noise.clone(),
+                    token_ids: token_ids.clone(),
+                    session: session.clone(),
+                };
+                let output = ops::prepare_with_session(&inputs.session, || {
+                    eager_traversal(&self.model, spec, &inputs, || {
+                        self.model.infer(
+                            &inputs.patches,
+                            &inputs.token_ids,
+                            spec.token_count,
+                            &inputs.noise,
+                        )
+                    })
+                })?;
+                Ok((inputs, output))
+            },
+            |_session, (inputs, output)| {
+                backend::synchronize(&self.backend)?;
+                drop(output);
+                Ok(inputs)
+            },
         )?;
-        let inputs = EagerInputs {
-            patches,
-            raw_images,
-            noise,
-            token_ids,
-            session,
-        };
-        let output = ops::prepare_with_session(&inputs.session, || {
-            eager_traversal(&self.model, spec, &inputs, || {
-                self.model.infer(
-                    &inputs.patches,
-                    &inputs.token_ids,
-                    spec.token_count,
-                    &inputs.noise,
-                )
-            })
-        })?;
-        backend::synchronize(&self.backend)?;
-        drop(output);
         Ok(inputs)
     }
 

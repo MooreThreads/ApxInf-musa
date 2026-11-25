@@ -14,7 +14,9 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use apxinf_core::{Error, Result};
 
@@ -24,35 +26,156 @@ use crate::error::musa_error;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
+/// Prefix shared by every allocator exhaustion error.
+///
+/// The PI0.5 capacity ladder retries on this message, so the bump and pool
+/// allocators must produce the same text; [`is_workspace_exhaustion`] is the
+/// one place that recognizes it.
+pub const WORKSPACE_EXHAUSTED: &str = "static inference workspace exhausted";
+
+/// State of the pooled allocator.
+///
+/// A lease returns its extent when the last tensor reading the slice drops, so
+/// the offset no longer has to grow for the whole traversal. `generation` is
+/// what makes a lease from an earlier traversal inert: `reset` bumps it, and a
+/// stale drop only skips reinsertion.
+#[derive(Default)]
+struct WorkspaceState {
+    generation: u64,
+    active_allocations: usize,
+    live_requested_bytes: usize,
+    peak_requested_bytes: usize,
+    high_water_bytes: usize,
+    free_blocks: BTreeMap<usize, usize>,
+}
+
+/// One slice of the arena, returned to the free list when its last tensor drops.
+struct WorkspaceLease {
+    state: Arc<Mutex<WorkspaceState>>,
+    _storage: MusaBuffer,
+    start: usize,
+    extent: usize,
+    requested_bytes: usize,
+    generation: u64,
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        release_extent(
+            &mut state,
+            self.generation,
+            self.start,
+            self.extent,
+            self.requested_bytes,
+        );
+    }
+}
+
+enum Allocator {
+    /// The proven monotonic allocator: one offset, never reused.
+    Bump { offset: Cell<usize> },
+    /// Smallest-fitting free list; slices return when their tensors drop.
+    Pool { state: Arc<Mutex<WorkspaceState>> },
+}
+
 /// Persistent device arena used by a fixed-shape graph.
 pub struct GraphWorkspace {
     storage: MusaBuffer,
-    offset: Cell<usize>,
+    allocator: Allocator,
 }
 
 impl GraphWorkspace {
     pub fn new(capacity_bytes: usize, device: usize) -> Result<Self> {
+        Self::build(capacity_bytes, device, workspace_pool_enabled())
+    }
+
+    fn build(capacity_bytes: usize, device: usize, pooled: bool) -> Result<Self> {
         if capacity_bytes == 0 {
             return Err(Error::Other(
                 "static inference workspace capacity must be non-zero".into(),
             ));
         }
-        Ok(Self {
-            storage: MusaBuffer::alloc(capacity_bytes, device).map_err(musa_error)?,
-            offset: Cell::new(0),
-        })
+        // The pool allocates in 256-byte extents. Reserve the rounded size so a
+        // request whose aligned extent equals the capacity it was handed fits.
+        let capacity_bytes = align_extent_with_slack(capacity_bytes, 0)?;
+        let storage = MusaBuffer::alloc(capacity_bytes, device).map_err(musa_error)?;
+        let allocator = if pooled {
+            Allocator::Pool {
+                state: Arc::new(Mutex::new(WorkspaceState {
+                    free_blocks: BTreeMap::from([(0, capacity_bytes)]),
+                    ..WorkspaceState::default()
+                })),
+            }
+        } else {
+            Allocator::Bump {
+                offset: Cell::new(0),
+            }
+        };
+        Ok(Self { storage, allocator })
+    }
+
+    /// Test-only constructor that picks the allocator without the process-wide
+    /// `APXINF_MUSA_WORKSPACE_POOL` knob (which is read once).
+    #[cfg(test)]
+    fn new_with_allocator(capacity_bytes: usize, device: usize, pooled: bool) -> Result<Self> {
+        Self::build(capacity_bytes, device, pooled)
     }
 
     pub fn capacity(&self) -> usize {
         self.storage.len()
     }
 
+    /// Requested-byte high-water of the last traversal: the furthest byte any
+    /// slice asked for. It excludes the per-allocation alignment and slack, so
+    /// it is a usage diagnostic, not a reservation size; on the bump path it is
+    /// also the final offset.
     pub fn used(&self) -> usize {
-        self.offset.get()
+        match &self.allocator {
+            Allocator::Bump { offset } => offset.get(),
+            Allocator::Pool { state } => lock_state(state)
+                .map(|state| state.high_water_bytes)
+                .unwrap_or(0),
+        }
     }
 
-    fn reset(&self) {
-        self.offset.set(0);
+    /// Peak bytes live at one instant. Equal to `used()` on the bump path.
+    pub fn peak_used(&self) -> usize {
+        match &self.allocator {
+            Allocator::Bump { offset } => offset.get(),
+            Allocator::Pool { state } => lock_state(state)
+                .map(|state| state.peak_requested_bytes)
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn pooling(&self) -> bool {
+        matches!(self.allocator, Allocator::Pool { .. })
+    }
+
+    fn reset(&self) -> Result<()> {
+        match &self.allocator {
+            Allocator::Bump { offset } => {
+                offset.set(0);
+                Ok(())
+            }
+            Allocator::Pool { state } => {
+                let mut state = lock_state(state)?;
+                state.generation = state
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Other("workspace generation overflow".into()))?;
+                state.active_allocations = 0;
+                state.live_requested_bytes = 0;
+                state.peak_requested_bytes = 0;
+                state.high_water_bytes = 0;
+                state.free_blocks.clear();
+                state.free_blocks.insert(0, self.storage.len());
+                Ok(())
+            }
+        }
     }
 
     fn allocate(&self, bytes: usize, device: usize) -> Result<MusaBuffer> {
@@ -62,8 +185,14 @@ impl GraphWorkspace {
                 self.storage.device()
             )));
         }
-        let start = self
-            .offset
+        match &self.allocator {
+            Allocator::Bump { offset } => self.allocate_bump(offset, bytes),
+            Allocator::Pool { state } => self.allocate_pool(state, bytes),
+        }
+    }
+
+    fn allocate_bump(&self, offset: &Cell<usize>, bytes: usize) -> Result<MusaBuffer> {
+        let start = offset
             .get()
             .checked_add(WORKSPACE_ALIGNMENT - 1)
             .ok_or_else(|| Error::Other("static inference workspace offset overflow".into()))?
@@ -79,14 +208,147 @@ impl GraphWorkspace {
             .and_then(|value| value.checked_add(slack))
             .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
         if end > self.storage.len() {
-            return Err(Error::Other(format!(
-                "static inference workspace exhausted: need {end} bytes, capacity is {} bytes",
-                self.storage.len()
-            )));
+            return Err(exhaustion_error(end, self.storage.len()));
         }
-        self.offset.set(end);
+        offset.set(end);
         self.storage.view(start, bytes).map_err(musa_error)
     }
+
+    fn allocate_pool(
+        &self,
+        state: &Arc<Mutex<WorkspaceState>>,
+        bytes: usize,
+    ) -> Result<MusaBuffer> {
+        let extent = align_extent(bytes)?;
+        let mut guard = lock_state(state)?;
+        let start = take_free_block(&mut guard.free_blocks, extent)
+            .ok_or_else(|| exhaustion_error(extent, self.storage.len()))?;
+        guard.active_allocations = guard
+            .active_allocations
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("workspace active allocation overflow".into()))?;
+        guard.live_requested_bytes = guard
+            .live_requested_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Other("workspace live byte overflow".into()))?;
+        let allocation_end = start
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Other("workspace high-water overflow".into()))?;
+        guard.high_water_bytes = guard.high_water_bytes.max(allocation_end);
+        guard.peak_requested_bytes = guard.peak_requested_bytes.max(guard.live_requested_bytes);
+        let lease = Arc::new(WorkspaceLease {
+            state: Arc::clone(state),
+            _storage: self.storage.clone(),
+            start,
+            extent,
+            requested_bytes: bytes,
+            generation: guard.generation,
+        });
+        drop(guard);
+        self.storage
+            .view_with_owner(start, bytes, lease)
+            .map_err(musa_error)
+    }
+}
+
+fn lock_state(
+    state: &Arc<Mutex<WorkspaceState>>,
+) -> Result<std::sync::MutexGuard<'_, WorkspaceState>> {
+    state
+        .lock()
+        .map_err(|_| Error::Other("static inference workspace state mutex is poisoned".into()))
+}
+
+/// The requested extent rounded up to the arena alignment, slack included.
+fn align_extent(bytes: usize) -> Result<usize> {
+    align_extent_with_slack(bytes, workspace_slack())
+}
+
+fn align_extent_with_slack(bytes: usize, slack: usize) -> Result<usize> {
+    let requested = bytes
+        .checked_add(slack)
+        .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
+    if requested == 0 {
+        return Ok(0);
+    }
+    requested
+        .checked_add(WORKSPACE_ALIGNMENT - 1)
+        .map(|end| end & !(WORKSPACE_ALIGNMENT - 1))
+        .ok_or_else(|| Error::Other("static inference workspace extent overflow".into()))
+}
+
+/// Smallest block that fits, split so the remainder stays available.
+fn take_free_block(free_blocks: &mut BTreeMap<usize, usize>, extent: usize) -> Option<usize> {
+    let mut selected = None;
+    for (start, block_extent) in free_blocks.iter() {
+        if *block_extent >= extent
+            && selected.is_none_or(|(_, selected_extent)| *block_extent < selected_extent)
+        {
+            selected = Some((*start, *block_extent));
+        }
+    }
+    let (start, block_extent) = selected?;
+    free_blocks.remove(&start);
+    if block_extent > extent {
+        free_blocks.insert(start + extent, block_extent - extent);
+    }
+    Some(start)
+}
+
+fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
+    let mut merged = BTreeMap::new();
+    for (&start, &extent) in free_blocks.iter() {
+        if let Some((&last_start, &last_extent)) = merged.last_key_value() {
+            if last_start + last_extent == start {
+                *merged.get_mut(&last_start).expect("last key exists") = last_extent + extent;
+                continue;
+            }
+        }
+        merged.insert(start, extent);
+    }
+    *free_blocks = merged;
+}
+
+/// Return one extent, unless the traversal that allocated it has already ended.
+fn release_extent(
+    state: &mut WorkspaceState,
+    generation: u64,
+    start: usize,
+    extent: usize,
+    requested_bytes: usize,
+) {
+    if state.generation != generation || state.active_allocations == 0 {
+        return;
+    }
+    state.active_allocations -= 1;
+    state.live_requested_bytes = state.live_requested_bytes.saturating_sub(requested_bytes);
+    if extent != 0 {
+        state.free_blocks.entry(start).or_insert(extent);
+        merge_adjacent_free_blocks(&mut state.free_blocks);
+    }
+}
+
+/// The pooled allocator reuses slices whose tensors have dropped; `=0` restores
+/// the proven monotonic allocator without a rebuild.
+pub fn workspace_pool_enabled() -> bool {
+    static POOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        std::env::var("APXINF_MUSA_WORKSPACE_POOL")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Whether `error` is an allocator exhaustion error, the only failure the PI0.5
+/// capacity ladder retries.
+pub fn is_workspace_exhaustion(error: &Error) -> bool {
+    error.to_string().contains(WORKSPACE_EXHAUSTED)
+}
+
+fn exhaustion_error(need: usize, capacity: usize) -> Error {
+    Error::Other(format!(
+        "{WORKSPACE_EXHAUSTED}: need {need} bytes, capacity is {capacity} bytes"
+    ))
 }
 
 struct ExecutionSessionInner {
@@ -229,7 +491,7 @@ fn with_session_phase<T>(
         // the check would leave the *outer* traversal allocating from the
         // bottom of an arena it is already part-way through — two live outputs
         // aliasing one range, and nothing to say so.
-        session.inner.workspace.reset();
+        session.inner.workspace.reset()?;
         if prepare {
             session.inner.prepared_shapes.borrow_mut().clear();
         }
@@ -357,10 +619,12 @@ enum OutputFill {
 
 fn output_fill() -> OutputFill {
     static FILL: std::sync::OnceLock<OutputFill> = std::sync::OnceLock::new();
-    *FILL.get_or_init(|| match std::env::var("APXINF_MUSA_OUTPUT_FILL").as_deref() {
-        Ok("poison") => OutputFill::Poison,
-        _ => OutputFill::Dirty,
-    })
+    *FILL.get_or_init(
+        || match std::env::var("APXINF_MUSA_OUTPUT_FILL").as_deref() {
+            Ok("poison") => OutputFill::Poison,
+            _ => OutputFill::Dirty,
+        },
+    )
 }
 
 /// Session-aware allocation for direct-launch operators. During an execution
@@ -381,7 +645,9 @@ pub(crate) fn output_buffer(ctx: &MusaContext, bytes: usize) -> Result<MusaBuffe
                 }
             }
         } else {
-            unsafe { &*inner }.workspace.allocate(bytes, ctx.device_id())
+            unsafe { &*inner }
+                .workspace
+                .allocate(bytes, ctx.device_id())
         }
     })
 }
@@ -430,7 +696,10 @@ mod tests {
 
         let (used, message) = session
             .prepare(|| {
-                session.workspace().allocate(1024, device).expect("outer allocation");
+                session
+                    .workspace()
+                    .allocate(1024, device)
+                    .expect("outer allocation");
                 assert_eq!(session.workspace().used(), 1024);
 
                 let nested = session.run(|| Ok(()));
@@ -462,16 +731,8 @@ mod tests {
     fn a_shape_outside_the_prepare_traversal_is_refused() {
         let workspace = GraphWorkspace::new(1 << 20, 0).expect("host arena");
         let session = ExecutionSession::new(workspace);
-        let gemm = OperationShape::Gemm {
-            m: 8,
-            n: 32,
-            k: 16,
-        };
-        let narrower = OperationShape::Gemm {
-            m: 4,
-            n: 32,
-            k: 16,
-        };
+        let gemm = OperationShape::Gemm { m: 8, n: 32, k: 16 };
+        let narrower = OperationShape::Gemm { m: 4, n: 32, k: 16 };
         let attention = OperationShape::Attention {
             queries: 16,
             keys: 24,
@@ -545,7 +806,10 @@ mod tests {
             "only what was prepared under capture is kept, and only once"
         );
         assert!(Rc::ptr_eq(
-            &retained[0].clone().downcast::<u32>().expect("the retained u32"),
+            &retained[0]
+                .clone()
+                .downcast::<u32>()
+                .expect("the retained u32"),
             &inside
         ));
     }
@@ -562,7 +826,10 @@ mod tests {
             .prepare(|| ctx.allocate_output(shape.clone(), DType::BF16).map(|_| ()))
             .expect("a prepared traversal");
         let inside = session.workspace().used();
-        assert!(inside > 0, "the session must have taken arena for the output");
+        assert!(
+            inside > 0,
+            "the session must have taken arena for the output"
+        );
 
         ctx.allocate_output(shape, DType::BF16)
             .expect("an eager output");
@@ -572,5 +839,242 @@ mod tests {
             inside,
             "an allocation outside a session consumed session arena"
         );
+    }
+
+    #[test]
+    fn align_extent_rounds_up_including_slack() {
+        assert_eq!(align_extent_with_slack(0, 0).expect("zero"), 0);
+        assert_eq!(
+            align_extent_with_slack(1, 0).expect("one"),
+            WORKSPACE_ALIGNMENT
+        );
+        assert_eq!(
+            align_extent_with_slack(WORKSPACE_ALIGNMENT, 0).expect("aligned"),
+            WORKSPACE_ALIGNMENT
+        );
+        assert_eq!(
+            align_extent_with_slack(WORKSPACE_ALIGNMENT + 1, 0).expect("one past"),
+            2 * WORKSPACE_ALIGNMENT
+        );
+        assert_eq!(
+            align_extent_with_slack(1, WORKSPACE_ALIGNMENT).expect("slack"),
+            2 * WORKSPACE_ALIGNMENT,
+            "slack is part of the extent, not an afterthought"
+        );
+    }
+
+    #[test]
+    fn take_free_block_prefers_the_smallest_fit_and_splits() {
+        let mut blocks = BTreeMap::from([(0usize, 1024usize), (4096, 512)]);
+        assert_eq!(
+            take_free_block(&mut blocks, 256),
+            Some(4096),
+            "the 512-byte block is the smallest that fits"
+        );
+        assert_eq!(blocks.get(&4352), Some(&256), "the remainder stays free");
+        assert_eq!(take_free_block(&mut blocks, 2000), None);
+        assert_eq!(take_free_block(&mut blocks, 1024), Some(0));
+        assert_eq!(blocks.get(&1024), None, "an exact fit leaves no remainder");
+    }
+
+    #[test]
+    fn merge_adjacent_free_blocks_coalesces_on_both_sides() {
+        let mut blocks = BTreeMap::from([(0usize, 256usize), (256, 512), (768, 128), (1024, 64)]);
+        merge_adjacent_free_blocks(&mut blocks);
+        assert_eq!(
+            blocks,
+            BTreeMap::from([(0, 896), (1024, 64)]),
+            "0..256, 256..768 and 768..896 are one block; 1024 stays separate"
+        );
+        merge_adjacent_free_blocks(&mut blocks);
+        assert_eq!(
+            blocks,
+            BTreeMap::from([(0, 896), (1024, 64)]),
+            "a second pass is a no-op"
+        );
+    }
+
+    #[test]
+    fn release_extent_ignores_a_stale_generation() {
+        let mut state = WorkspaceState {
+            generation: 2,
+            active_allocations: 1,
+            live_requested_bytes: 100,
+            ..WorkspaceState::default()
+        };
+        release_extent(&mut state, 1, 0, 256, 100);
+        assert_eq!(
+            state.active_allocations, 1,
+            "a stale lease must not decrement"
+        );
+        assert!(state.free_blocks.is_empty(), "a stale lease must not free");
+        release_extent(&mut state, 2, 0, 256, 100);
+        assert_eq!(state.active_allocations, 0);
+        assert_eq!(state.live_requested_bytes, 0);
+        assert_eq!(state.free_blocks.get(&0), Some(&256));
+    }
+
+    #[test]
+    fn exhaustion_errors_are_recognized_by_the_ladder_predicate() {
+        let exhaustion = exhaustion_error(1024, 512);
+        assert!(is_workspace_exhaustion(&exhaustion));
+        assert!(
+            exhaustion.to_string().starts_with(WORKSPACE_EXHAUSTED),
+            "both allocators must share the ladder's prefix: {exhaustion}"
+        );
+        assert!(!is_workspace_exhaustion(&Error::Other(
+            "static inference workspace is on MUSA 1".into()
+        )));
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn a_dropped_lease_is_reused() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        let session = ExecutionSession::with_capacity(1 << 20, device).expect("session");
+        session
+            .prepare(|| {
+                let workspace = session.workspace();
+                assert!(workspace.pooling(), "the default allocator is pooled");
+                let first = workspace.allocate(1024, device).expect("first");
+                let first_pointer = first.address().ptr();
+                let mark = workspace.used();
+                drop(first);
+                let second = workspace.allocate(1024, device).expect("second");
+                assert_eq!(
+                    second.address().ptr(),
+                    first_pointer,
+                    "the dropped slice was not reused"
+                );
+                assert_eq!(workspace.used(), mark, "reuse moved the high-water mark");
+                Ok(())
+            })
+            .expect("traversal");
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn prepare_and_run_allocate_identical_addresses() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        let session = ExecutionSession::with_capacity(1 << 20, device).expect("session");
+
+        fn sequence(session: &ExecutionSession, device: usize) -> Result<(Vec<usize>, usize)> {
+            let workspace = session.workspace();
+            let first = workspace.allocate(1024, device)?;
+            let second = workspace.allocate(2048, device)?;
+            let mut addresses = vec![
+                first.address().ptr() as usize,
+                second.address().ptr() as usize,
+            ];
+            drop(first);
+            let third = workspace.allocate(512, device)?;
+            addresses.push(third.address().ptr() as usize);
+            drop((second, third));
+            Ok((addresses, workspace.used()))
+        }
+
+        let prepared = session
+            .prepare(|| sequence(&session, device))
+            .expect("prepare");
+        let replayed = session.run(|| sequence(&session, device)).expect("run");
+        assert_eq!(
+            prepared, replayed,
+            "prepare and run allocated different addresses"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn a_stale_lease_after_reset_is_inert() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        let session = ExecutionSession::with_capacity(1 << 20, device).expect("session");
+        let held = session
+            .prepare(|| session.workspace().allocate(1024, device))
+            .expect("the first traversal");
+        // The stale extent must stay out of the new free list: if it were
+        // reinserted, the arena would be split and this whole-capacity
+        // allocation would have to fail.
+        session
+            .prepare(|| {
+                drop(held);
+                session.workspace().allocate(1 << 20, device).map(|_| ())
+            })
+            .expect("the stale lease must not fragment the pool");
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn exhaustion_names_the_workspace() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        let session = ExecutionSession::with_capacity(1 << 20, device).expect("session");
+        let error = session
+            .prepare(|| {
+                let whole = session.workspace().allocate(1 << 20, device)?;
+                drop(whole); // Return it, then ask for one byte more than exists.
+                session
+                    .workspace()
+                    .allocate((1 << 20) + 1, device)
+                    .map(|_| ())
+            })
+            .expect_err("an over-capacity allocation must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("static inference workspace exhausted"),
+            "unhelpful refusal: {error}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn the_bump_path_never_reuses_a_dropped_slice() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        let workspace =
+            GraphWorkspace::new_with_allocator(1 << 20, device, false).expect("workspace");
+        let session = ExecutionSession::new(workspace);
+        session
+            .prepare(|| {
+                let workspace = session.workspace();
+                assert!(!workspace.pooling());
+                let first = workspace.allocate(1024, device).expect("first");
+                let first_pointer = first.address().ptr();
+                drop(first);
+                let second = workspace.allocate(1024, device).expect("second");
+                assert_ne!(
+                    second.address().ptr(),
+                    first_pointer,
+                    "the bump path reused a dropped slice"
+                );
+                Ok(())
+            })
+            .expect("traversal");
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn an_unaligned_capacity_admits_its_aligned_extent() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let device = ctx.device_id();
+        for pooled in [true, false] {
+            // 1025 rounds to 1280; the request's aligned extent is 1280.
+            let workspace =
+                GraphWorkspace::new_with_allocator(1025, device, pooled).expect("workspace");
+            assert_eq!(workspace.capacity(), 1280);
+            workspace
+                .allocate(1025, device)
+                .expect("a request equal to the aligned capacity");
+            drop(workspace);
+
+            let workspace =
+                GraphWorkspace::new_with_allocator(1025, device, pooled).expect("workspace");
+            workspace
+                .allocate(1280, device)
+                .expect("the rounded capacity");
+        }
     }
 }

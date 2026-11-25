@@ -786,6 +786,62 @@ pub fn rms_norm_apply_mrope_qk_precomputed(
     }
 }
 
+/// Split the packed 16:8:8 text projection while normalizing and rotating Q/K.
+pub fn packed_qkv_rms_mrope(
+    ctx: &MusaContext,
+    packed: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    rotations: &MusaBuffer,
+    eps: f32,
+) -> Result<QkvTensors> {
+    let tokens = require_packed_qkv(ctx, packed, None, 16, 8, 128)?;
+    require_positive_eps(eps, "packed QKV mRoPE")?;
+    require_vector_bf16(ctx, q_weight, 128, "packed QKV mRoPE", "query weight")?;
+    require_vector_bf16(ctx, k_weight, 128, "packed QKV mRoPE", "key weight")?;
+    if tokens == 0
+        || tokens > 256
+        || rotations.device() != ctx.device_id()
+        || rotations.len() < tokens * 128 * std::mem::size_of::<f32>()
+    {
+        return Err(Error::Other(
+            "MUSA packed QKV mRoPE rotation table or length mismatch".into(),
+        ));
+    }
+    let out = QkvTensors {
+        q: bf16_tensor(ctx, &[tokens, 16, 128])?,
+        k: bf16_tensor(ctx, &[tokens, 8, 128])?,
+        v: bf16_tensor(ctx, &[tokens, 8, 128])?,
+    };
+    #[cfg(apxinf_musa_available)]
+    {
+        // SAFETY: packed row width, device, table extent and destinations match the kernel.
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_packed_qkv_rms_mrope(
+                    tensor_ptr(packed)?,
+                    tensor_ptr(q_weight)?,
+                    tensor_ptr(k_weight)?,
+                    rotations.address().ptr(),
+                    tensor_ptr(&out.q)?,
+                    tensor_ptr(&out.k)?,
+                    tensor_ptr(&out.v)?,
+                    tokens as i32,
+                    eps,
+                    ctx.stream().handle(),
+                ),
+                "packed QKV mRoPE",
+            )?;
+        }
+        Ok(out)
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = out;
+        Err(native_unavailable("rope::packed_qkv_rms_mrope"))
+    }
+}
+
 #[cfg(all(test, apxinf_musa_available))]
 mod tests {
     //! Device test for the rotary position embedding.
@@ -1086,5 +1142,53 @@ mod tests {
         let got = read_back(&output);
         let expected: Vec<f32> = input_values.iter().map(|value| rounded(*value)).collect();
         assert_tight("mRoPE at zero positions", &got, &expected);
+    }
+
+    #[test]
+    #[ignore = "requires a MUSA device"]
+    fn packed_qkv_rms_mrope_matches_split() {
+        let device = std::env::var("APXINF_MUSA_BENCH_DEVICE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let ctx = MusaContext::new(device).unwrap();
+        let qw = upload(&ctx, &values(128, 1001), Shape::new(vec![128]));
+        let kw = upload(&ctx, &values(128, 1002), Shape::new(vec![128]));
+        for tokens in [1, 17, 145, 256] {
+            let packed = upload(
+                &ctx,
+                &values(tokens * 4096, 1003),
+                Shape::new(vec![tokens, 4096]),
+            );
+            let table = MusaBuffer::alloc(tokens * 128 * 4, ctx.device_id()).unwrap();
+            let bytes: Vec<u8> = values(tokens * 128, 1004)
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect();
+            table.copy_from_host(&bytes).unwrap();
+            let (q, k, v) =
+                crate::kernels::elementwise::split_qkv_uneven_bf16(&ctx, &packed, 2048, 1024, 1024)
+                    .unwrap();
+            let (qr, kr) = super::rms_norm_apply_mrope_qk_precomputed(
+                &ctx,
+                &q.reshape(vec![tokens * 16, 128]).unwrap(),
+                &qw,
+                &k.reshape(vec![tokens * 8, 128]).unwrap(),
+                &kw,
+                tokens,
+                16,
+                8,
+                128,
+                1e-5,
+                &table,
+                128,
+            )
+            .unwrap();
+            let actual =
+                super::packed_qkv_rms_mrope(&ctx, &packed, &qw, &kw, &table, 1e-5).unwrap();
+            assert_eq!(read_back(&actual.q), read_back(&qr));
+            assert_eq!(read_back(&actual.k), read_back(&kr));
+            assert_eq!(read_back(&actual.v), read_back(&v));
+        }
     }
 }

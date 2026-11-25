@@ -284,6 +284,27 @@ pub fn gemm_bias_residual(ctx: &MusaContext, args: GemmBiasResidualArgs<'_>) -> 
         )));
     }
     require_unit_output_scale("gemm_bias_residual", args.gemm.output_scale)?;
+    // The static-FP8 route has a vendor epilogue that adds bias and residual in
+    // f32 behind the GEMM (one BF16 rounding) instead of writing a BF16 scratch
+    // and launching the composed producer. On the vision fc2 shape it measured
+    // 2.7 us cheaper than the pair, and it is the same epilogue GR00T's
+    // projections already use. A bias-less site keeps the composed producer:
+    // the vendor epilogue has no null-bias form.
+    if matches!(args.gemm.quantization, GemmQuantization::Fp8UnitScale) {
+        if let Some(bias) = args.bias {
+            let _ = args.gemm.policy.admit("gemm_bias_residual", 0)?;
+            return gemm_kernels::gemm_fp8_bias_residual_into(
+                ctx,
+                args.gemm.a,
+                args.gemm.b,
+                args.gemm.out,
+                bias,
+                args.residual,
+                args.gemm.alpha,
+                "gemm_bias_residual",
+            );
+        }
+    }
     let mut scratch = ctx.allocate_output(args.gemm.out.shape().clone(), DType::BF16)?;
     gemm_into_scratch(ctx, &args.gemm, &mut scratch)?;
     super::norm::bias_residual(

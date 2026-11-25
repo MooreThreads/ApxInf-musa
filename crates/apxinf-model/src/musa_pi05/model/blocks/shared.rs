@@ -81,6 +81,45 @@ pub(super) fn mqa_bf16(
     value: &Tensor,
     key_tokens: usize,
 ) -> Result<Tensor> {
+    mqa(ctx, policy, query, key, value, key_tokens, DType::BF16, 1.0)
+}
+
+/// Quantized twin of [`mqa_bf16`]: the decoded row is written as E4M3 through
+/// the static quantizer the following projection would apply to it, so that
+/// projection reads FP8 directly instead of re-quantizing a BF16 copy. The
+/// bytes are identical to the composed pair.
+pub(super) fn mqa_fp8(
+    ctx: &Context,
+    policy: &AttentionPolicy,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    key_tokens: usize,
+    output_scale: f32,
+) -> Result<Tensor> {
+    mqa(
+        ctx,
+        policy,
+        query,
+        key,
+        value,
+        key_tokens,
+        DType::F8E4M3,
+        output_scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mqa(
+    ctx: &Context,
+    policy: &AttentionPolicy,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    key_tokens: usize,
+    out_dtype: DType,
+    output_scale: f32,
+) -> Result<Tensor> {
     let q = query.shape().dims();
     let k = key.shape().dims();
     if query.dtype() != DType::BF16
@@ -118,8 +157,11 @@ pub(super) fn mqa_bf16(
         })
         .map_err(Error::Other)?;
     let query4 = query.reshape(Shape::new(vec![1, q[0], q[1], q[2]]))?;
-    let mut output = ctx.allocate_output(query4.shape().clone(), DType::BF16)?;
+    let mut output = ctx.allocate_output(query4.shape().clone(), out_dtype)?;
     let mut args = AttentionArgs::new(&query4, &key, &value, &mut output);
+    // The E4M3 path carries the following projection's real input scale; the
+    // BF16 path keeps the unit-scale contract.
+    args.output_scale = output_scale;
     args.policy = policy.clone();
     attention(ctx, args)?;
     output.reshape(query.shape().clone())

@@ -12,7 +12,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
-use memmap2::Mmap;
 use serde::Deserialize;
 
 use bytemuck;
@@ -199,88 +198,318 @@ pub fn load_native_sharded(
     Ok((tensors, metadata))
 }
 
-fn load_impl(
-    path: &Path,
-    upcast_bf16: bool,
-) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
-    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("mmap failed: {e}"))? };
+/// One shard's open file; tensor bytes are read on demand.
+struct ReaderShard {
+    file: File,
+}
 
-    if mmap.len() < 8 {
+/// A tensor's header entry, resolved to an absolute range in its shard.
+struct ReaderEntry {
+    shard: usize,
+    abs_start: usize,
+    len: usize,
+    dtype: DType,
+    shape: Vec<usize>,
+}
+
+/// A checkpoint read one tensor at a time.
+///
+/// `open` reads only headers; `take` reads the named tensor's bytes with
+/// `read_exact_at`, so a caller that consumes tensors as it builds device state
+/// never materialises the whole checkpoint. This is the streaming counterpart
+/// of [`load_native_path`], and it preserves the same sharded-index validation,
+/// duplicate/missing checks, unsafe-path rejection and metadata union.
+///
+/// `take` uses `std::os::unix::fs::FileExt::read_exact_at`, so streaming
+/// requires a Unix target.
+pub struct CheckpointReader {
+    shards: Vec<ReaderShard>,
+    entries: HashMap<String, ReaderEntry>,
+    metadata: HashMap<String, String>,
+    files: Vec<PathBuf>,
+}
+
+impl CheckpointReader {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let resolved = resolve_checkpoint(path)?;
+        let mut reader = Self {
+            shards: Vec::new(),
+            entries: HashMap::new(),
+            metadata: HashMap::new(),
+            files: Vec::new(),
+        };
+        if is_index(&resolved) {
+            let (index, shards) = read_index(&resolved)?;
+            let parent = resolved.parent().unwrap_or_else(|| Path::new("."));
+            for shard_name in shards {
+                let shard_path = parent.join(&shard_name);
+                let (file, header) = parse_shard_header(&shard_path)?;
+                let shard_index = reader.shards.len();
+                reader.shards.push(ReaderShard { file });
+                reader.files.push(shard_path);
+                reader.metadata.extend(header.metadata);
+                for (name, range) in header.entries {
+                    let Some(expected) = index.weight_map.get(&name) else {
+                        continue;
+                    };
+                    if expected != &shard_name {
+                        return Err(format!(
+                            "tensor `{name}` was found in `{shard_name}`, index assigns it to `{expected}`"
+                        ));
+                    }
+                    if reader
+                        .entries
+                        .insert(
+                            name.clone(),
+                            ReaderEntry {
+                                shard: shard_index,
+                                abs_start: range.abs_start,
+                                len: range.len,
+                                dtype: range.dtype,
+                                shape: range.shape,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(format!("duplicate indexed tensor `{name}`"));
+                    }
+                }
+            }
+            let missing = index
+                .weight_map
+                .keys()
+                .filter(|name| !reader.entries.contains_key(*name))
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "SafeTensors shards are missing indexed tensors: {}",
+                    missing.join(", ")
+                ));
+            }
+        } else {
+            let (file, header) = parse_shard_header(&resolved)?;
+            reader.shards.push(ReaderShard { file });
+            reader.files.push(resolved.clone());
+            reader.metadata.extend(header.metadata);
+            for (name, range) in header.entries {
+                reader.entries.insert(
+                    name,
+                    ReaderEntry {
+                        shard: 0,
+                        abs_start: range.abs_start,
+                        len: range.len,
+                        dtype: range.dtype,
+                        shape: range.shape,
+                    },
+                );
+            }
+        }
+        Ok(reader)
+    }
+
+    /// Tensor names in the header, excluding `__metadata__` and consumed keys.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// Read one tensor, removing it from the reader. `Ok(None)` when the name is
+    /// absent or was already taken, matching a map's `remove` semantics.
+    pub fn take(&mut self, name: &str) -> Result<Option<Tensor>, String> {
+        use std::os::unix::fs::FileExt;
+
+        let Some(entry) = self.entries.remove(name) else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0u8; entry.len];
+        self.shards[entry.shard]
+            .file
+            .read_exact_at(&mut bytes, entry.abs_start as u64)
+            .map_err(|e| format!("failed to read tensor '{name}': {e}"))?;
+        let tensor = Tensor::from_raw(Shape::from(entry.shape), entry.dtype, Device::Cpu, bytes)
+            .map_err(|e| format!("tensor '{name}' construction error: {e}"))?;
+        Ok(Some(tensor))
+    }
+
+}
+
+/// One tensor's validated absolute range in its shard.
+struct TensorRange {
+    dtype: DType,
+    shape: Vec<usize>,
+    abs_start: usize,
+    len: usize,
+}
+
+/// One shard's parsed header: tensor ranges and the `__metadata__` entries.
+struct ShardHeader {
+    entries: Vec<(String, TensorRange)>,
+    metadata: HashMap<String, String>,
+}
+
+/// Open one shard, parse its header and validate every entry's file range.
+///
+/// `CheckpointReader::open` and `load_impl` both call this, so a streaming
+/// reader and a whole-file load produce the same error for the same malformed
+/// header. The returned file is read with absolute offsets by the caller.
+fn parse_shard_header(path: &Path) -> Result<(File, ShardHeader), String> {
+    use std::os::unix::fs::FileExt;
+
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len(),
+    )
+    .map_err(|_| "SafeTensors file is larger than this platform's address space".to_string())?;
+    if file_len < 8 {
         return Err("file too small to be a SafeTensors file".into());
     }
 
-    // Read 8-byte LE header length
-    let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-
-    if mmap.len() < 8 + header_len {
+    let mut length_bytes = [0u8; 8];
+    file.read_exact_at(&mut length_bytes, 0)
+        .map_err(|e| format!("failed to read header length: {e}"))?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    let data_start_u64 = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| format!("header length {header_len} overflows the file offset range"))?;
+    if (file_len as u64) < data_start_u64 {
         return Err(format!(
             "file too small: expected at least {} bytes, got {}",
-            8 + header_len,
-            mmap.len()
+            data_start_u64, file_len
         ));
     }
+    let data_start = usize::try_from(data_start_u64)
+        .map_err(|_| format!("header length {header_len} is too large for this platform"))?;
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| format!("header length {header_len} is too large for this platform"))?;
 
-    // Parse JSON header
-    let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact_at(&mut header_bytes, 8)
+        .map_err(|e| format!("failed to read header: {e}"))?;
+    let header_json = std::str::from_utf8(&header_bytes)
         .map_err(|e| format!("invalid UTF-8 in header: {e}"))?;
-
     let raw: HashMap<String, serde_json::Value> =
         serde_json::from_str(header_json).map_err(|e| format!("JSON parse error: {e}"))?;
 
-    // Extract metadata (optional __metadata__ key)
     let mut metadata = HashMap::new();
     if let Some(serde_json::Value::Object(meta)) = raw.get("__metadata__") {
-        for (k, v) in meta {
-            if let Some(s) = v.as_str() {
-                metadata.insert(k.clone(), s.to_string());
+        for (key, value) in meta {
+            if let Some(text) = value.as_str() {
+                metadata.insert(key.clone(), text.to_string());
             }
         }
     }
 
-    // Data section starts after the 8-byte length + header
-    let data_start = 8 + header_len;
-
-    let mut tensors = HashMap::new();
-
+    let mut entries = Vec::new();
     for (name, value) in &raw {
         if name == "__metadata__" {
             continue;
         }
-
         let info: TensorInfo = serde_json::from_value(value.clone())
             .map_err(|e| format!("failed to parse tensor '{name}': {e}"))?;
-
         let dtype = parse_dtype(&info.dtype)
             .ok_or_else(|| format!("unsupported dtype '{}' for tensor '{name}'", info.dtype))?;
-
         let [start, end] = info.data_offsets;
-        let abs_start = data_start + start;
-        let abs_end = data_start + end;
-
-        if abs_end > mmap.len() {
+        if start > end {
             return Err(format!(
-                "tensor '{name}': data_offsets [{start}, {end}] exceed file size {}",
-                mmap.len()
+                "tensor '{name}': data_offsets [{start}, {end}] start exceeds end"
             ));
         }
+        let abs_start = data_start.checked_add(start).ok_or_else(|| {
+            format!("tensor '{name}': data_offsets [{start}, {end}] overflow the file offset range")
+        })?;
+        let abs_end = data_start.checked_add(end).ok_or_else(|| {
+            format!("tensor '{name}': data_offsets [{start}, {end}] overflow the file offset range")
+        })?;
+        if abs_end > file_len {
+            return Err(format!(
+                "tensor '{name}': data_offsets [{start}, {end}] exceed file size {file_len}"
+            ));
+        }
+        // SafeTensors packs the data buffer densely: one entry's byte range is
+        // exactly the dtype extent times the element count. Check it here,
+        // before any byte is read, so the whole-file and streaming readers
+        // reject a truncated or padded range with the same error. Fold with
+        // checked arithmetic; `Shape::numel()` uses `product()`, which wraps in
+        // release builds.
+        let expected = info
+            .shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |bytes, dimension| {
+                bytes.checked_mul(*dimension)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "tensor '{name}': shape {:?} overflows its byte size",
+                    info.shape
+                )
+            })?;
+        let len = abs_end - abs_start;
+        if len != expected {
+            return Err(format!(
+                "tensor '{name}': data_offsets [{start}, {end}] span {len} bytes, but {} {:?} \
+                 needs {expected} bytes",
+                info.dtype, info.shape
+            ));
+        }
+        entries.push((
+            name.clone(),
+            TensorRange {
+                dtype,
+                shape: info.shape,
+                abs_start,
+                len,
+            },
+        ));
+    }
+    Ok((file, ShardHeader { entries, metadata }))
+}
 
-        let bytes = mmap[abs_start..abs_end].to_vec();
-        let shape = Shape::from(info.shape);
+fn load_impl(
+    path: &Path,
+    upcast_bf16: bool,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
+    use std::os::unix::fs::FileExt;
+
+    // Read each tensor instead of mapping the file: a mapping keeps the whole
+    // checkpoint resident while every tensor is copied to the heap, so the load
+    // peaks at roughly twice the checkpoint size instead of once.
+    let (file, ShardHeader { entries, metadata }) = parse_shard_header(path)?;
+    let mut tensors = HashMap::new();
+
+    for (name, range) in entries {
+        let mut bytes = vec![0u8; range.len];
+        file.read_exact_at(&mut bytes, range.abs_start as u64)
+            .map_err(|e| format!("failed to read tensor '{name}': {e}"))?;
+        let shape = Shape::from(range.shape);
 
         // BF16: upcast to F32 for the legacy path, or keep native for bf16 CUDA.
-        let tensor = if dtype == DType::BF16 && upcast_bf16 {
+        let tensor = if range.dtype == DType::BF16 && upcast_bf16 {
             let bf16_bytes: &[u8] = &bytes;
             let bf16_data: &[half::bf16] = bytemuck::cast_slice(bf16_bytes);
             let f32_data: Vec<f32> = bf16_data.iter().map(|b| b.to_f32()).collect();
             Tensor::from_f32(shape.dims().to_vec(), &f32_data)
                 .map_err(|e| format!("tensor '{name}' bf16->f32 conversion error: {e}"))?
         } else {
-            Tensor::from_raw(shape, dtype, Device::Cpu, bytes)
+            Tensor::from_raw(shape, range.dtype, Device::Cpu, bytes)
                 .map_err(|e| format!("tensor '{name}' construction error: {e}"))?
         };
 
-        tensors.insert(name.clone(), tensor);
+        tensors.insert(name, tensor);
     }
 
     Ok((tensors, metadata))
@@ -358,6 +587,13 @@ mod tests {
 
     /// Build a minimal SafeTensors file in memory.
     fn make_safetensors(tensors: &[(&str, DType, &[usize], &[u8])]) -> Vec<u8> {
+        make_safetensors_with_metadata(tensors, &[])
+    }
+
+    fn make_safetensors_with_metadata(
+        tensors: &[(&str, DType, &[usize], &[u8])],
+        metadata: &[(&str, &str)],
+    ) -> Vec<u8> {
         // Build JSON header
         let mut data_offset = 0usize;
         let mut tensor_entries = Vec::new();
@@ -382,6 +618,13 @@ mod tests {
             data_offset = end;
         }
 
+        if !metadata.is_empty() {
+            let entries = metadata
+                .iter()
+                .map(|(key, value)| format!(r#""{key}": "{value}""#))
+                .collect::<Vec<_>>();
+            tensor_entries.push(format!(r#""__metadata__": {{{}}}"#, entries.join(", ")));
+        }
         let header_json = format!("{{{}}}", tensor_entries.join(", "));
         let header_bytes = header_json.as_bytes();
         let header_len = header_bytes.len() as u64;
@@ -392,6 +635,15 @@ mod tests {
         for (_, _, _, data) in tensors {
             out.extend_from_slice(data);
         }
+        out
+    }
+
+    /// Build a file whose header is written verbatim, so a test can produce
+    /// offsets that the normal fixture would never emit.
+    fn make_safetensors_with_raw_header(header_json: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = (header_json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header_json.as_bytes());
+        out.extend_from_slice(data);
         out
     }
 
@@ -576,5 +828,258 @@ mod tests {
                 .unwrap_err()
                 .contains("unsafe shard path"));
         }
+    }
+
+    fn assert_same_bytes(left: &Tensor, right: &Tensor) {
+        assert_eq!(left.dtype(), right.dtype());
+        assert_eq!(left.shape().dims(), right.shape().dims());
+        match left.dtype() {
+            DType::F32 => assert_eq!(
+                left.as_f32().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                right.as_f32().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            ),
+            DType::BF16 => assert_eq!(
+                left.as_bf16().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                right.as_bf16().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            ),
+            DType::F16 => assert_eq!(
+                left.as_f16().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                right.as_f16().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            ),
+            other => panic!("fixture does not compare dtype {other}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_reader_matches_the_whole_file_load() {
+        let f32_data = vec![1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|x: &f32| x.to_le_bytes())
+            .collect::<Vec<_>>();
+        let bf16_data = vec![half::bf16::from_f32(1.5), half::bf16::from_f32(-2.25)]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<_>>();
+        let file_bytes = make_safetensors_with_metadata(
+            &[
+                ("weight", DType::F32, &[2, 2], &f32_data),
+                ("scale", DType::BF16, &[2], &bf16_data),
+            ],
+            &[("format", "pt")],
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&file_bytes).unwrap();
+
+        let (expected, expected_metadata) = load_native_path(tmp.path()).unwrap();
+        let mut reader = CheckpointReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.metadata(), &expected_metadata);
+        assert_eq!(reader.files(), [tmp.path().to_path_buf()]);
+        let mut keys = reader.keys().collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["scale", "weight"]);
+
+        for name in ["weight", "scale"] {
+            assert!(reader.contains(name));
+            let tensor = reader.take(name).unwrap().expect("tensor present");
+            assert_same_bytes(&tensor, &expected[name]);
+            assert!(!reader.contains(name), "{name} was consumed");
+            assert!(reader.take(name).unwrap().is_none(), "{name} is take-once");
+        }
+    }
+
+    #[test]
+    fn checkpoint_reader_reads_a_sharded_index_one_tensor_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let a_data = [half::f16::from_f32(1.5)]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let b_data = [half::f16::from_f32(-2.0)]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let first = directory.path().join("model-00001-of-00002.safetensors");
+        let second = directory.path().join("model-00002-of-00002.safetensors");
+        std::fs::write(
+            &first,
+            make_safetensors_with_metadata(&[("a", DType::F16, &[1], &a_data)], &[("shard", "1")]),
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            make_safetensors_with_metadata(&[("b", DType::F16, &[1], &b_data)], &[("shard", "2")]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        // The reader resolves the directory, reports the shard files in index
+        // order, unions their metadata, and yields bytes identical to a load
+        // that materialises every shard.
+        let (expected, expected_metadata) = load_native_path(directory.path()).unwrap();
+        let mut reader = CheckpointReader::open(directory.path()).unwrap();
+        assert_eq!(reader.files(), [first, second]);
+        assert_eq!(reader.metadata(), &expected_metadata);
+        let mut keys = reader.keys().collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "b"]);
+        for name in ["a", "b"] {
+            let tensor = reader.take(name).unwrap().expect("tensor present");
+            assert_same_bytes(&tensor, &expected[name]);
+        }
+        assert!(reader.keys().next().is_none());
+    }
+
+    #[test]
+    fn checkpoint_reader_rejects_a_tensor_in_the_wrong_shard() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = [half::f16::from_f32(1.0)]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            directory.path().join("one.safetensors"),
+            make_safetensors(&[
+                ("a", DType::F16, &[1], &data),
+                ("c", DType::F16, &[1], &data),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("two.safetensors"),
+            make_safetensors(&[("b", DType::F16, &[1], &data)]),
+        )
+        .unwrap();
+        // Both shards are indexed (so the reader opens both), but `a` lives in
+        // the shard the index does not assign it to.
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"two.safetensors","b":"two.safetensors","c":"one.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = CheckpointReader::open(directory.path())
+            .err()
+            .expect("a tensor in the wrong shard must be rejected");
+        assert!(error.contains("index assigns it to"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_reader_reports_missing_indexed_tensors() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = [half::f16::from_f32(1.0)]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            directory.path().join("one.safetensors"),
+            make_safetensors(&[("a", DType::F16, &[1], &data)]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"one.safetensors","absent":"one.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = CheckpointReader::open(directory.path())
+            .err()
+            .expect("an index naming an absent tensor must be rejected");
+        assert!(error.contains("missing indexed tensors"), "{error}");
+        assert!(error.contains("absent"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_reader_rejects_unsafe_shard_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = CheckpointReader::open(directory.path())
+            .err()
+            .expect("an unsafe shard path must be rejected");
+        assert!(error.contains("unsafe shard path"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_reversed_data_offsets() {
+        let bytes = make_safetensors_with_raw_header(
+            r#"{"x": {"dtype": "F32", "shape": [1], "data_offsets": [4, 0]}}"#,
+            &[0u8; 4],
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(load_error.contains("data_offsets [4, 0]"), "{load_error}");
+        assert!(load_error.contains("start exceeds end"), "{load_error}");
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("a reversed range must be rejected");
+        assert_eq!(reader_error, load_error);
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_a_range_that_is_not_the_dtype_extent() {
+        for (header, body) in [
+            // F32 [2] needs 8 bytes; this range is truncated.
+            (
+                r#"{"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}}"#,
+                vec![0u8; 4],
+            ),
+            // The same tensor with four bytes too many.
+            (
+                r#"{"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 12]}}"#,
+                vec![0u8; 12],
+            ),
+        ] {
+            let bytes = make_safetensors_with_raw_header(header, &body);
+            let mut tmp = NamedTempFile::new().unwrap();
+            tmp.write_all(&bytes).unwrap();
+
+            let load_error = load(tmp.path()).unwrap_err();
+            assert!(load_error.contains("needs 8 bytes"), "{load_error}");
+            let reader_error = CheckpointReader::open(tmp.path())
+                .err()
+                .expect("a range that is not the dtype extent must be rejected");
+            assert_eq!(reader_error, load_error);
+        }
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_data_offsets_that_overflow() {
+        let header = format!(
+            r#"{{"x": {{"dtype": "F32", "shape": [1], "data_offsets": [1, {}]}}}}"#,
+            usize::MAX
+        );
+        let bytes = make_safetensors_with_raw_header(&header, &[0u8; 4]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(
+            load_error.contains("overflow the file offset range"),
+            "{load_error}"
+        );
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("an overflowing range must be rejected");
+        assert_eq!(reader_error, load_error);
+    }
+
+    #[test]
+    fn checkpoint_reader_and_load_reject_an_overflowing_header_length() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&u64::MAX.to_le_bytes()).unwrap();
+
+        let load_error = load(tmp.path()).unwrap_err();
+        assert!(load_error.contains("header length"), "{load_error}");
+        let reader_error = CheckpointReader::open(tmp.path())
+            .err()
+            .expect("an overflowing header length must be rejected");
+        assert_eq!(reader_error, load_error);
     }
 }

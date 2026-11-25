@@ -302,6 +302,59 @@ not speed. The capture's arena is not CUDA's either — a measured INT8 capture
 touches 3.84 GB, so the reservation is the BF16 one rather than the doubled one
 upstream keeps for its INT32 accumulator and verifier.
 
+The arena is pooled and the reservation is a ladder, not a constant.
+`GraphWorkspace` reuses a slice once the last tensor reading it drops
+(cuda-new's generation-tagged lease free list). `with_capacity_ladder` starts
+at `max(required/8, 256 MiB)`, doubles, and ends at the modeled bound; a
+modeled bound at or below 256 MiB is a single rung. Only a
+`"static inference workspace exhausted"` error advances the ladder: the
+prepare traversal is retried on the next rung, and the plan is committed on
+the rung that prepared. Any other error is final, and a capture failure is
+never retried. The eager path runs the same ladder because an eager plan
+retains its session. On M1000 (int8_dynamic, 3 views, 10 tokens) the modeled
+5.50 GiB (5,909,589,760 bytes) becomes a 704.5 MiB arena — exactly its eighth,
+so the first rung held — and the steady device footprint falls from 11.1 to
+6.0 GiB. The report separates two marks: `used` (109.6 MiB) is the
+requested-byte high-water of the traversal, while `peak` (105.0 MiB) is the
+most requested bytes live at once (`peak_used()`); neither includes the
+per-allocation alignment and slack, so they are usage diagnostics rather than
+reservation sizes. `APXINF_MUSA_WORKSPACE_POOL=0` restores the monotonic
+allocator, which never reuses a dropped slice: every rung below `required`
+would exhaust, so the ladder collapses to the single modeled rung.
+`APXINF_MUSA_WORKSPACE_REPORT=1` prints one line per successful plan (`graph`
+or `eager`) with capacity/used/peak/attempts/tokens/pool. The arena rounds its
+requested capacity up to the 256-byte alignment before allocating; `capacity()`
+reports the rounded size, so a request whose aligned extent equals the capacity
+it was handed fits on both allocators.
+
+### Streaming int8 loads
+
+A real-checkpoint `int8_dynamic` load never materializes the whole host model.
+`CheckpointReader` opens SafeTensors shard headers only and reads one tensor's
+bytes on demand; `Int8DynamicWeights::from_checkpoint` feeds those tensors
+through `WeightSource` one layer at a time, folds them in F32, quantizes and
+uploads them, then drops the host copy before the next layer. The reader shares
+header parsing and the sharded index's wrong-shard, duplicate, missing and
+unsafe-path checks with the whole-file loader, and it rejects a non-forward or
+overflowing `data_offsets` entry before any tensor is exposed. Header parsing
+also requires each entry's `data_offsets` extent to equal
+`dtype.size_in_bytes() * product(shape)`; a truncated or padded range is
+refused before any bytes are read. The streaming
+path runs the same shape validation as `Pi05Weights::from_map`, including the
+six checkpoint-wide tensors (`token_embedding`, `multimodal_projector`,
+`action_in_proj`, `action_out_proj`, `time_mlp_in`, `time_mlp_out`); only the
+order in which checks are reached differs, because the streaming builder
+validates each tensor when it takes it. `bf16_to_device` copies a tensor
+already in BF16 straight to the device rather than round-tripping through F32;
+`Pi05Weights` and the BF16 path are unchanged. On M1000 with
+`pi05_libero_pytorch` (two camera views), the measured host peak falls from
+14.1 GiB to 2.1 GiB while the device weights and the L0 actions stay
+bit-identical; the largest remaining transients are the token embedding and the
+language gate/up group's F32 staging. Loading stays synchronous per group, so
+capture and replay are unchanged. `CheckpointReader` reads with
+`FileExt::read_exact_at`, so the loader targets Unix; CI is Linux and the MLX
+target is macOS.
+
 ### FP8 (static E4M3)
 
 The verified MP31 decode O/down projections also reduce FP32 split-K partials
@@ -335,6 +388,37 @@ On S5000, muDNN measured 1.6-2.7x the muBLAS FP8 time on qkv, o and down,
 equal on up, and matched at the test's cosine 0.9999 gate (not byte equality);
 muBLAS is not part of the route.
 
+`ops::gemm_bias_residual` selects muDNN's bias+residual epilogue on this route
+whenever the site carries a bias: `alpha*a*b + residual + bias` runs in one f32
+epilogue with a single BF16 rounding, so the composed BF16 scratch and the
+separate `bias_residual` producer disappear. The 27 vision fc2 sites
+(`512x4304x1152`) are the whole population on S5000; a paired ABBA measured
+23.105/23.122 -> 23.026/23.016 ms p50 (cosine 0.99946 -> 0.99932, max_abs
+0.0424 -> 0.0455, both inside their gates), and the captured graph loses 27
+launches per replay. The prefix MLP down projection has no bias in the
+checkpoint and keeps the composed producer: muDNN's epilogue has no null-bias
+form.
+
+The action chain's decode attention merges its split-KV partials directly into
+the E4M3 row the following O projection reads, and that projection consumes the
+row through TMA (`Fp8UnitScale`) instead of quantizing a BF16 copy. The stored
+bytes are identical to merging to BF16 and quantizing the copy; a paired ABBA
+measured 22.879/22.953 -> 22.496/22.481 ms p50 (-0.383 ms, -1.67%, cosine
+0.99931780 unchanged). An E4M3 attention output is admitted only for
+decode-shaped MQA and requires a finite positive `output_scale`; every other
+attention call keeps the unit-scale BF16 contract. When the native MP31
+geometry does not apply — for example at the default `action_horizon=50` KV
+length — `allow_fallback` serves the same E4M3 contract by running the BF16
+MQA route into a workspace temporary and then applying the fixed-scale E4M3
+quantizer; `allow_fallback=false` still refuses the substitute by name. The
+action O and down
+projections also moved to a single 128-thread SQMMA squad that issues the one or
+two K tiles per partition up front (projection+norm 10.622 -> 9.111 and
+12.273 -> 10.748 us), and `direct_qkv_rope` groups two K chunks of A and weight
+loads ahead of the MMAs (-0.281 ms, -1.21%, byte-identical). The launch
+contract and stress test are in
+[the MP31 FP8 kernel notes](../crates/apxinf-musa/kernels/mp31_fp8/README.md).
+
 Static-FP8 preparation keeps the CUDA artifact contract:
 
 - weights: one per-tensor absmax scale, host F32 amax -> F16 rounding ->
@@ -365,7 +449,8 @@ head_dim=256, valid_kv=532)`, the MP31 native BF16 QK/PV path is enabled by
 default. It uses BN64 with fixed-order split-KV=5 reduction. K/V descriptors
 expose the logical 532 rows; TME zero-fills the final tile. Declaring 576
 rows would read past the logical tensors and can propagate poisoned values.
-Unsupported shapes keep the MATE fallback.
+Unsupported shapes keep the MATE fallback; an E4M3 output on those shapes is
+the MATE/BF16 result passed through the fixed-scale quantizer.
 
 Barrier initialization is performed by one elected thread. A single producer
 warp registers DMA transactions and arrives at the corresponding barriers;
@@ -436,7 +521,6 @@ without its KN pack stays on the native route with a one-time warning
 rather than failing the call. `APXINF_TILELANG=off` empties the route at run time — the
 feature-off semantics, no rebuild. The first dispatch prints one line
 (`TileLang route:` …), so a run's route adoption is visible in its log.
-
 
 ## GR00T N1.7 on MUSA
 
@@ -552,6 +636,14 @@ at 16.6234/16.6530 ms against 16.8673/16.6839 ms on the three-GEMM path; the
 three-GEMM form still runs for BF16 and for a calibration whose Q/K/V
 activation scales differ. The per-stage ledger and probes are
 in `devlocal/gr00t/`.
+
+The packed split also folds into the Q/K RMSNorm and mRoPE kernel for up to 256
+tokens with 16 Q heads, 8 KV heads and head dimension 128: one warp per
+`(token, head)` reads the wide projection, rotates Q/K and copies V, so the
+separate `split_qkv_uneven_bf16` launch disappears. The outputs are
+byte-identical; the fp8/require-graph median moved 17.004 -> 16.581 ms p50 on
+musa:5 and 17.158 -> 17.052 on musa:4 (three processes each, cosine 0.99994476
+unchanged).
 
 The current dev-Yi pass moved FP8 18.541 -> **17.46 ms** (p50, four runs
 17.44-17.75, Orin fixture, cosine 0.9999584, relative L2 0.009127, max_abs

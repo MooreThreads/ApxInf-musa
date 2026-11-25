@@ -1,20 +1,130 @@
 //! Shared PI0.5 preparation and captured resource ownership.
 use crate::musa_pi05::backend::{
-    self, capture as capture_cuda_graph, ops, transfers, Context, DeviceBuffer,
-    ExecutionSession,
+    self, capture as capture_cuda_graph, ops, transfers, Context, DeviceBuffer, ExecutionSession,
 };
 use crate::musa_pi05::model::Pi05Model;
-use crate::musa_pi05::model::{ModelOperation, ModelVariant, PrepareBlocks, WorkspaceRequirements};
+use crate::musa_pi05::model::{ModelOperation, ModelVariant, PrepareBlocks};
 use crate::musa_pi05::{Pi05Config, Pi05ImageLayout};
 use apxinf_core::{Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
-fn allocate_session(
-    requirements: &WorkspaceRequirements,
-    device: usize,
-) -> Result<ExecutionSession> {
-    ExecutionSession::with_capacity(requirements.bytes, device)
+/// Smallest useful first rung. Below this the ladder would add plan attempts
+/// without meaningfully reducing the reservation.
+const WORKSPACE_FLOOR: usize = 256 << 20;
+
+/// Capacities the capture and eager paths try in order.
+///
+/// The first rung is an eighth of the modeled reservation, floored at
+/// [`WORKSPACE_FLOOR`], doubling until the proven reservation. A bump allocator
+/// never reuses a slice, so every rung below the full reservation would
+/// exhaust: `POOL=0` gets the full reservation directly.
+pub(super) fn workspace_capacities(required_bytes: usize, pooling: bool) -> Vec<usize> {
+    if !pooling || required_bytes <= WORKSPACE_FLOOR {
+        return vec![required_bytes];
+    }
+    let mut capacities = Vec::new();
+    let mut capacity = (required_bytes / 8).max(WORKSPACE_FLOOR);
+    while capacity < required_bytes {
+        capacities.push(capacity);
+        capacity = match capacity.checked_mul(2) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    if capacities.last().copied() != Some(required_bytes) {
+        capacities.push(required_bytes);
+    }
+    capacities
 }
+
+/// One line per successful plan, so the allocator decision is auditable.
+pub(super) fn report_workspace(
+    session: &ExecutionSession,
+    attempts: usize,
+    token_count: usize,
+    label: &str,
+) {
+    if !workspace_report_enabled() {
+        return;
+    }
+    let workspace = session.workspace();
+    eprintln!(
+        "[apxinf] PI0.5 {label} workspace: capacity={} used={} peak={} attempts={} tokens={} pool={}",
+        workspace.capacity(),
+        workspace.used(),
+        workspace.peak_used(),
+        attempts,
+        token_count,
+        workspace.pooling(),
+    );
+}
+
+fn workspace_report_enabled() -> bool {
+    static REPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORT.get_or_init(|| std::env::var("APXINF_MUSA_WORKSPACE_REPORT").as_deref() == Ok("1"))
+}
+
+/// Run `prepare` on each arena capacity until one fits, then let `finish`
+/// commit the winning rung.
+///
+/// Every rung gets a fresh session. `prepare` is the only step the ladder
+/// retries: an error the arena reports as exhaustion is ordered (the failed
+/// traversal may still have work in flight), the session dropped, and the next
+/// rung tried. Any other prepare error is final.
+///
+/// `finish` runs once, on the rung that prepared, and is never retried: a
+/// capture that fails after a fitting warm-up would repeat the traversal on the
+/// next rung for an error capacity cannot fix. The report is printed after
+/// `finish`, so it describes the plan that actually exists.
+pub(super) fn with_capacity_ladder<P, T>(
+    context: &Context,
+    label: &'static str,
+    required: usize,
+    token_count: usize,
+    mut prepare: impl FnMut(&ExecutionSession) -> Result<P>,
+    finish: impl FnOnce(&ExecutionSession, P) -> Result<T>,
+) -> Result<(T, ExecutionSession)> {
+    let capacities = workspace_capacities(required, backend::workspace_pool_enabled());
+    let mut last_exhaustion = None;
+    for (attempt, &capacity) in capacities.iter().enumerate() {
+        let session = ExecutionSession::with_capacity(capacity, context.device_id())?;
+        let prepared = match prepare(&session) {
+            Ok(prepared) => prepared,
+            Err(error) if backend::is_workspace_exhaustion(&error) => {
+                last_exhaustion = Some(error);
+                // The failed traversal may still have work in flight; order it
+                // before releasing the arena it wrote into.
+                backend::synchronize(context)?;
+                drop(session);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let output = finish(&session, prepared)?;
+        report_workspace(&session, attempt + 1, token_count, label);
+        return Ok((output, session));
+    }
+    Err(ladder_exhaustion_error(
+        label,
+        required,
+        capacities.len(),
+        last_exhaustion.as_ref(),
+    ))
+}
+
+fn ladder_exhaustion_error(
+    label: &str,
+    required: usize,
+    attempts: usize,
+    last: Option<&Error>,
+) -> Error {
+    Error::Other(format!(
+        "PI0.5 {label} workspace exhausted at {required} bytes after {attempts} attempts: {}",
+        last.map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown error".into())
+    ))
+}
+
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
@@ -202,50 +312,60 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             ));
         }
         backend::synchronize(backend)?;
-        let session = allocate_session(
-            &self.model.workspace_requirements(token_count)?,
-            self.ctx().device_id(),
-        )?;
-        // Warm-up and capture resolve providers under the same rule. Left on,
-        // autotuning would measure the warm-up's shapes and change the provider
-        // between the two traversals — the record capture bakes would then be
-        // of a dispatch that no longer happens.
-        let captured_output = std::cell::RefCell::new(None);
-        let (eager_output, graph) = backend::without_autotune(|| {
-            let eager_output = ops::prepare_with_session(&session, || {
-                self.infer_captured_inputs(
-                    &patches,
-                    raw_images.as_ref(),
-                    raw_image_layout,
-                    token_ids,
-                    token_count,
-                    noise,
-                )
-            })?;
-            backend::synchronize(backend)?;
+        let required = self.model.workspace_requirements(token_count)?.bytes;
+        let ((graph, output), session) = with_capacity_ladder(
+            self.ctx(),
+            "graph",
+            required,
+            token_count,
+            |session| {
+                // Warm-up and capture resolve providers under the same rule. Left on,
+                // autotuning would measure the warm-up's shapes and change the provider
+                // between the two traversals — the record capture bakes would then be
+                // of a dispatch that no longer happens.
+                backend::without_autotune(|| {
+                    ops::prepare_with_session(session, || {
+                        self.infer_captured_inputs(
+                            &patches,
+                            raw_images.as_ref(),
+                            raw_image_layout,
+                            token_ids,
+                            token_count,
+                            noise,
+                        )
+                    })
+                })
+            },
+            |session, eager_output| {
+                backend::synchronize(backend)?;
 
-            let graph = capture_cuda_graph(self.ctx(), || {
-                let output = ops::with_session(&session, || {
-                    self.infer_captured_inputs(
-                        &patches,
-                        raw_images.as_ref(),
-                        raw_image_layout,
-                        token_ids,
-                        token_count,
-                        noise,
-                    )
+                let captured_output = std::cell::RefCell::new(None);
+                let graph = backend::without_autotune(|| {
+                    capture_cuda_graph(self.ctx(), || {
+                        let output = ops::with_session(session, || {
+                            self.infer_captured_inputs(
+                                &patches,
+                                raw_images.as_ref(),
+                                raw_image_layout,
+                                token_ids,
+                                token_count,
+                                noise,
+                            )
+                        })?;
+                        captured_output.replace(Some(output));
+                        Ok(())
+                    })
                 })?;
-                captured_output.replace(Some(output));
-                Ok(())
-            })?;
-            Ok::<_, Error>((eager_output, graph))
-        })?;
-        drop(eager_output);
-        let output = captured_output
-            .into_inner()
-            .ok_or_else(|| Error::Other("PI0.5 graph capture produced no output tensor".into()))?;
+                drop(eager_output);
+                let output = captured_output.into_inner().ok_or_else(|| {
+                    Error::Other("PI0.5 graph capture produced no output tensor".into())
+                })?;
+                let graph: Box<dyn Graph> = Box::new(graph);
+                Ok((graph, output))
+            },
+        )?;
         Ok(CapturedGraph {
-            graph: Box::new(graph),
+            graph,
             output,
             patches,
             raw_images,
@@ -288,10 +408,13 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             .map_err(Error::Other)?;
         let patch_rows = self.config.num_views * self.config.patches_per_view();
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
-        let patches = backend::to_device(backend, &Tensor::zeros(
-            vec![patch_rows, patch_width],
-            crate::musa_pi05::model::ACTIVATION_DTYPE,
-        ))?;
+        let patches = backend::to_device(
+            backend,
+            &Tensor::zeros(
+                vec![patch_rows, patch_width],
+                crate::musa_pi05::model::ACTIVATION_DTYPE,
+            ),
+        )?;
         self.capture_infer_impl(
             patches,
             Some(raw_images),
@@ -354,4 +477,71 @@ pub(super) fn capture_loaded(
         count: spec.token_count,
         noise,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_capacity_ladder_is_ascending_and_ends_at_the_reservation() {
+        let required = 5_909_589_760;
+        assert_eq!(
+            workspace_capacities(required, true),
+            vec![738_698_720, 1_477_397_440, 2_954_794_880, 5_909_589_760]
+        );
+    }
+
+    #[test]
+    fn a_reservation_below_the_floor_is_its_own_capacity() {
+        assert_eq!(workspace_capacities(1 << 20, true), vec![1 << 20]);
+    }
+
+    #[test]
+    fn a_reservation_at_the_floor_is_a_single_rung() {
+        assert_eq!(
+            workspace_capacities(WORKSPACE_FLOOR, true),
+            vec![WORKSPACE_FLOOR]
+        );
+    }
+
+    #[test]
+    fn a_reservation_just_above_the_floor_starts_at_the_floor() {
+        assert_eq!(
+            workspace_capacities(WORKSPACE_FLOOR + 1, true),
+            vec![WORKSPACE_FLOOR, WORKSPACE_FLOOR + 1]
+        );
+    }
+
+    #[test]
+    fn the_ladder_floors_its_first_rung_at_256_mib() {
+        assert_eq!(
+            workspace_capacities(1 << 30, true),
+            vec![WORKSPACE_FLOOR, 512 << 20, 1 << 30]
+        );
+    }
+
+    #[test]
+    fn a_bump_allocator_uses_the_full_reservation() {
+        let required = 5_909_589_760;
+        assert_eq!(workspace_capacities(required, false), vec![required]);
+        assert_eq!(workspace_capacities(1 << 20, false), vec![1 << 20]);
+    }
+
+    #[test]
+    fn the_aggregate_exhaustion_error_names_the_label_and_attempts() {
+        let unknown = ladder_exhaustion_error("eager", 12_345, 3, None);
+        assert_eq!(
+            unknown.to_string(),
+            "PI0.5 eager workspace exhausted at 12345 bytes after 3 attempts: unknown error"
+        );
+        let last = Error::Other("static inference workspace exhausted: need 1 bytes".into());
+        let named = ladder_exhaustion_error("graph", 1, 1, Some(&last));
+        assert!(
+            named.to_string().ends_with(
+                "at 1 bytes after 1 attempts: static inference workspace exhausted: need 1 bytes"
+            ),
+            "{named}"
+        );
+    }
 }

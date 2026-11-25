@@ -56,7 +56,35 @@ pub fn quantize_fixed_e4m3(
     output: &mut Tensor,
     scale: f32,
 ) -> Result<()> {
-    let inverse_scale = checked_inverse_scale(scale)?;
+    quantize_with_inverse(ctx, input, output, checked_inverse_scale(scale)?)
+}
+
+/// [`quantize_fixed_e4m3`] for callers that already hold the kernel's multiplier.
+///
+/// The static-FP8 attention fallback receives `1 / output_scale` from the
+/// model layer. Taking the reciprocal again would round twice and break the
+/// byte identity with the composed BF16 + quantize path.
+pub(super) fn quantize_fixed_e4m3_inverse(
+    ctx: &MusaContext,
+    input: &Tensor,
+    output: &mut Tensor,
+    inverse_scale: f32,
+) -> Result<()> {
+    if !inverse_scale.is_finite() || inverse_scale <= 0.0 {
+        return Err(Error::Other(format!(
+            "MUSA quantization fixed-scale E4M3 inverse scale must be finite and positive, got \
+             {inverse_scale}"
+        )));
+    }
+    quantize_with_inverse(ctx, input, output, inverse_scale)
+}
+
+fn quantize_with_inverse(
+    ctx: &MusaContext,
+    input: &Tensor,
+    output: &mut Tensor,
+    inverse_scale: f32,
+) -> Result<()> {
     let dtype = input.dtype();
     if !matches!(dtype, DType::F16 | DType::BF16) {
         return Err(Error::Other(format!(

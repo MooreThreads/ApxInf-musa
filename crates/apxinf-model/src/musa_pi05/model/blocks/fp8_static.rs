@@ -18,7 +18,7 @@ use crate::musa_pi05::{Fp8StaticTransformerLayerScales, Fp8StaticVisionLayerScal
 
 use super::bf16_vector_prefix;
 use super::shared::{
-    bias_activation_bf16, mha_bf16, mqa_bf16, split_qkv_bias_bf16, split_qkv_rope_bf16,
+    bias_activation_bf16, mha_bf16, mqa_bf16, mqa_fp8, split_qkv_bias_bf16, split_qkv_rope_bf16,
     split_qkv_rope_into_cache_bf16,
 };
 use super::L3Policies;
@@ -615,7 +615,15 @@ fn action_layer_fp8_static_with_policies(
     let key_tokens = position_offset + input.shape().dims()[0];
     // The prefix-cache attention views only the valid prefix rows, so the
     // reserved tail never reaches the softmax.
-    let attention = mqa_bf16(ctx, &policies.attention, &q, prefix_k, prefix_v, key_tokens)?;
+    let attention = mqa_fp8(
+        ctx,
+        &policies.attention,
+        &q,
+        prefix_k,
+        prefix_v,
+        key_tokens,
+        scales.attention_output,
+    )?;
     let attention = attention.reshape(vec![
         input.shape().dims()[0],
         config.num_heads * config.head_dim,

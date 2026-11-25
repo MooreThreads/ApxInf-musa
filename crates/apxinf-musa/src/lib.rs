@@ -40,7 +40,10 @@ pub use context::{MusaContext, MusaLibraryVersions};
 pub use device_caps::{MusaArchFamily, MusaDeviceCaps};
 pub use graph::{capture, capture_isolated, CapturedGraph};
 pub use stream::MusaStream;
-pub use workspace::{ExecutionSession, GraphWorkspace, OperationShape};
+pub use workspace::{
+    is_workspace_exhaustion, workspace_pool_enabled, ExecutionSession, GraphWorkspace,
+    OperationShape,
+};
 
 /// Whether this build found a MUSA toolkit. Set by `build.rs`; a build
 /// without one still compiles so `cargo build --workspace` works everywhere.

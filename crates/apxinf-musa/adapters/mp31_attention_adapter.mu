@@ -1,5 +1,6 @@
 #include "../kernels/mp31_attention/attention.cuh"
 #include <musa_runtime.h>
+#include <cmath>
 #include <new>
 
 namespace {
@@ -51,10 +52,11 @@ extern "C" void apxinf_musa_mp31_attention_release(void *descriptors) {
 }
 extern "C" musaError_t apxinf_musa_mp31_attention(const void *raw_descriptors,
                                                   float *partials, float *stats,
-                                                  void *output,
+                                                  void *output, float inverse_output_scale,
                                                   musaStream_t stream) {
 
-  if (!raw_descriptors || !partials || !stats || !output)
+  if (!raw_descriptors || !partials || !stats || !output ||
+      !std::isfinite(inverse_output_scale) || inverse_output_scale < 0.f)
     return musaErrorInvalidValue;
   auto const &descriptors = *static_cast<const Descriptors *>(raw_descriptors);
   // The first grid axis is the physical query head; the second is the KV split.
@@ -67,8 +69,14 @@ extern "C" musaError_t apxinf_musa_mp31_attention(const void *raw_descriptors,
   auto status = musaGetLastError();
   if (status != musaSuccess)
     return status;
-  apxinf_mp31_attention::merge_partials<5, false>
-      <<<80, 256, 0, stream>>>(partials, stats, output, 10, 1.f);
+  // A positive inverse scale writes the merged row as E4M3 through the next
+  // projection's own input quantizer; zero keeps the BF16 contract.
+  if (inverse_output_scale > 0.f)
+    apxinf_mp31_attention::merge_partials<5, true><<<80, 256, 0, stream>>>(
+        partials, stats, output, 10, inverse_output_scale);
+  else
+    apxinf_mp31_attention::merge_partials<5, false>
+        <<<80, 256, 0, stream>>>(partials, stats, output, 10, 0.f);
   return musaGetLastError();
 
 }
