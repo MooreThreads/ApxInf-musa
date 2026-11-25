@@ -84,8 +84,11 @@ pub(crate) fn load_model_runner(
         if !apxinf_musa::MUSA_AVAILABLE || apxinf_musa::MUSA_ARCH != "mp_22" {
             return Err(Error::Other("PI0.5 W4A16 requires a native mp_22 MUSA build".into()));
         }
-        if config.patch_size == 0 || config.num_views.checked_mul(config.patches_per_view()) != Some(512) {
-            return Err(Error::Other("PI0.5 native W4A16 requires 512 total vision patches".into()));
+        let side = config.image_size.checked_div(config.patch_size);
+        let rows = side.and_then(|s| s.checked_mul(s))
+            .and_then(|patches| config.num_views.checked_mul(patches));
+        if !rows.is_some_and(|m| (1..=i32::MAX as usize).contains(&m)) {
+            return Err(Error::Other("PI0.5 W4A16 vision row count must be positive and fit in i32".into()));
         }
     }
     if matches!(model_variant, ModelVariantChoice::Fp8Static)

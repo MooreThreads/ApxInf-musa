@@ -142,13 +142,11 @@ impl W4DeviceLanguageLayer {
             )?,
             output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
             post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
-            // The language MLP carries the traffic: both linears take the
-            // mate-ported kernel format (U4 uint32 words, FP16 G128 scales).
-            gate_up: W4LinearWeights::from_host_parts_mate(
+            gate_up: W4LinearWeights::from_host_parts_policy(
                 &[&weights.mlp.gate, &weights.mlp.up],
-                backend,
+                backend, 16, 0.98,
             )?,
-            down: W4LinearWeights::from_host_mate(&weights.mlp.down, backend)?,
+            down: W4LinearWeights::from_host_policy(&weights.mlp.down, backend, 16, 0.98)?,
         })
     }
 }
@@ -182,26 +180,6 @@ impl W4LinearWeights {
         };
         Ok(Self { packed,scales,bias,k,n,group_size,clip_ratio })
     }
-    /// Mate kernel format: U4 packed as uint32 words, FP16 scales, G128, and
-    /// the decode `w = (q - 8) * s` with an implicit zero point of eight.
-    pub fn from_host_mate(linear: &LinearWeights, ctx: &Context) -> Result<Self> { Self::from_host_parts_mate(&[linear], ctx) }
-    pub fn from_host_parts_mate(parts: &[&LinearWeights], ctx: &Context) -> Result<Self> {
-        const GROUP: usize = 128;
-        let weight=super::packing::concat_host_2d(&parts.iter().map(|p| &p.weight).collect::<Vec<_>>())?;
-        let dims=weight.shape().dims();
-        let (k,n)=(dims[0],dims[1]);
-        let (words,scales)=pack_w4_mate(&weight.to_f32_vec()?,k,n,GROUP)?;
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let packed=backend::DeviceBuffer::alloc_on(ctx,bytes.len()).map_err(apxinf_core::Error::Other)?;
-        packed.copy_from_host(&bytes).map_err(apxinf_core::Error::Other)?;
-        let scales=backend::to_device(ctx,&Tensor::from_f16(vec![n,k/GROUP],&scales)?)?;
-        let bias=if parts.iter().all(|p| p.bias.is_none()) { None } else {
-            let mut v=Vec::new();
-            for p in parts { v.extend(p.bias.as_ref().ok_or_else(|| apxinf_core::Error::Other("mixed W4 bias presence".into()))?.to_f32_vec()?.into_iter().map(half::bf16::from_f32)); }
-            Some(backend::to_device(ctx,&Tensor::from_bf16(vec![v.len()],&v)?)?)
-        };
-        Ok(Self { packed,scales,bias,k,n,group_size:GROUP,clip_ratio:1. })
-    }
 }
 
 /// KN source -> NK bytes, low nibble first, BF16 scales per output/K128 group.
@@ -229,35 +207,6 @@ fn pack_w4(values: &[f32], k: usize, n: usize, group_size: usize, clip_ratio: f3
     Ok((packed,scales))
 }
 
-/// KN source -> NK uint32 words (eight nibbles each, element i at bits 4i)
-/// with FP16 scales per (n, K/group) group, matching the mate-ported kernel:
-/// the decode is `w = (q - 8) * s` with q in [0,15] and an implicit zero
-/// point of eight. `s = group_max / 7.5` keeps both edges of the asymmetric
-/// [-8, 7] range within s/2 of the true extreme.
-fn pack_w4_mate(values: &[f32], k: usize, n: usize, group_size: usize) -> Result<(Vec<u32>,Vec<half::f16>)> {
-    use apxinf_core::Error;
-    if k==0 || n==0 || group_size==0 || group_size%8!=0 || k%group_size!=0
-        || k.checked_mul(n)!=Some(values.len()) || values.iter().any(|v| !v.is_finite()) {
-        return Err(Error::Other("mate W4 requires finite nonempty KN weights with K % group == 0".into()));
-    }
-    let groups=k/group_size;
-    let mut packed=vec![0u32;n*k/8];
-    let mut scales=vec![half::f16::ONE;n*groups];
-    for j in 0..n { for g in 0..groups {
-        let base=g*group_size;
-        let max=(base..base+group_size).map(|i| values[i*n+j].abs()).fold(0f32,f32::max);
-        let scale=half::f16::from_f32(if max==0. {1.} else {max/7.5});
-        let sf=scale.to_f32();
-        if !sf.is_normal() { return Err(Error::Other("mate W4 scale not representable as normal FP16".into())); }
-        scales[j*groups+g]=scale;
-        for i in base..base+group_size {
-            let q=((values[i*n+j]/sf).round_ties_even()+8.).clamp(0.,15.) as u32;
-            packed[j*(k/8)+i/8] |= (q&15)<<((i%8)*4);
-        }
-    }}
-    Ok((packed,scales))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,32 +227,6 @@ mod tests {
         for v in [f32::NAN,f32::INFINITY,f32::NEG_INFINITY,f32::from_bits(1)] {
             assert!(pack_w4(&[v],1,1,128,1.).is_err());
         }
-    }
-    #[test]
-    fn mate_packer_zero_point_nibbles_and_clamp() {
-        // group max 7.5 => FP16 scale exactly 1.0; decode keeps w = (q-8)*s
-        let w=[0.,1.,-1.,2.5,-2.5,3.,7.5,-3.];
-        let (p,s)=pack_w4_mate(&w,8,1,8).unwrap();
-        assert_eq!(s.len(),1);
-        assert_eq!(s[0].to_f32(),1.);
-        assert_eq!(p.len(),1);
-        let expect=[8i32,9,7,10,6,11,15,5]; // 2.5 ties-even->2; 7.5 rounds to +8 and clamps to 15
-        for (i,e) in expect.iter().enumerate() {
-            assert_eq!(((p[0]>>(i*4))&15) as i32,*e,"nibble {i}");
-        }
-    }
-    #[test]
-    fn mate_packer_group_scales_and_rejects() {
-        // two G8 groups: per-group maxima pick independent FP16 scales
-        let mut w=[0.;16]; w[7]=7.5; w[8+3]=-3.75;
-        let (p,s)=pack_w4_mate(&w,16,1,8).unwrap();
-        assert_eq!(s.len(),2);
-        assert_eq!(s[0].to_f32(),1.);
-        assert_eq!(s[1].to_f32(),0.5);
-        assert_eq!(p.len(),2);
-        assert_eq!((p[1]>>(3*4))&15,0); // -3.75/0.5 = -7.5 -> ties-even -8 -> q 0
-        assert!(pack_w4_mate(&[0.;130],130,1,128).is_err());
-        assert!(pack_w4_mate(&[f32::NAN;8],8,1,8).is_err());
     }
 }
 

@@ -2206,11 +2206,7 @@ template<int TN, int TK> __global__ void w4_decode_vision_tiled(const unsigned c
 // stores and one 16-byte global store — while producing the same [k][n]
 // scratch layout. Arithmetic stays `(float)q * (float)scale` rounded once to
 // bf16, bit-identical to the fallback.
-// ScaleT/SG select the scale dtype and group width: vision G16 passes
-// BF16/16, language G128 passes FP16/128. An 8-aligned K run never straddles
-// a group at either width, so one scale fetch still covers 8 elements.
-// ZP is the nibble zero point: 0 decodes two's-complement nibbles (G16,
-// q>=8 -> q-16); 8 decodes mate's offset-binary nibbles (G128, q-8).
+// Production W4 uses G16 BF16 scales and signed INT4 nibbles.
 template<int TN, int TK, typename ScaleT, int SG, int ZP>
 __global__ void __launch_bounds__(256, 1)
 w4_decode_kn_vec(const unsigned char* __restrict__ B, const ScaleT* __restrict__ S, __mt_bfloat16* __restrict__ W, int n, int k) {
@@ -2234,13 +2230,8 @@ w4_decode_kn_vec(const unsigned char* __restrict__ B, const ScaleT* __restrict__
       for (int j = 0; j < 4; ++j) {
         int q0 = (int)((b >> (8 * j)) & 15);
         int q1 = (int)((b >> (8 * j + 4)) & 15);
-        if (ZP == 0) {  // G16: two's-complement nibble
-          q0 = q0 >= 8 ? q0 - 16 : q0;
-          q1 = q1 >= 8 ? q1 - 16 : q1;
-        } else {        // mate G128: offset-binary nibble, zero point 8
-          q0 -= ZP;
-          q1 -= ZP;
-        }
+        q0 = q0 >= 8 ? q0 - 16 : q0;
+        q1 = q1 >= 8 ? q1 - 16 : q1;
         const unsigned int lo = (unsigned int)__bfloat16_as_ushort((__mt_bfloat16)((float)q0 * fs));
         const unsigned int hi = (unsigned int)__bfloat16_as_ushort((__mt_bfloat16)((float)q1 * fs));
         row[(kkL >> 1) + j] = lo | (hi << 16);
@@ -2267,16 +2258,8 @@ w4_decode_kn_vec(const unsigned char* __restrict__ B, const ScaleT* __restrict__
 
 extern "C" musaError_t apxinf_musa_w4_decode_kn(const void* packed, const void* scales, void* scratch, int n, int k, musaStream_t stream) {
   if (!packed || !scales || !scratch || n <= 0 || k <= 0 || (k % 16) != 0) return musaErrorInvalidValue;
-  if (n==32768 && k==2048) {
-    w4_decode_kn_vec<64,64,__half,128,8><<<dim3((k+63)/64,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(const __half*)scales,(__mt_bfloat16*)scratch,n,k);
-  } else if (n==2048 && k==16384) {
-    w4_decode_kn_vec<64,64,__half,128,8><<<dim3((k+63)/64,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(const __half*)scales,(__mt_bfloat16*)scratch,n,k);
-  } else if ((n==3456 && k==1152) || (n==1152 && k==1152) || (n==4304 && k==1152) || (n==1152 && k==4304)) {
-    if ((n % 8) == 0 && (k % 8) == 0) {
-      w4_decode_kn_vec<64,64,__mt_bfloat16,16,0><<<dim3((k+63)/64,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
-    } else {
-      w4_decode_vision_tiled<64,32><<<dim3((k+31)/32,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
-    }
+  if ((n==32768 && k==2048) || (n==2048 && k==16384) || (n==3456 && k==1152) || (n==1152 && k==1152) || (n==4304 && k==1152) || (n==1152 && k==4304)) {
+    w4_decode_kn_vec<64,64,__mt_bfloat16,16,0><<<dim3((k+63)/64,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
   } else return musaErrorInvalidValue;
   return musaGetLastError();
 }
