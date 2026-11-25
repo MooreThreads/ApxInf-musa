@@ -883,6 +883,22 @@ fn launch_mha(
     let flash = *FLASH_ENABLED.get_or_init(|| {
         std::env::var("APXINF_MUSA_BF16_MHA").map_or(true, |value| value != "legacy")
     });
+    let (provider, explicit) = pi05_fa_provider().map_err(Error::Other)?;
+    let custom_geometry = crate::MUSA_ARCH == "mp_22" && batches == 2 && heads == 16 && rows == 256 && head_dim == 72;
+    if explicit && provider == Pi05FaProvider::Custom && !custom_geometry {
+        return Err(Error::Other("APXINF_PI05_FA=custom requires the fixed MP22 D72 vision geometry (B=2,T=256,H=16,D=72)".into()));
+    }
+    // The fixed PI0.5 vision geometry is served by the independent QY2 D72 image.
+    #[cfg(apxinf_musa_available)]
+    if custom_geometry && (explicit || flash) {
+        if provider != Pi05FaProvider::Mudnn {
+            let mut state = ctx.d72.lock().map_err(|_| Error::Other("custom FA D72 state poisoned".into()))?;
+            let status = unsafe { ffi::mubin::apxinf_musa_fa_d72(&mut state.0, tensor_ptr(q)?, tensor_ptr(k)?, tensor_ptr(v)?, tensor_ptr(output)?, checked_i32("custom D72", "batch", batches)?, checked_i32("custom D72", "heads", heads)?, checked_i32("custom D72", "tokens", rows)?, checked_i32("custom D72", "head_dim", head_dim)?, stream) };
+            let result = ffi::mubin::check_fa_d72(status, "attention::custom_d72").map_err(crate::error::musa_error);
+            match (provider, result) { (Pi05FaProvider::Custom, r) => return r, (Pi05FaProvider::Auto, Ok(())) => { eprintln!("[apxinf] PI0.5 FA provider=custom"); return Ok(()); }, (Pi05FaProvider::Auto, Err(e)) => eprintln!("[apxinf] PI0.5 FA provider=custom failed; fallback=mudnn: {e}"), (Pi05FaProvider::Mudnn, _) => unreachable!() }
+        }
+    }
+
     // Which generations have the muDNN flash kernel is the family's answer, not
     // a pair of numbers written here: a list at the dispatch site is a list a
     // new generation falls off silently, keeping the correct-but-slower path
@@ -1292,6 +1308,27 @@ enum Bf16SdpaMode {
     Legacy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pi05FaProvider { Mudnn, Custom, Auto }
+
+fn parse_pi05_fa_provider(value: Option<&str>) -> std::result::Result<Pi05FaProvider, String> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("mudnn") => Ok(Pi05FaProvider::Mudnn),
+        None | Some("custom") => Ok(Pi05FaProvider::Custom),
+        Some("auto") => Ok(Pi05FaProvider::Auto),
+        Some(other) => Err(format!("invalid APXINF_PI05_FA={other:?}; expected custom, mudnn, or auto")),
+    }
+}
+
+fn pi05_fa_provider() -> std::result::Result<(Pi05FaProvider, bool), String> {
+    use std::sync::OnceLock;
+    static PROVIDER: OnceLock<std::result::Result<(Pi05FaProvider, bool), String>> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let value = std::env::var("APXINF_PI05_FA").ok();
+        parse_pi05_fa_provider(value.as_deref()).map(|provider| (provider, value.is_some()))
+    }).clone()
+}
+
 fn bf16_sdpa_mode() -> Bf16SdpaMode {
     use std::sync::OnceLock;
     static MODE: OnceLock<Bf16SdpaMode> = OnceLock::new();
@@ -1410,6 +1447,12 @@ fn launch_packed_qkv_flash_bf16(
 
 fn batched_equal_flash_shape(batch: usize, tokens: usize, heads: usize, head_dim: usize) -> bool {
     batch == 2 && tokens == 256 && heads == 16 && head_dim == 64
+}
+
+/// Whether a tensor tuple is the fixed PI0.5 vision QY2 D72 geometry.
+#[cfg_attr(not(test), allow(dead_code))]
+fn qy2_d72_shape(batch: usize, tokens: usize, heads: usize, head_dim: usize) -> bool {
+    batch == 2 && tokens == 256 && heads == 16 && head_dim == 72
 }
 
 pub fn try_noncausal_batched_equal(
@@ -2301,6 +2344,19 @@ pub fn noncausal_strided_qkv_hdim96_bm64(
 }
 
 #[cfg(test)]
+mod qy2_d72_contract_tests {
+    use super::qy2_d72_shape;
+
+    #[test]
+    fn accepts_only_pi05_vision_d72_geometry() {
+        assert!(qy2_d72_shape(2, 256, 16, 72));
+        assert!(!qy2_d72_shape(2, 256, 16, 64));
+        assert!(!qy2_d72_shape(1, 256, 16, 72));
+        assert!(!qy2_d72_shape(2, 128, 16, 72));
+    }
+}
+
+#[cfg(test)]
 mod routing_tests {
     use super::{
         batched_equal_flash_shape, general_causal_gqa_flash_shape, general_noncausal_flash_shape,
@@ -2346,11 +2402,14 @@ mod tests {
     //! Needs a MUSA device, so it is `#[ignore]`d:
     //! `cargo test -p apxinf-musa --lib -- --ignored --nocapture`.
 
-    use apxinf_core::{DType, Shape, Tensor};
+    use std::sync::Arc;
+
+    use apxinf_core::{DType, Graph, Shape, Tensor};
 
     use crate::context::MusaContext;
+    use crate::graph::capture;
     use crate::kernels::attention::{
-        mha_bf16, mqa_bf16, mqa_bf16_into, mqa_bf16_into_with, mqa_bf16_into_with_workspace,
+        mha_bf16, mha_bf16_into, mqa_bf16, mqa_bf16_into, mqa_bf16_into_with, mqa_bf16_into_with_workspace,
         mqa_fp8_into_with_workspace, split_qkv_bias_bf16,
     };
     use crate::kernels::attention::{ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM, VISION_HEAD_DIM};
@@ -3003,6 +3062,39 @@ mod tests {
 
     #[test]
     #[ignore = "needs a MUSA device"]
+    fn qy2_d72_repeats_eager_and_replays_graph() {
+        let ctx = Arc::new(MusaContext::new(0).expect("MUSA device 0"));
+        let batches = 2usize;
+        let tokens_per_batch = 256usize;
+        let heads = 16usize;
+        let tokens = batches * tokens_per_batch;
+        let shape = Shape::new(vec![tokens, heads, VISION_HEAD_DIM]);
+        let q = upload(&ctx, &values(tokens * heads * VISION_HEAD_DIM, 0x27d4_eb2f), shape.clone());
+        let k = upload(&ctx, &values(tokens * heads * VISION_HEAD_DIM, 0x1656_67b1), shape.clone());
+        let v = upload(&ctx, &values(tokens * heads * VISION_HEAD_DIM, 0x9e37_79b9), shape);
+        let mut output = ctx.allocate_output(Shape::new(vec![tokens, heads, VISION_HEAD_DIM]), DType::BF16).expect("output");
+
+        mha_bf16_into(&ctx, &q, &k, &v, &mut output, tokens_per_batch).expect("eager warmup");
+        ctx.synchronize().expect("warmup synchronize");
+        let expected = read_back(&output);
+        for _ in 0..2 {
+            mha_bf16_into(&ctx, &q, &k, &v, &mut output, tokens_per_batch).expect("eager repeat");
+            ctx.synchronize().expect("repeat synchronize");
+            assert_eq!(read_back(&output), expected, "eager D72 output changed");
+        }
+
+        let graph = capture(Arc::clone(&ctx), || {
+            mha_bf16_into(&ctx, &q, &k, &v, &mut output, tokens_per_batch)
+        }).expect("capture D72 graph");
+        for _ in 0..5 {
+            graph.replay().expect("replay D72 graph");
+            ctx.synchronize().expect("replay synchronize");
+            assert_eq!(read_back(&output), expected, "graph D72 output changed");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a MUSA device"]
     fn mha_matches_a_reference_across_window_shapes() {
         let ctx = MusaContext::new(0).expect("MUSA device 0");
         // The model's shape.
@@ -3270,6 +3362,22 @@ mod route_tests {
     }
 
     #[test]
+    fn pi05_fa_provider_defaults_to_custom() {
+        assert_eq!(parse_pi05_fa_provider(None), parse_pi05_fa_provider(Some("custom")));
+        assert_eq!(parse_pi05_fa_provider(Some("mudnn")), Ok(Pi05FaProvider::Mudnn));
+    }
+
+    #[test]
+    fn pi05_fa_provider_accepts_custom_and_auto() {
+        assert_eq!(parse_pi05_fa_provider(Some("custom")), Ok(Pi05FaProvider::Custom));
+        assert_eq!(parse_pi05_fa_provider(Some("auto")), Ok(Pi05FaProvider::Auto));
+    }
+
+    #[test]
+    fn pi05_fa_provider_rejects_unknown_values() {
+        assert!(parse_pi05_fa_provider(Some("legacy")).is_err());
+    }
+
     fn a_prefix_pass_is_not_a_fallback() {
         assert!(require_packed_decode(522, 522, TacticDispatch::RequireExact).is_ok());
     }

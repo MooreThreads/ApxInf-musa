@@ -98,10 +98,28 @@ impl MusaLibraryVersions {
     }
 }
 
+#[cfg(apxinf_musa_available)]
+#[derive(Default)]
+pub(crate) struct D72State(pub(crate) *mut std::ffi::c_void);
+
+// The handle is only accessed under its owner's mutex; teardown binds its
+// driver context explicitly and does not depend on the creating host thread.
+#[cfg(apxinf_musa_available)]
+unsafe impl Send for D72State {}
+
+#[cfg(apxinf_musa_available)]
+impl Drop for D72State {
+    fn drop(&mut self) {
+        unsafe { ffi::mubin::apxinf_musa_fa_d72_release(self.0) };
+    }
+}
+
 pub struct MusaContext {
     pub(crate) native_attention: std::sync::Mutex<crate::kernels::attention::mp31::State>,
     pub(crate) native_fp8_weights:
         std::sync::Mutex<crate::kernels::gemm::mp31_fp8::PreparedWeights>,
+    #[cfg(apxinf_musa_available)]
+    pub(crate) d72: std::sync::Mutex<D72State>,
     pub(crate) asm_weights: std::sync::Mutex<crate::kernels::gemm::assembly::PreparedWeights>,
     device_id: usize,
     caps: MusaDeviceCaps,
@@ -192,6 +210,8 @@ impl MusaContext {
         }
         warn_unmeasured_generation(&caps);
         Ok(Self {
+            #[cfg(apxinf_musa_available)]
+            d72: Default::default(),
             asm_weights: Default::default(),
             native_attention: Default::default(),
             native_fp8_weights: Default::default(),

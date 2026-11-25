@@ -67,6 +67,24 @@ pub fn check_fa_d256(status: i32, operation: &str) -> Result<(), String> {
     })
 }
 
+/// Independent QY2 BF16 D72 forward flash attention for PI0.5 vision.
+extern "C" {
+    pub fn apxinf_musa_fa_d72_release(owner: *mut c_void);
+    pub fn apxinf_musa_fa_d72(
+        owner: *mut *mut c_void,
+        q: *const c_void, k: *const c_void, v: *const c_void, out: *mut c_void,
+        batch: i32, heads: i32, tokens: i32, head_dim: i32, stream: *mut c_void,
+    ) -> i32;
+    pub fn apxinf_musa_fa_d72_last_error() -> *const c_char;
+}
+
+pub fn check_fa_d72(status: i32, operation: &str) -> Result<(), String> {
+    crate::ffi::check_status(status, || {
+        let text = unsafe { crate::ffi::error_text(apxinf_musa_fa_d72_last_error()) };
+        format!("{operation}: {}", text.unwrap_or_else(|| format!("QY2 D72 status {status}")))
+    })
+}
+
 // MP22 BF16 GEMM and load-time KN -> NK packing. All launches use the supplied
 // engine stream; modules must have been warmed before capture.
 extern "C" {

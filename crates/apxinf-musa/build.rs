@@ -210,6 +210,7 @@ const VENDOR_FMHA_FLAGS: &[&str] = &[
 /// symbol `mate_fa_d256_mp22`, so which one runs is decided by which image the
 /// driver loaded, and they cannot share a translation unit.
 const MUBIN_VARIANTS: &[(&str, &str)] = &[
+    ("asm_qy2_bf16flash_atten_512_256x64x128", "kApxinfMusaFaD72Mp22Image"),
     ("fa_d256_mp22", "kApxinfMusaFaD256Mp22Image"),
     ("fa_d256_mp22_decode", "kApxinfMusaFaD256Mp22DecodeImage"),
     ("fa_d256_mp22_splitkv", "kApxinfMusaFaD256Mp22SplitkvImage"),
