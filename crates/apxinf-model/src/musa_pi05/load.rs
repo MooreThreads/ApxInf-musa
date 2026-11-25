@@ -80,6 +80,14 @@ pub(crate) fn load_model_runner(
             calibration_path.is_some() || options.uniform_fp8_scale.is_some(),
         )
         .ensure_supported(family)?;
+    if model_variant == ModelVariantChoice::W4A16Bf16Expert {
+        if !apxinf_musa::MUSA_AVAILABLE || apxinf_musa::MUSA_ARCH != "mp_22" {
+            return Err(Error::Other("PI0.5 W4A16 requires a native mp_22 MUSA build".into()));
+        }
+        if config.patch_size == 0 || config.num_views.checked_mul(config.patches_per_view()) != Some(512) {
+            return Err(Error::Other("PI0.5 native W4A16 requires 512 total vision patches".into()));
+        }
+    }
     if matches!(model_variant, ModelVariantChoice::Fp8Static)
         && apxinf_musa::FP8_ROUTE == "unsupported"
     {
@@ -117,29 +125,28 @@ pub(crate) fn load_model_runner(
 
     let host_weights = match options.synthetic {
         Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
-        None => Pi05Weights::from_safetensors(&config, path)?,
+        None => Pi05Weights::from_safetensors(
+            &config,
+            path,
+            matches!(model_variant, ModelVariantChoice::W4A16Bf16Expert),
+        )?,
     };
     let policies = L3Policies::default();
     install_tactics(&backend, options)?;
     let model = match model_variant {
         ModelVariantChoice::Fp8Static => {
-            let scales = fp8_scales.ok_or_else(|| {
-                Error::Other("PI0.5 FP8 activation scales were not resolved during load".into())
-            })?;
+            let scales = fp8_scales.ok_or_else(|| Error::Other("PI0.5 FP8 activation scales were not resolved during load".into()))?;
             let weights = Arc::new(Fp8StaticWeights::from_host(&host_weights, &*backend)?);
-            // Weight packing is the only reader of the host copy.
             drop(host_weights);
             let time_embeddings = upload_time_embeddings_fp8_static(&config, &*backend)?;
-            ModelVariant::Fp8Static {
-                model: build_fp8_static_model_with_policies(
-                    Arc::clone(&backend),
-                    Arc::clone(&config),
-                    weights,
-                    scales,
-                    policies,
-                    &time_embeddings,
-                )?,
-            }
+            ModelVariant::Fp8Static { model: build_fp8_static_model_with_policies(Arc::clone(&backend), Arc::clone(&config), weights, scales, policies, &time_embeddings)? }
+        }
+        ModelVariantChoice::W4A16Bf16Expert => {
+            let weights = Arc::new(super::weights::W4Weights::from_host(&host_weights, &backend)?);
+            drop(host_weights);
+            weights.prepare_assembly_weights(&backend)?;
+            let embeddings = upload_time_embeddings_bf16(&config, &backend)?;
+            ModelVariant::W4 { model: super::model::build_w4_model(Arc::clone(&backend), Arc::clone(&config), weights, policies, &embeddings)? }
         }
         ModelVariantChoice::Int8Dynamic | ModelVariantChoice::Int8DynamicNoEncode => {
             let scope = match model_variant {

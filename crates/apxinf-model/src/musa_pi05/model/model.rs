@@ -1,5 +1,5 @@
 //! Construction and typed dispatch of loaded PI0.5 computation. No execution policy or capture ownership.
-use super::blocks::{Bf16Blocks, Fp8StaticBlocks, Int8DynamicBlocks, L3Policies};
+use super::blocks::{Bf16Blocks, Fp8StaticBlocks, Int8DynamicBlocks, W4Blocks, L3Policies};
 use super::Pi05Model;
 use super::{Bf16Model, Fp8StaticModel, Int8DynamicModel};
 use crate::musa_pi05::backend::{self, Context};
@@ -116,6 +116,7 @@ pub(in crate::musa_pi05) enum ModelVariant {
     Bf16 {
         model: Bf16Model,
     },
+    W4 { model: Arc<Pi05Model<W4Blocks>> },
     Int8Dynamic {
         model: Int8DynamicModel,
         /// Which `int8_dynamic` spelling this is, for reporting
@@ -133,6 +134,7 @@ impl ModelVariant {
     pub(in crate::musa_pi05) fn name(&self) -> &'static str {
         match self {
             Self::Bf16 { .. } => "bf16",
+            Self::W4 { .. } => "w4a16_bf16_expert",
             Self::Int8Dynamic { name, .. } => name,
             Self::Fp8Static { .. } => "fp8_static",
         }
@@ -143,6 +145,7 @@ impl ModelVariant {
         token_count: usize,
     ) -> Result<super::WorkspaceRequirements> {
         match self {
+            Self::W4 { model } => model.workspace_requirements(token_count),
             Self::Bf16 { model, .. } => model.workspace_requirements(token_count),
             Self::Int8Dynamic { model, .. } => model.workspace_requirements(token_count),
             Self::Fp8Static { model, .. } => model.workspace_requirements(token_count),
@@ -157,6 +160,7 @@ impl ModelVariant {
         noise: &Tensor,
     ) -> Result<Tensor> {
         match self {
+            Self::W4 { model } => model.infer(patches, token_ids, token_count, noise),
             Self::Bf16 { model } => model.infer(patches, token_ids, token_count, noise),
             Self::Int8Dynamic { model, .. } => model.infer(patches, token_ids, token_count, noise),
             Self::Fp8Static { model } => model.infer(patches, token_ids, token_count, noise),
@@ -184,6 +188,7 @@ impl ModelVariant {
         operation: O,
     ) -> Result<O::Output> {
         match self {
+            Self::W4 { model } => operation.run(model),
             Self::Bf16 { model } => operation.run(model),
             Self::Int8Dynamic { model, .. } => operation.run(model),
             Self::Fp8Static { model } => operation.run(model),
@@ -200,6 +205,7 @@ impl ModelVariant {
     ) -> Result<()> {
         use super::PrepareBlocks;
         match self {
+            Self::W4 { model } => model.blocks.preprocess(images, patches, layout),
             Self::Bf16 { model, .. } => model.blocks.preprocess(images, patches, layout),
             Self::Int8Dynamic { model, .. } => model.blocks.preprocess(images, patches, layout),
             Self::Fp8Static { model, .. } => model.blocks.preprocess(images, patches, layout),
@@ -212,4 +218,8 @@ impl ModelVariant {
 pub(in crate::musa_pi05) trait ModelOperation {
     type Output;
     fn run<B: super::PrepareBlocks>(self, model: &Arc<Pi05Model<B>>) -> Result<Self::Output>;
+}
+
+pub(in crate::musa_pi05) fn build_w4_model(backend: Arc<Context>, config: Arc<Pi05Config>, weights: Arc<crate::musa_pi05::W4Weights>, policies: L3Policies, embeddings: &[Tensor]) -> Result<Arc<Pi05Model<W4Blocks>>> {
+    Ok(Arc::new(Pi05Model::new(W4Blocks::new(backend,config,weights,policies)?,embeddings)?))
 }

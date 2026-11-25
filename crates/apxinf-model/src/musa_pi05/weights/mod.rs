@@ -13,3 +13,6 @@ pub use fp8_static::*;
 pub use fp8_static_calibration::*;
 pub use host::*;
 pub use int8_dynamic::*;
+
+mod w4a16;
+pub use w4a16::*;

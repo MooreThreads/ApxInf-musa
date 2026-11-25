@@ -105,15 +105,15 @@ pub struct Pi05Weights {
 
 impl Pi05Weights {
     /// Load a single-file or sharded LeRobot/OpenPI SafeTensors checkpoint.
-    pub fn from_safetensors(config: &Pi05Config, path: &Path) -> Result<Self> {
+    pub fn from_safetensors(config: &Pi05Config, path: &Path, keep_mlp_scale: bool) -> Result<Self> {
         let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
             .map_err(|error| Error::Other(format!("load PI0.5 SafeTensors: {error}")))?;
-        Self::from_map(config, tensors)
+        Self::from_map(config, tensors, keep_mlp_scale)
     }
 
     /// Consume a LeRobot/OpenPI PI0.5 safetensors map and validate every tensor
     /// required by the inference graph. Unused action LM-head weights may remain.
-    pub fn from_map(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+    pub fn from_map(config: &Pi05Config, mut tensors: HashMap<String, Tensor>, keep_mlp_scale: bool) -> Result<Self> {
         config.validate()?;
         normalize_lerobot_prefix(&mut tensors);
 
@@ -184,11 +184,8 @@ impl Pi05Weights {
         let mut language_layers = Vec::with_capacity(config.language.depth);
         for layer in 0..config.language.depth {
             let p = format!("{language_prefix}.layers.{layer}");
-            // Fold Gemma's learned RMSNorm multiplier into the consuming
-            // weights in FP32 before the destination format is chosen. Keeping
-            // it as an activation multiply can round channels near -1 to zero,
-            // and it gives the packed QKV/gate-up matrix a much worse tensor
-            // scale; after the fold the norm multipliers become `ones` below.
+            // QKV always uses folded weights. W4 gate/up instead quantizes raw
+            // weights and applies the learned scale once, in the preceding RMSNorm.
             let attention_scale =
                 add_one(take(&mut tensors, &format!("{p}.input_layernorm.weight"))?)?;
             let mlp_scale = add_one(take(
@@ -200,12 +197,17 @@ impl Pi05Weights {
             attention.k = fold_input_scale(attention.k, &attention_scale)?;
             attention.v = fold_input_scale(attention.v, &attention_scale)?;
             let mut mlp = take_mlp(&mut tensors, &p)?;
-            mlp.gate = fold_input_scale(mlp.gate, &mlp_scale)?;
-            mlp.up = fold_input_scale(mlp.up, &mlp_scale)?;
+            let post_attention_norm_scale = if keep_mlp_scale {
+                mlp_scale
+            } else {
+                mlp.gate = fold_input_scale(mlp.gate, &mlp_scale)?;
+                mlp.up = fold_input_scale(mlp.up, &mlp_scale)?;
+                ones(mlp_scale.shape().dims())?
+            };
             language_layers.push(LanguageLayerWeights {
                 input_norm_scale: ones(attention_scale.shape().dims())?,
                 attention,
-                post_attention_norm_scale: ones(mlp_scale.shape().dims())?,
+                post_attention_norm_scale,
                 mlp,
             });
         }

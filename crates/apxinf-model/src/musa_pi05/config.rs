@@ -307,15 +307,14 @@ impl Pi05Config {
     }
 
     /// Reservation for the static-FP8 graph: the BF16 arena, unchanged.
-    ///
-    /// The composed operators allocate extra BF16 scratch the BF16 route does
-    /// not: `gemm_bias_gelu` holds the GEMM result and the activated result
-    /// before quantizing, and the norm variants hold their normalized BF16
-    /// output alongside the E4M3 copy. The measured configurations fit inside
-    /// the doubled BF16 reservation; a new image size or view count should be
-    /// measured before it is treated as supported.
     pub fn graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
         self.graph_workspace_bytes_bf16(token_count)
+    }
+
+    /// W4 uses no activation quantization or global dequantization scratch.
+    pub fn graph_workspace_bytes_w4a16(&self, token_count: usize) -> Result<usize> {
+        self.graph_workspace_bytes(token_count)?.checked_add(256 * 1024 * 1024)
+            .ok_or_else(|| Error::Other("W4 workspace overflow".into()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -532,10 +531,12 @@ pub enum ModelVariantChoice {
     /// expert do not. Everything downstream (dispatch, kernels, captures) is
     /// shared with `int8_dynamic`; only weight preparation differs.
     Int8DynamicNoEncode,
+    W4A16Bf16Expert,
 }
 impl ModelVariantChoice {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::W4A16Bf16Expert => "w4a16_bf16_expert",
             Self::Auto => "auto",
             Self::Bf16 => "bf16",
             Self::Fp8Static => "fp8_static",
@@ -561,6 +562,9 @@ impl ModelVariantChoice {
     /// Reject an explicitly selected implementation before loading or
     /// quantizing weights when the device cannot execute its full model path.
     pub fn ensure_supported(self, family: MusaArchFamily) -> Result<Self> {
+        if self == Self::W4A16Bf16Expert && family != MusaArchFamily::Mp22 {
+            return Err(Error::Other(format!("PI0.5 native W4A16 requires mp_22; device is {family}")));
+        }
         if self == Self::Fp8Static && !family.has_native_fp8() {
             return Err(Error::Other(format!(
                 "PI0.5 model_variant=fp8_static requires mp_31 (S5000/S4000); this device is {family}, which has no E4M3 MMA. There is no FP8 emulation fallback"
@@ -573,10 +577,11 @@ impl std::str::FromStr for ModelVariantChoice {
     type Err = apxinf_core::Error;
     fn from_str(value: &str) -> apxinf_core::Result<Self> {
         match value {
+            "w4a16_bf16_expert" => Ok(Self::W4A16Bf16Expert),
             "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
             "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
             "int8_dynamic_no_encode" => Ok(Self::Int8DynamicNoEncode),
-            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static, int8_dynamic or int8_dynamic_no_encode"))),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static, int8_dynamic, int8_dynamic_no_encode or w4a16_bf16_expert"))),
         }
     }
 }
@@ -591,6 +596,7 @@ mod model_variant_tests {
             ModelVariantChoice::Fp8Static,
             ModelVariantChoice::Int8Dynamic,
             ModelVariantChoice::Int8DynamicNoEncode,
+            ModelVariantChoice::W4A16Bf16Expert,
         ] {
             assert_eq!(v.as_str().parse::<ModelVariantChoice>().unwrap(), v);
         }
@@ -615,6 +621,8 @@ mod model_variant_tests {
             ModelVariantChoice::Bf16.resolve(MusaArchFamily::Mp31, true),
             ModelVariantChoice::Bf16
         );
+        assert!(ModelVariantChoice::W4A16Bf16Expert.ensure_supported(MusaArchFamily::Mp22).is_ok());
+        assert!(ModelVariantChoice::W4A16Bf16Expert.ensure_supported(MusaArchFamily::Mp31).is_err());
         let error = ModelVariantChoice::Fp8Static
             .ensure_supported(MusaArchFamily::Mp22)
             .unwrap_err()

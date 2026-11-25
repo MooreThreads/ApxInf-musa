@@ -102,6 +102,7 @@ pub struct MusaContext {
     pub(crate) native_attention: std::sync::Mutex<crate::kernels::attention::mp31::State>,
     pub(crate) native_fp8_weights:
         std::sync::Mutex<crate::kernels::gemm::mp31_fp8::PreparedWeights>,
+    identity: u64,
     pub(crate) asm_weights: std::sync::Mutex<crate::kernels::gemm::assembly::PreparedWeights>,
     device_id: usize,
     caps: MusaDeviceCaps,
@@ -191,7 +192,9 @@ impl MusaContext {
             )));
         }
         warn_unmeasured_generation(&caps);
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            identity: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             asm_weights: Default::default(),
             native_attention: Default::default(),
             native_fp8_weights: Default::default(),
@@ -202,6 +205,8 @@ impl MusaContext {
             tuning: RwLock::new(Arc::new(TuningSession::inference(Default::default()))),
         })
     }
+
+    pub(crate) fn scratch_identity(&self) -> (u64,u64) { (self.identity,self.stream.generation()) }
 
     pub fn device_id(&self) -> usize {
         self.device_id
