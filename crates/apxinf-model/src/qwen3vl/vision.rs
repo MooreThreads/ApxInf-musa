@@ -118,9 +118,7 @@ fn forward_impl(
         //   qkv[n, :] = [q[n,h,d] for h,d] ++ [k[n,h,d] for h,d] ++ [v[n,h,d] for h,d]
         // We need to extract Q = qkv[:, 0:1024], K = qkv[:, 1024:2048],
         // V = qkv[:, 2048:3072] as [N, n_heads, head_dim] tensors.
-        let q = slice_and_reshape(b, &qkv, 0, hidden, n_patches, n_heads, head_dim)?;
-        let k = slice_and_reshape(b, &qkv, hidden, hidden, n_patches, n_heads, head_dim)?;
-        let v = slice_and_reshape(b, &qkv, 2 * hidden, hidden, n_patches, n_heads, head_dim)?;
+        let (q, k, v) = split_vision_qkv(b, &qkv, n_patches, n_heads, head_dim)?;
 
         // Vision 2D-RoPE on Q and K
         let q = b.rope_vision_2d(&q, n_heads, head_dim, 10000.0, &pos_ids)?;
@@ -297,6 +295,28 @@ fn reshape_merge(
         dtype => return Err(Error::Other(format!("Qwen3-VL merge reshape does not support {dtype}"))),
     };
     b.to_device(&out)
+}
+
+/// Split packed vision projections while preserving token-major layout.
+fn split_vision_qkv(
+    b: &dyn Backend, qkv: &Tensor, rows: usize, heads: usize, dim: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let width = heads * dim;
+    #[cfg(feature = "musa")]
+    if let Some(musa) = b.as_any().downcast_ref::<apxinf_musa::MusaBackend>() {
+        if qkv.dtype() == apxinf_core::DType::BF16 {
+            let (q, k, v) = apxinf_musa::kernels::elementwise::split_qkv_uneven_bf16(
+                musa.context(), qkv, width, width, width,
+            )?;
+            let shape = vec![rows, heads, dim];
+            return Ok((q.reshape(shape.clone())?, k.reshape(shape.clone())?, v.reshape(shape)?));
+        }
+    }
+    Ok((
+        slice_and_reshape(b, qkv, 0, width, rows, heads, dim)?,
+        slice_and_reshape(b, qkv, width, width, rows, heads, dim)?,
+        slice_and_reshape(b, qkv, 2 * width, width, rows, heads, dim)?,
+    ))
 }
 
 /// Extract a contiguous slice `qkv[:, col_start..col_start+width]` and
