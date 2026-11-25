@@ -80,6 +80,14 @@ pub(crate) fn load_model_runner(
             calibration_path.is_some() || options.uniform_fp8_scale.is_some(),
         )
         .ensure_supported(family)?;
+    if model_variant == ModelVariantChoice::W4A16Bf16Expert {
+        if !apxinf_musa::MUSA_AVAILABLE || apxinf_musa::MUSA_ARCH != "mp_22" {
+            return Err(Error::Other("PI0.5 W4A16 requires a native mp_22 MUSA build".into()));
+        }
+        if config.patch_size == 0 || config.num_views.checked_mul(config.patches_per_view()) != Some(512) {
+            return Err(Error::Other("PI0.5 native W4A16 requires 512 total vision patches".into()));
+        }
+    }
     if matches!(model_variant, ModelVariantChoice::Fp8Static)
         && apxinf_musa::FP8_ROUTE == "unsupported"
     {

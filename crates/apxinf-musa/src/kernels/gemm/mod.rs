@@ -200,6 +200,3 @@ pub fn configure_tuning(
 ) -> Result<()> {
     crate::tuning::configure(ctx, mode, databases, paths)
 }
-
-#[cfg(apxinf_musa_available)]
-pub(crate) use tilelang::launch_w4;

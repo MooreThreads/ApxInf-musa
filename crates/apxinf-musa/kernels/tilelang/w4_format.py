@@ -17,7 +17,7 @@ def quantize(weight):
     padded[:, :k] = w.T
     groups = padded.reshape(n, -1, 16)
     maximum = np.max(np.abs(groups), axis=2)
-    raw = np.where(maximum == 0, 1., maximum / 7.)
+    raw = np.where(maximum == 0, 1., (maximum * np.float32(0.98)) / 7.)
     scales = raw.astype(ml_dtypes.bfloat16)
     sf = scales.astype(np.float32)
     if not np.isfinite(sf).all() or (sf < np.finfo(np.float32).tiny).any():

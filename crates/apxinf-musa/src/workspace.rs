@@ -172,7 +172,7 @@ impl ExecutionSession {
 
     /// Diagnostic route is default-off and allocates before preparation/capture.
     pub fn with_context_capacity(capacity_bytes: usize, ctx: &MusaContext, eligible: bool) -> Result<Self> {
-        if eligible && w4_native_enabled() { Self::with_w4_capacity(capacity_bytes,ctx) }
+        if eligible { Self::with_w4_capacity(capacity_bytes,ctx) }
         else { Self::with_capacity(capacity_bytes,ctx.device_id()) }
     }
 
@@ -650,6 +650,7 @@ mod w4_scratch_contract_tests {
 mod w4_real_scratch_tests {
     use super::*;
     #[test]
+    #[ignore = "requires a physical MUSA device"]
     fn physical_w4_graph_retains_scratch_and_rejects_replacement() {
         use apxinf_core::Graph;
         use std::sync::Arc;
@@ -688,11 +689,11 @@ mod w4_real_scratch_tests {
     // the original TileLang diagnostic. Sparse BF16 A permits an independent
     // exact FP32 reference for every output without a host multi-billion GEMM.
     #[test]
+    #[ignore = "requires a physical MUSA device"]
     fn physical_w4_native_pair_random_bytes_and_changing_graph() {
-        use apxinf_core::{Graph,Shape};
+        use apxinf_core::{DType, Graph, Shape};
         use half::bf16;
         use std::sync::Arc;
-        assert!(w4_native_enabled());
         for (n,k) in [(32768usize,2048usize),(2048,16384)] {
             let m=522usize;
             let ctx=Arc::new(MusaContext::new(0).unwrap());
@@ -783,8 +784,8 @@ mod w4_real_scratch_tests {
         }
     }
     #[test]
+    #[ignore = "requires a physical MUSA device"]
     fn physical_ineligible_session_has_no_w4_allocation() {
-        assert!(w4_native_enabled(), "run with APXINF_MUSA_W4_NATIVE_PAIR=1");
         let ctx=MusaContext::new(0).unwrap();
         let plain=ExecutionSession::with_context_capacity(256,&ctx,false).unwrap();
         assert_eq!(plain.w4_scratch_capacity(),0);
@@ -794,6 +795,7 @@ mod w4_real_scratch_tests {
         assert_eq!(plain.workspace().capacity(),256);
     }
     #[test]
+    #[ignore = "requires a physical MUSA device"]
     fn physical_w4_scratch_reuses_and_rejects_other_stream() {
         let ctx = MusaContext::new(0).unwrap();
         let other = MusaContext::new(0).unwrap();
@@ -809,10 +811,6 @@ mod w4_real_scratch_tests {
     }
 }
 
-pub(crate) fn w4_native_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("APXINF_MUSA_W4_NATIVE_PAIR").as_deref()==Ok("1"))
-}
 pub(crate) fn w4_session_buffer(ctx: &MusaContext,n: usize,k: usize) -> Result<MusaBuffer> {
     ACTIVE_SESSION.with(|active| {
         let inner=active.get();

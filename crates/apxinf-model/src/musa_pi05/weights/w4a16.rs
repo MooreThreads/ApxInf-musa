@@ -52,6 +52,11 @@ impl W4Weights {
     /// host checkpoint is dropped, which is what keeps the transposes from
     /// meeting a live FP32 copy of the model.
     pub fn prepare_assembly_weights(&self, context: &Context) -> Result<()> {
+        for layer in &self.language_layers {
+            for linear in [&layer.qkv, &layer.output] {
+                backend::gemm::prepare_bf16_nn_weight(context, &linear.weight)?;
+            }
+        }
         for linear in [&self.action_in, &self.action_out] {
             backend::gemm::prepare_bf16_nt_weight(context, &linear.weight)?;
         }

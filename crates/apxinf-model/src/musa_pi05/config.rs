@@ -562,6 +562,9 @@ impl ModelVariantChoice {
     /// Reject an explicitly selected implementation before loading or
     /// quantizing weights when the device cannot execute its full model path.
     pub fn ensure_supported(self, family: MusaArchFamily) -> Result<Self> {
+        if self == Self::W4A16Bf16Expert && family != MusaArchFamily::Mp22 {
+            return Err(Error::Other(format!("PI0.5 native W4A16 requires mp_22; device is {family}")));
+        }
         if self == Self::Fp8Static && !family.has_native_fp8() {
             return Err(Error::Other(format!(
                 "PI0.5 model_variant=fp8_static requires mp_31 (S5000/S4000); this device is {family}, which has no E4M3 MMA. There is no FP8 emulation fallback"
@@ -578,7 +581,7 @@ impl std::str::FromStr for ModelVariantChoice {
             "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
             "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
             "int8_dynamic_no_encode" => Ok(Self::Int8DynamicNoEncode),
-            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static, int8_dynamic or int8_dynamic_no_encode"))),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static, int8_dynamic, int8_dynamic_no_encode or w4a16_bf16_expert"))),
         }
     }
 }
@@ -593,6 +596,7 @@ mod model_variant_tests {
             ModelVariantChoice::Fp8Static,
             ModelVariantChoice::Int8Dynamic,
             ModelVariantChoice::Int8DynamicNoEncode,
+            ModelVariantChoice::W4A16Bf16Expert,
         ] {
             assert_eq!(v.as_str().parse::<ModelVariantChoice>().unwrap(), v);
         }
@@ -617,6 +621,8 @@ mod model_variant_tests {
             ModelVariantChoice::Bf16.resolve(MusaArchFamily::Mp31, true),
             ModelVariantChoice::Bf16
         );
+        assert!(ModelVariantChoice::W4A16Bf16Expert.ensure_supported(MusaArchFamily::Mp22).is_ok());
+        assert!(ModelVariantChoice::W4A16Bf16Expert.ensure_supported(MusaArchFamily::Mp31).is_err());
         let error = ModelVariantChoice::Fp8Static
             .ensure_supported(MusaArchFamily::Mp22)
             .unwrap_err()
