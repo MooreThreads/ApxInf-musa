@@ -104,7 +104,7 @@ impl Qwen3VLTextWeights {
 /// decode graph can use a row-major GEMM. Mirrors `llama::transpose_weight`
 /// which we don't reuse because it lives in a different module and the
 /// Qwen3-VL loader path stays self-contained.
-fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+pub(crate) fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
     let dims = tensor.shape().dims();
     if dims.len() != 2 {
         return Err(Error::Other(format!(
