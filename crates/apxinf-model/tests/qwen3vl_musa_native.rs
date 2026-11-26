@@ -355,3 +355,36 @@ fn native_image_matches_saved_baseline() -> Result<(), Box<dyn std::error::Error
     assert!(cosine > 0.999);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires M1000 and exported HF text fixture"]
+fn native_prefill_reports_stable_workspace() -> Result<(), Box<dyn std::error::Error>> {
+    use apxinf_model::musa_qwen3vl::Qwen3VlMusaExecutor;
+    use std::{env, fs, path::PathBuf};
+    #[derive(serde::Deserialize)]
+    struct Text {
+        tokens: Vec<u32>,
+    }
+    let dir = PathBuf::from(env::var("QWEN_GENERATION_FIXTURES")?);
+    let case: Text = serde_json::from_slice(&fs::read(dir.join("text.json"))?)?;
+    let mut model =
+        Qwen3VlMusaExecutor::load(0, &PathBuf::from(env::var("APXINF_QWEN3VL_MODEL_DIR")?))?;
+    let first = model.prefill_text(&case.tokens)?;
+    model.synchronize()?;
+    let used = model.workspace_bytes_used();
+    assert!(
+        used > 0,
+        "native prefill must use the persistent execution workspace"
+    );
+    let read = |t: &apxinf_core::Tensor| apxinf_musa::transfers::to_cpu(t)?.to_f32_vec();
+    let original = read(&first)?;
+    let mut changed = case.tokens.clone();
+    *changed.last_mut().unwrap() = 1;
+    model.reset()?;
+    let second = model.prefill_text(&changed)?;
+    model.synchronize()?;
+    assert_eq!(model.workspace_bytes_used(), used);
+    assert_ne!(original, read(&second)?);
+    assert_eq!(original, read(&first)?);
+    Ok(())
+}

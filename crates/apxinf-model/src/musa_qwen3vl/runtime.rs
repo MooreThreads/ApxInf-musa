@@ -30,6 +30,19 @@ impl MusaQwenRuntime {
     pub fn output(&self, shape: Shape, dtype: DType) -> Result<Tensor> {
         self.context.allocate_output(shape, dtype)
     }
+    pub(super) fn stable_copy(&self, tensor: &Tensor) -> Result<Tensor> {
+        self.require_device(tensor)?;
+        let source = apxinf_musa::MusaBuffer::from_tensor(tensor).map_err(Error::Other)?;
+        let bytes = source.len();
+        let destination =
+            apxinf_musa::MusaBuffer::alloc_on(&self.context, bytes).map_err(Error::Other)?;
+        destination
+            .copy_from_device_async(&source, bytes, self.context.stream())
+            .map_err(Error::Other)?;
+        destination
+            .as_tensor(tensor.shape().clone(), tensor.dtype())
+            .map_err(Error::Other)
+    }
     pub fn require_device(&self, tensor: &Tensor) -> Result<()> {
         if tensor.device() != self.device() {
             return Err(Error::DeviceMismatch {

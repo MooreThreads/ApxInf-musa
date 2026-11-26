@@ -1,6 +1,7 @@
 use super::NativeSequenceState;
 use super::{load::load_weights, runtime::MusaQwenRuntime, weights::NativeQwenWeights};
 use apxinf_core::{Error, Result, Tensor};
+use apxinf_musa::ExecutionSession;
 use std::path::Path;
 
 pub struct Qwen3VlMusaExecutor {
@@ -9,6 +10,7 @@ pub struct Qwen3VlMusaExecutor {
     cache: Vec<Option<super::kv_cache::LayerCache>>,
     next_rope: u32,
     pub(crate) sequence: NativeSequenceState,
+    session: Option<ExecutionSession>,
 }
 
 impl Qwen3VlMusaExecutor {
@@ -21,6 +23,7 @@ impl Qwen3VlMusaExecutor {
             runtime,
             weights,
             sequence: NativeSequenceState::default(),
+            session: None,
         })
     }
     pub fn reset(&mut self) -> Result<()> {
@@ -69,16 +72,30 @@ impl Qwen3VlMusaExecutor {
     ) -> Result<Tensor> {
         let start = self.sequence.position();
         let cap = self.capacity();
-        let ret = super::language::forward(
-            self.runtime.context(),
-            &self.weights,
-            &mut self.cache,
-            start,
-            cap,
-            ids,
-            positions,
-            image,
-        );
+        let session = if start == 0 {
+            self.prefill_session(ids.len())?
+        } else {
+            None
+        };
+        let mut forward = || {
+            super::language::forward(
+                self.runtime.context(),
+                &self.weights,
+                &mut self.cache,
+                start,
+                cap,
+                ids,
+                positions,
+                image,
+            )
+        };
+        // Commit the sequence only after the result has independent storage.
+        let ret = match session {
+            Some(session) => session
+                .prepare(forward)
+                .and_then(|t| self.runtime.stable_copy(&t)),
+            None => forward(),
+        };
         match ret {
             Ok(t) => {
                 super::validate_decode_transition(&mut self.sequence, ids.len(), start)
@@ -91,6 +108,41 @@ impl Qwen3VlMusaExecutor {
                 Err(e)
             }
         }
+    }
+    fn prefill_session(&mut self, tokens: usize) -> Result<Option<ExecutionSession>> {
+        let t = &self.weights.config.text;
+        // The bump arena retains every layer's outputs through the traversal.
+        // Budget BF16 projections/MLP, head-major attention scratch including
+        // FP32 scores, and alignment. Very long prompts remain eager rather
+        // than reserving quadratic temporary storage for every layer at once.
+        let n = tokens as u128;
+        let width = (t.hidden_size as u128).max(t.n_heads as u128 * t.head_dim as u128);
+        let per_layer = n * (48 * width + 8 * t.intermediate_size as u128)
+            + 8 * n * n * t.n_heads as u128
+            + 16384;
+        let mib = 1u128 << 20;
+        let bytes = (per_layer * t.n_layers as u128 + 2 * t.vocab_size as u128 + 8 * mib)
+            .div_ceil(mib)
+            * mib;
+        if bytes > 2 * 1024 * mib {
+            return Ok(None);
+        }
+        let bytes = bytes as usize;
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|s| s.workspace().capacity() < bytes)
+        {
+            self.session = Some(ExecutionSession::with_capacity(
+                bytes,
+                self.runtime.context().device_id(),
+            )?);
+        }
+        Ok(self.session.clone())
+    }
+    /// Number of arena bytes consumed by the most recent session traversal.
+    pub fn workspace_bytes_used(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.workspace().used())
     }
     pub fn prefill_text(&mut self, ids: &[u32]) -> Result<Tensor> {
         if self.sequence.position() != 0 {
