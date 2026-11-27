@@ -18,7 +18,7 @@ impl NativeQwenWeights {
         let vision = Qwen3VLVisionWeights::from_map(&config, tensors)?;
         let lm_head = match &text.lm_head {
             Some(t) => t.clone(),
-            None => crate::qwen3vl::weights::transpose_2d(&text.token_embedding)?,
+            None => transpose_2d(&text.token_embedding)?,
         };
         Ok(Self {
             config,
@@ -87,5 +87,41 @@ impl NativeQwenWeights {
             vision,
             lm_head,
         })
+    }
+}
+
+fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
+    let dims = tensor.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Other(format!(
+            "transpose_2d expected 2D tensor, got {}D",
+            dims.len()
+        )));
+    }
+    let [rows, cols] = [dims[0], dims[1]];
+    match tensor.dtype() {
+        apxinf_core::DType::F32 => {
+            let data = tensor.as_f32()?;
+            let mut out = vec![0.0f32; rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[j * rows + i] = data[i * cols + j];
+                }
+            }
+            Tensor::from_f32(vec![cols, rows], &out)
+        }
+        apxinf_core::DType::BF16 => {
+            let data = tensor.as_bf16()?;
+            let mut out = vec![half::bf16::from_f32(0.0); rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[j * rows + i] = data[i * cols + j];
+                }
+            }
+            Tensor::from_bf16(vec![cols, rows], &out)
+        }
+        dtype => Err(Error::Other(format!(
+            "Qwen3-VL weight transpose does not support {dtype}"
+        ))),
     }
 }

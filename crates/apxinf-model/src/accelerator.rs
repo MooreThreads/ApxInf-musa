@@ -125,7 +125,7 @@ pub(crate) fn downcast_cuda_new_arc(
 
 /// Borrow the concrete cuda-new backend from a `&dyn Backend`.
 ///
-/// The llama decode graphs compose cuda-new kernels directly
+/// The llama / qwen3-vl decode graphs compose cuda-new kernels directly
 /// (allocation-free decode workspace + CUDA Graph capture); this is their
 /// intentional seam to the concrete backend.
 #[cfg(feature = "cuda")]
