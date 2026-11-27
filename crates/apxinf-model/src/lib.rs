@@ -28,6 +28,8 @@ pub mod profiling;
 #[cfg(feature = "cuda")]
 pub mod qwen38;
 pub mod qwen3vl;
+#[cfg(feature = "musa")]
+pub use qwen3vl::musa as musa_qwen3vl;
 pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]

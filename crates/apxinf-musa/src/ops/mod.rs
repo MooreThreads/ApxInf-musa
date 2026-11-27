@@ -23,6 +23,7 @@ mod norm;
 mod pointwise;
 mod quantization;
 mod rope;
+pub mod sampling;
 pub mod w8a8;
 
 pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
@@ -46,6 +47,7 @@ pub use rope::{rope, RopeArgs, RopeSemantic};
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 
+use crate::MusaContext;
 use apxinf_core::{DType, Error, Result, Tensor};
 
 /// Run a fixed-shape forward pass that may prepare native executions.
@@ -160,4 +162,33 @@ fn require_scaled_output(out: &Tensor, scale: f32, operation: &str) -> Result<Sc
             "MUSA {operation} out expects BF16 or F8E4M3, got {dtype}"
         ))),
     }
+}
+
+pub use rope::vision_axial_rope;
+
+/// Vision self-attention delegates kernel selection to the noncausal backend.
+pub fn vision_self_attention(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<Tensor> {
+    let &[n, h, d] = q.shape().dims() else {
+        return Err(Error::Other("vision attention requires rank three".into()));
+    };
+    if n == 0
+        || h == 0
+        || h > 65535
+        || d == 0
+        || d > 128
+        || q.shape().numel() > i32::MAX as usize
+        || [q, k, v].iter().any(|t| {
+            t.shape() != q.shape()
+                || t.dtype() != DType::BF16
+                || t.device() != apxinf_core::Device::Musa(ctx.device_id())
+        })
+    {
+        return Err(Error::Other("invalid vision attention operands".into()));
+    }
+    crate::kernels::attention::noncausal(ctx, q, k, v, h, d)
 }

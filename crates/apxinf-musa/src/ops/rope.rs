@@ -4,7 +4,7 @@ use apxinf_core::{Error, Result, Tensor};
 
 use crate::kernels::attention as attention_kernels;
 use crate::kernels::rope as rope_kernels;
-use crate::MusaContext;
+use crate::{MusaBuffer, MusaContext};
 
 /// Which packed-QKV split the arguments describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,4 +87,45 @@ pub fn rope(ctx: &MusaContext, args: RopeArgs<'_>) -> Result<()> {
             )
         }
     }
+}
+
+/// Apply split-half BF16 RoPE using prepared FP32 angles `[tokens, head_dim]`.
+pub fn vision_axial_rope(ctx: &MusaContext, input: &Tensor, angles: &Tensor) -> Result<Tensor> {
+    use apxinf_core::{DType, Device};
+    let &[n, h, d] = input.shape().dims() else {
+        return Err(Error::Other("expected rank-three vision RoPE input".into()));
+    };
+    if n == 0
+        || h == 0
+        || d == 0
+        || d % 4 != 0
+        || input.shape().numel() > i32::MAX as usize
+        || input.dtype() != DType::BF16
+        || angles.dtype() != DType::F32
+        || angles.shape().dims() != [n, d]
+        || input.device() != Device::Musa(ctx.device_id())
+        || angles.device() != input.device()
+    {
+        return Err(Error::Other("invalid vision RoPE operands".into()));
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+        let buffer = |t: &Tensor| MusaBuffer::from_tensor(t).map_err(Error::Other);
+        let status = unsafe {
+            crate::ffi::custom::apxinf_musa_mudnn_vision_rope(
+                buffer(input)?.ptr(),
+                buffer(&output)?.ptr(),
+                buffer(angles)?.ptr(),
+                n as i32,
+                h as i32,
+                d as i32,
+                ctx.stream().handle(),
+            )
+        };
+        crate::ffi::custom::check_mudnn(status, || "vision RoPE".into()).map_err(Error::Other)?;
+        Ok(output)
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(Error::Other("MUSA vision RoPE unavailable".into()))
 }

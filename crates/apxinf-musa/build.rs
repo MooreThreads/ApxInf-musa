@@ -601,6 +601,7 @@ fn main() {
 
     for directory in &library_directories {
         println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath-link={}", directory.display());
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

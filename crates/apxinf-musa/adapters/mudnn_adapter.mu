@@ -17,6 +17,8 @@
 // this one returns `int` because muDNN's own Run() does, and translating would
 // mean inventing a mapping for codes this file does not own.
 #include <mudnn.h>
+#include <musa_fp16.h>
+#include <musa_bf16.h>
 #include <musa_runtime.h>
 #include <cmath>
 #include <map>
@@ -209,8 +211,35 @@ struct GeneralFlash {
   }
   ~GeneralFlash() { if(lse_buffer) musaFree(lse_buffer); }
 };
+// Preserve the host contract: compare as f32 (including i32 rounding), and reject
+// the entire row if ANY lane is non-finite. Mapping those lanes to +inf makes
+// the winning value a validity flag in the same reduction as its token index.
+__global__ void greedy_keys(const void* input, int kind, float* keys, int n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= unsigned(n)) return;
+  float v;
+  switch (kind) {
+    case 0: v = __bfloat162float(static_cast<const __mt_bfloat16*>(input)[i]); break;
+    case 1: v = __half2float(static_cast<const __half*>(input)[i]); break;
+    case 2: v = static_cast<const float*>(input)[i]; break;
+    default: v = float(static_cast<const int*>(input)[i]); break;
+  }
+  keys[i] = isfinite(v) ? v : INFINITY;
+}
+struct Greedy {
+  Scratch scratch;
+  md::Tensor keys, value, index;
+  md::Reduce op;
+  explicit Greedy(musaStream_t stream) : scratch(stream) {
+    check(keys.SetType(md::Tensor::Type::FLOAT));
+    check(value.SetType(md::Tensor::Type::FLOAT)); check(value.SetNdInfo({1,1}));
+    check(index.SetType(md::Tensor::Type::INT32)); check(index.SetNdInfo({1,1}));
+    check(op.SetMode(md::Reduce::Mode::MAX)); check(op.SetDim({1}));
+  }
+};
 struct Stream {
   md::Handle handle;
+  std::unique_ptr<Greedy> greedy;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int>,std::unique_ptr<MatmulFp8>> fp8_matmuls;
   std::map<std::tuple<int,int,int>,std::unique_ptr<MatmulFp8Bias>> fp8_bias_matmuls;
@@ -276,6 +305,61 @@ void record_failure(int status, const char* what) {
       break;
   }
 }
+}
+
+extern "C" int apxinf_musa_mudnn_greedy(const void* input, int n, int kind,
+    int* host_index, musaStream_t stream) {
+  const char* name = "muDNN greedy argmax";
+  try {
+    if (!input || !host_index || n <= 0 || kind < 0 || kind > 3)
+      throw StatusError{kStatusInvalidArgument};
+    if (capturing(stream)) throw StatusError{kStatusCaptureInProgress};
+    auto& st = state(stream);
+    if (!st.greedy) st.greedy = std::make_unique<Greedy>(stream);
+    auto& g = *st.greedy;
+    g.scratch.cursor = 0;
+    auto keys = static_cast<float*>(g.scratch.get(size_t(n)*sizeof(float)).get());
+    struct Result { float value; int index; } host;
+    auto out = static_cast<char*>(g.scratch.get(sizeof(host)).get());
+    check(g.keys.SetNdInfo({1,n})); check(g.keys.SetAddr(keys));
+    check(g.value.SetAddr(out)); check(g.index.SetAddr(out + offsetof(Result,index)));
+    greedy_keys<<<(unsigned(n)+255)/256,256,0,stream>>>(input,kind,keys,n);
+    auto runtime_check = [&](musaError_t e) {
+      if (e == musaSuccess) return true;
+      apxinf_adapters::set_error("%s: %s", name, musaGetErrorString(e)); return false;
+    };
+    if (!runtime_check(musaGetLastError())) return kStatusUnknown;
+    check(g.op.RunWithIndices(st.handle,g.value,g.index,g.keys,
+          [&](size_t bytes){return g.scratch.get(bytes);}));
+    if (!runtime_check(musaMemcpyAsync(&host,out,sizeof(host),musaMemcpyDeviceToHost,stream)) ||
+        !runtime_check(musaStreamSynchronize(stream))) return kStatusUnknown;
+    *host_index = std::isfinite(host.value) ? host.index : -1;
+    return 0;
+  } catch (const StatusError& e) { record_failure(e.status,name); return e.status; }
+    catch (...) { record_failure(kStatusUnknown,name); return kStatusUnknown; }
+}
+
+// Sequence-first BF16 [S,1,H,D], with one FP32 angle per output channel.
+extern "C" int apxinf_musa_mudnn_vision_rope(const void* x, void* y, const void* angles,
+    int n, int heads, int dim, musaStream_t stream) {
+  const char* name = "muDNN vision RoPE";
+  try {
+    auto& st = state(stream);
+    md::Tensor in, out, freqs;
+    for (auto t : {&in, &out}) {
+      check(t->SetType(md::Tensor::Type::BFLOAT16));
+      check(t->SetNdInfo({n,1,heads,dim}));
+    }
+    check(in.SetAddr(const_cast<void*>(x))); check(out.SetAddr(y));
+    check(freqs.SetType(md::Tensor::Type::FLOAT)); check(freqs.SetNdInfo({n,dim}));
+    check(freqs.SetAddr(const_cast<void*>(angles)));
+    md::Rope op;
+    check(op.SetRotaryInterleaved(false)); check(op.SetBatchFirst(false));
+    check(op.SetMultiLatentAttention(false));
+    check(op.Run(st.handle,out,in,freqs));
+    return 0;
+  } catch (const StatusError& e) { record_failure(e.status,name); return e.status; }
+    catch (...) { record_failure(kStatusUnknown,name); return kStatusUnknown; }
 }
 
 extern "C" int apxinf_musa_mudnn_bf16_gemm(const void* a,const void* w,void* y,
