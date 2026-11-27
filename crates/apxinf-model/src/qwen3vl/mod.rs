@@ -3,6 +3,8 @@
 //! Text stack + vision tower today; multimodal wiring in Phase 5. All CUDA
 //! and bf16-first.
 
+#[cfg(feature = "musa")]
+pub mod musa;
 pub mod config;
 pub mod weights;
 pub mod vision_weights;

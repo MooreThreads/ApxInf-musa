@@ -1,4 +1,4 @@
-use super::super::qwen3vl::{Qwen3VLConfig, Qwen3VLTextWeights, Qwen3VLVisionWeights};
+use super::super::{Qwen3VLConfig, Qwen3VLTextWeights, Qwen3VLVisionWeights};
 use apxinf_core::{Error, Result, Tensor};
 use std::collections::HashMap;
 

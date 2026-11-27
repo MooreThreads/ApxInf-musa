@@ -1,7 +1,7 @@
 use super::{runtime::MusaQwenRuntime, weights::NativeQwenWeights};
 use apxinf_core::{DType, Error, Result, Tensor};
 
-use crate::qwen3vl::vision_weights::Qwen3VLMerger;
+use super::super::vision_weights::Qwen3VLMerger;
 pub struct NativeVisionOutput {
     pub primary: Tensor,
     pub deepstack: Vec<Tensor>,
