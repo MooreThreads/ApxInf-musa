@@ -6,6 +6,13 @@ pub(super) struct LayerCache {
     v: MusaBuffer,
     written: usize,
 }
+impl LayerCache {
+    /// Prior rows stay allocated but no longer belong to the new sequence.
+    pub(super) fn rewind(&mut self) {
+        self.written = 0;
+    }
+}
+
 pub(super) fn append(
     slot: &mut Option<LayerCache>,
     ctx: &MusaContext,

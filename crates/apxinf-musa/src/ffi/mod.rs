@@ -2,7 +2,6 @@
 
 #![allow(non_camel_case_types)]
 
-pub(crate) mod abi;
 pub mod custom;
 pub mod mubin;
 pub mod mublas;

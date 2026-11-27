@@ -44,7 +44,7 @@ pub(crate) fn create_backend_with_recipe_options(
         // full because the import above is gone exactly when every other
         // backend feature is on, and one of these two arms always compiles.
         #[cfg(feature = "musa")]
-        Device::Musa(id) => Ok(Arc::new(apxinf_musa::MusaBackend::new(id)?)),
+        Device::Musa(_) => Err(apxinf_core::Error::UnsupportedDevice(device)),
         #[cfg(not(feature = "musa"))]
         Device::Musa(_) => Err(apxinf_core::Error::Other(
             "MUSA support not compiled in".into(),
@@ -125,7 +125,7 @@ pub(crate) fn downcast_cuda_new_arc(
 
 /// Borrow the concrete cuda-new backend from a `&dyn Backend`.
 ///
-/// The llama / qwen3-vl decode graphs compose cuda-new kernels directly
+/// The llama decode graphs compose cuda-new kernels directly
 /// (allocation-free decode workspace + CUDA Graph capture); this is their
 /// intentional seam to the concrete backend.
 #[cfg(feature = "cuda")]

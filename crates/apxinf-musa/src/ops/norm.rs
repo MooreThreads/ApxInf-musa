@@ -266,10 +266,13 @@ pub fn rms_norm(ctx: &MusaContext, args: RmsNormArgs<'_>) -> Result<()> {
         eps,
         output_scale,
     } = args;
-    if let ScaledOutput::E4m3(scale) = require_scaled_output(normalized, output_scale, "rms_norm")?
+    if let ScaledOutput::E4m3(scale) =
+        require_scaled_output(normalized, output_scale, "rms_norm")?
     {
         if norm_kernels::rms_e4m3_supported(last_dim(input)) {
-            return norm_kernels::rms_bf16_e4m3_into(ctx, input, weight, normalized, eps, scale);
+            return norm_kernels::rms_bf16_e4m3_into(
+                ctx, input, weight, normalized, eps, scale,
+            );
         }
     }
     write_normalized(ctx, normalized, output_scale, "rms_norm", |out| {
@@ -337,9 +340,11 @@ pub fn bias_residual_rms_norm(ctx: &MusaContext, args: BiasResidualRmsNormArgs<'
         eps,
         output_scale,
     } = args;
-    if let ScaledOutput::E4m3(scale) =
-        require_scaled_output(normalized, output_scale, "bias_residual_rms_norm")?
-    {
+    if let ScaledOutput::E4m3(scale) = require_scaled_output(
+        normalized,
+        output_scale,
+        "bias_residual_rms_norm",
+    )? {
         if fused_kernels::bias_residual_rms_e4m3_supported(last_dim(input)) {
             return fused_kernels::bias_residual_rms_e4m3_into(
                 ctx, input, bias, residual, weight, hidden, normalized, eps, scale,
@@ -374,12 +379,23 @@ pub fn bias_residual_layer_norm(
         eps,
         output_scale,
     } = args;
-    if let ScaledOutput::E4m3(scale) =
-        require_scaled_output(normalized, output_scale, "bias_residual_layer_norm")?
-    {
+    if let ScaledOutput::E4m3(scale) = require_scaled_output(
+        normalized,
+        output_scale,
+        "bias_residual_layer_norm",
+    )? {
         if fused_kernels::bias_residual_layer_e4m3_supported(last_dim(input)) {
             return fused_kernels::bias_residual_layer_e4m3_into(
-                ctx, input, bias, residual, weight, norm_bias, hidden, normalized, eps, scale,
+                ctx,
+                input,
+                bias,
+                residual,
+                weight,
+                norm_bias,
+                hidden,
+                normalized,
+                eps,
+                scale,
             );
         }
     }

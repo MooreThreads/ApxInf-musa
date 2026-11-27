@@ -24,7 +24,6 @@ mod pointwise;
 mod portable;
 mod quantization;
 mod rope;
-#[path = "gemm/w8a8.rs"]
 pub mod w8a8;
 
 pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
@@ -32,7 +31,8 @@ pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gemm::{
     gemm, gemm_ada_gate_residual_rms_norm, gemm_bias_gelu, gemm_bias_residual, gemm_fp8_qkv_rope,
-    gemm_geglu, prepare_fp8_weight, GegluWeightLayout, GemmAdaGateResidualRmsNormArgs, GemmArgs,
+    gemm_geglu,
+    prepare_fp8_weight, GegluWeightLayout, GemmAdaGateResidualRmsNormArgs, GemmArgs,
     GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
 };
 pub use norm::{
@@ -42,10 +42,6 @@ pub use norm::{
     RmsNormArgs,
 };
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
-pub(crate) use portable::{
-    attention as portable_attention, embedding as portable_embedding, point as portable_point,
-    rope as portable_rope,
-};
 pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{rope, RopeArgs, RopeSemantic};
 
@@ -196,7 +192,7 @@ pub fn vision_axial_rope(
         return Err(Error::Other("invalid vision RoPE operands".into()));
     }
     let out = ctx.allocate_output(x.shape().clone(), DType::BF16)?;
-    portable_rope(ctx, x, &out, positions, h, d, theta, 2, 0, 0)?;
+    portable::rope(ctx, x, &out, positions, h, d, theta, 2, 0, 0)?;
     Ok(out)
 }
 
@@ -229,7 +225,7 @@ pub fn vision_self_attention(
         return crate::kernels::attention::noncausal(ctx, q, k, v, h, d);
     }
     let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    portable_attention(ctx, q, k, v, &out, n, n, h, h, d, false)?;
+    portable::attention(ctx, q, k, v, &out, n, n, h, h, d, false)?;
     out.reshape(vec![n, h * d])
 }
 
@@ -266,6 +262,6 @@ pub fn causal_prefix_attention(
         return Err(Error::Other("invalid causal attention operands".into()));
     }
     let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    portable_attention(ctx, q, k, v, &out, nq, nk, h, kh, d, true)?;
+    portable::attention(ctx, q, k, v, &out, nq, nk, h, kh, d, true)?;
     out.reshape(vec![nq, h * d])
 }

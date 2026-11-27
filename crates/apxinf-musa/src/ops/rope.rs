@@ -83,14 +83,7 @@ pub fn rope(ctx: &MusaContext, args: RopeArgs<'_>) -> Result<()> {
                 ));
             }
             attention_kernels::split_qkv_bias_bf16_into(
-                ctx,
-                args.qkv,
-                args.bias,
-                args.q,
-                args.k,
-                args.v,
-                args.q_heads,
-                args.head_dim,
+                ctx, args.qkv, args.bias, args.q, args.k, args.v, args.q_heads, args.head_dim,
             )
         }
     }

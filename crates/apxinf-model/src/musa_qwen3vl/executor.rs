@@ -26,10 +26,20 @@ impl Qwen3VlMusaExecutor {
             session: None,
         })
     }
+    /// Start a new sequence on the same stream, retaining per-layer KV capacity.
     pub fn reset(&mut self) -> Result<()> {
-        self.cache.iter_mut().for_each(|l| *l = None);
+        for layer in self.cache.iter_mut().flatten() {
+            layer.rewind();
+        }
         self.next_rope = 0;
         self.sequence.reset();
+        Ok(())
+    }
+    /// End the sequence and release KV allocations; model weights and workspace stay loaded.
+    pub fn release_kv_cache(&mut self) -> Result<()> {
+        self.runtime.synchronize()?;
+        self.reset()?;
+        self.cache.iter_mut().for_each(|layer| *layer = None);
         Ok(())
     }
     /// Encode preprocessed patches without consuming a language sequence position.
@@ -225,5 +235,43 @@ impl Qwen3VlMusaExecutor {
     }
     pub fn synchronize(&self) -> Result<()> {
         self.runtime.synchronize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires M1000 and a BF16 Qwen3-VL checkpoint"]
+    fn reset_retains_kv_without_leaking_previous_request() -> Result<()> {
+        let dir = std::env::var("APXINF_QWEN3VL_MODEL_DIR").unwrap();
+        let mut model = Qwen3VlMusaExecutor::load(0, Path::new(&dir))?;
+        let short = [32, 785, 13];
+        let read = |t: Tensor| apxinf_musa::transfers::to_cpu(&t)?.to_f32_vec();
+        let first = model.prefill_text(&short)?;
+        let step = model.decode_one(17)?;
+        model.synchronize()?;
+        let expected = (read(first)?, read(step)?);
+        model.reset()?;
+        assert!(
+            model.cache.iter().all(Option::is_some),
+            "reset discarded KV storage"
+        );
+        model.prefill_text(&[42; 32])?;
+        model.decode_one(99)?;
+        model.reset()?;
+        assert!(model.decode_one(17).is_err());
+        let first = model.prefill_text(&short)?;
+        let step = model.decode_one(17)?;
+        model.synchronize()?;
+        assert_eq!((read(first)?, read(step)?), expected);
+        model.release_kv_cache()?;
+        assert!(model.cache.iter().all(Option::is_none));
+        assert!(model.decode_one(17).is_err());
+        let first = model.prefill_text(&short)?;
+        model.synchronize()?;
+        assert_eq!(read(first)?, expected.0);
+        Ok(())
     }
 }

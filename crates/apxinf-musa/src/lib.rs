@@ -20,8 +20,6 @@ pub mod buffer;
 pub mod context;
 pub mod device_caps;
 mod error;
-mod backend;
-mod kv_cache;
 // Not `pub`: this is the raw `extern "C"` surface, and the crate's rule is
 // that `ffi` is the only module allowed to declare one. Exporting it would let
 // a dependent crate call `musaFree`-class symbols and then read the contracts
@@ -37,7 +35,6 @@ pub mod transfers;
 pub mod tuning;
 mod workspace;
 
-pub use backend::MusaBackend;
 pub use buffer::{MusaBuffer, MusaDeviceAddress};
 pub use context::{MusaContext, MusaLibraryVersions};
 pub use device_caps::{MusaArchFamily, MusaDeviceCaps};

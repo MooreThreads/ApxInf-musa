@@ -8,7 +8,6 @@ use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
 use crate::auto::{LoadOptions, LoadedModel};
 use crate::llama::{GeneralLlama, LlamaWeights};
-use crate::qwen3vl::{GeneralQwen3VL, Qwen3VLConfig};
 use crate::registry;
 
 /// Register every implementation shipped in this crate. Re-registering is
@@ -21,8 +20,6 @@ pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_qwen3", crate::metal_qwen3::load);
     registry::register("llama", load_llama);
-    registry::register("qwen3_vl", load_qwen3vl);
-    registry::register("qwen3vl", load_qwen3vl);
     registry::register("qwen_drive", load_qwen_drive);
     #[cfg(feature = "cuda")]
     registry::register("qwen38", load_qwen38);
@@ -68,24 +65,6 @@ fn load_llama(
     Ok(LoadedModel::text(Box::new(GeneralLlama::new(
         config, weights, backend,
     )?)))
-}
-
-fn load_qwen3vl(
-    path: &Path,
-    _device: Device,
-    backend: Arc<dyn Backend>,
-    _options: &LoadOptions,
-) -> Result<LoadedModel> {
-    let model_dir = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let config = Qwen3VLConfig::from_json_file(&model_dir.join("config.json"))?;
-    let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
-        .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
-    let model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
-    Ok(LoadedModel::text(Box::new(model)))
 }
 
 fn load_qwen_drive(

@@ -167,34 +167,3 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
         dtype => Err(Error::Other(format!("Qwen3-VL vision transpose does not support {dtype}"))),
     }
 }
-
-/// Transfer all vision weights to the backend's device.
-pub fn transfer_vision_weights(w: &Qwen3VLVisionWeights, backend: &dyn apxinf_core::Backend) -> Result<Qwen3VLVisionWeights> {
-    let transfer_block = |b: &Qwen3VLVisionBlock| -> Result<Qwen3VLVisionBlock> {
-        Ok(Qwen3VLVisionBlock {
-            norm1_w: backend.to_device(&b.norm1_w)?, norm1_b: backend.to_device(&b.norm1_b)?,
-            qkv_w:   backend.to_device(&b.qkv_w)?,   qkv_b:   backend.to_device(&b.qkv_b)?,
-            proj_w:  backend.to_device(&b.proj_w)?,  proj_b:  backend.to_device(&b.proj_b)?,
-            norm2_w: backend.to_device(&b.norm2_w)?, norm2_b: backend.to_device(&b.norm2_b)?,
-            fc1_w:   backend.to_device(&b.fc1_w)?,   fc1_b:   backend.to_device(&b.fc1_b)?,
-            fc2_w:   backend.to_device(&b.fc2_w)?,   fc2_b:   backend.to_device(&b.fc2_b)?,
-        })
-    };
-    let transfer_merger = |m: &Qwen3VLMerger| -> Result<Qwen3VLMerger> {
-        Ok(Qwen3VLMerger {
-            norm_w: backend.to_device(&m.norm_w)?, norm_b: backend.to_device(&m.norm_b)?,
-            fc1_w:  backend.to_device(&m.fc1_w)?,  fc1_b:  backend.to_device(&m.fc1_b)?,
-            fc2_w:  backend.to_device(&m.fc2_w)?,  fc2_b:  backend.to_device(&m.fc2_b)?,
-        })
-    };
-    let blocks = w.blocks.iter().map(transfer_block).collect::<Result<Vec<_>>>()?;
-    let deepstack_mergers = w.deepstack_mergers.iter().map(transfer_merger).collect::<Result<Vec<_>>>()?;
-    Ok(Qwen3VLVisionWeights {
-        patch_embed_weight: backend.to_device(&w.patch_embed_weight)?,
-        patch_embed_bias:   backend.to_device(&w.patch_embed_bias)?,
-        pos_embed:          backend.to_device(&w.pos_embed)?,
-        blocks,
-        merger:             transfer_merger(&w.merger)?,
-        deepstack_mergers,
-    })
-}

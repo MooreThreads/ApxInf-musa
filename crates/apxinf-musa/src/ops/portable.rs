@@ -1,45 +1,13 @@
 //! Launch adapters for the bring-up portable MUSA operators.
 //!
 //! Validation and tensor ownership stay in Rust, while the ABI declarations
-//! live under `ffi/abi`, matching the CUDA-new layering.
+//! live in `ffi::custom`.
 
 use crate::{MusaBuffer, MusaContext};
 use apxinf_core::{Error, Result, Tensor};
 
 fn buffer(tensor: &Tensor) -> Result<MusaBuffer> {
     MusaBuffer::from_tensor(tensor).map_err(Error::Other)
-}
-
-pub(crate) fn point(
-    ctx: &MusaContext,
-    a: &Tensor,
-    b: Option<&Tensor>,
-    out: &Tensor,
-    op: i32,
-    factor: f32,
-) -> Result<()> {
-    let elements = a.shape().numel() as i32;
-    let a = buffer(a)?;
-    let b = b.map(buffer).transpose()?;
-    let out = buffer(out)?;
-    #[cfg(apxinf_musa_available)]
-    unsafe {
-        crate::ffi::check_runtime(crate::ffi::abi::portable::apxinf_musa_portable_point(
-            a.ptr(),
-            b.as_ref().map_or(std::ptr::null_mut(), |x| x.ptr()),
-            out.ptr(),
-            elements,
-            op,
-            factor,
-            ctx.stream().handle(),
-        ))
-        .map_err(Error::Other)?;
-    }
-    #[cfg(not(apxinf_musa_available))]
-    let _ = (ctx, a, b, out, op, factor);
-    #[cfg(not(apxinf_musa_available))]
-    return Err(Error::Other("MUSA portable pointwise unavailable".into()));
-    Ok(())
 }
 
 pub(crate) fn rope(
@@ -59,7 +27,7 @@ pub(crate) fn rope(
     let output = buffer(output)?;
     #[cfg(apxinf_musa_available)]
     unsafe {
-        crate::ffi::check_runtime(crate::ffi::abi::portable::apxinf_musa_portable_rope(
+        crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_rope(
             input.ptr(),
             output.ptr(),
             positions.ptr(),
@@ -111,7 +79,7 @@ pub(crate) fn attention(
     let output = buffer(output)?;
     #[cfg(apxinf_musa_available)]
     unsafe {
-        crate::ffi::check_runtime(crate::ffi::abi::portable::apxinf_musa_portable_attention(
+        crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_attention(
             q.ptr(),
             k.ptr(),
             v.ptr(),
@@ -132,34 +100,5 @@ pub(crate) fn attention(
     );
     #[cfg(not(apxinf_musa_available))]
     return Err(Error::Other("MUSA portable attention unavailable".into()));
-    Ok(())
-}
-
-pub(crate) fn embedding(
-    ctx: &MusaContext,
-    table: &Tensor,
-    ids: &MusaBuffer,
-    output: &Tensor,
-    rows: usize,
-    width: usize,
-) -> Result<()> {
-    let table = buffer(table)?;
-    let output = buffer(output)?;
-    #[cfg(apxinf_musa_available)]
-    unsafe {
-        crate::ffi::check_runtime(crate::ffi::abi::portable::apxinf_musa_portable_embedding(
-            table.ptr(),
-            ids.ptr(),
-            output.ptr(),
-            rows as i32,
-            width as i32,
-            ctx.stream().handle(),
-        ))
-        .map_err(Error::Other)?;
-    }
-    #[cfg(not(apxinf_musa_available))]
-    let _ = (ctx, table, ids, output, rows, width);
-    #[cfg(not(apxinf_musa_available))]
-    return Err(Error::Other("MUSA portable embedding unavailable".into()));
     Ok(())
 }
