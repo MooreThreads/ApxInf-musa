@@ -134,6 +134,9 @@ extern "C" {
     pub fn apxinf_musa_mublas_release_stream(stream: *mut c_void);
     pub fn apxinf_musa_mudnn_release_stream(stream: *mut c_void);
 
+    pub fn apxinf_musa_mudnn_greedy(input: *const c_void, n: i32, kind: i32,
+        host_index: *mut i32, stream: *mut c_void) -> i32;
+
     /// Exact MP22 BF16 GEMV over row-major `[1, K] @ [K, N]`.
     pub fn apxinf_musa_bf16_gemv(
         activation: *const c_void,
@@ -1103,30 +1106,8 @@ pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<()
 
 #[cfg(apxinf_musa_available)]
 extern "C" {
-    pub fn apxinf_musa_portable_rope(
-        a: *const c_void,
-        o: *mut c_void,
-        positions: *const c_void,
-        n: i32,
-        heads: i32,
-        head_dim: i32,
-        theta: f32,
-        mode: i32,
-        height_sections: i32,
-        width_sections: i32,
-        stream: *mut c_void,
-    ) -> musaError_t;
-    pub fn apxinf_musa_portable_attention(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        o: *mut c_void,
-        query_len: i32,
-        key_len: i32,
-        heads: i32,
-        kv_heads: i32,
-        head_dim: i32,
-        causal: i32,
-        stream: *mut c_void,
-    ) -> musaError_t;
+    pub fn apxinf_musa_mudnn_vision_rope(
+        input: *const c_void, output: *mut c_void, angles: *const c_void,
+        tokens: i32, heads: i32, dim: i32, stream: *mut c_void,
+    ) -> i32;
 }

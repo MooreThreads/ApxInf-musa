@@ -29,7 +29,10 @@ def main():
             expected = np.asarray(ref["logits_last"], dtype=np.float64)
             if actual.shape != expected.shape or not np.isfinite(actual).all():
                 raise SystemExit("FAIL: logits shape or finite-value check")
-            overlap = len(set(np.argsort(actual)[-5:]) & set(np.argsort(expected)[-5:]))
+            # Match Rust: descending logits, then ascending token ID.
+            actual_top = np.argsort(-actual, kind="stable")[:5]
+            expected_top = np.argsort(-expected, kind="stable")[:5]
+            overlap = len(set(actual_top) & set(expected_top))
             metrics = {
                 "cosine": float(np.dot(actual, expected)/(np.linalg.norm(actual)*np.linalg.norm(expected))),
                 "max_abs": float(np.max(np.abs(actual-expected))),

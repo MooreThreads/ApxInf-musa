@@ -55,15 +55,13 @@ pub(super) fn forward(
         let v = gemm::bf16(ctx, &z, &l.wv)?.reshape(vec![n, kh, d])?;
         let (k, v) = append(&mut cache[i], ctx, start, cap, &k, &v)?;
         // Full prefill has equal query and KV lengths; decode attends a longer prefix.
-        let prefill = if start == 0 && n > 1 {
+        let a = if start == 0 && n > 1 {
             apxinf_musa::kernels::attention::causal_gqa_prefill_bf16(ctx, &q, &k, &v)?
+                .ok_or_else(|| Error::Other("MUSA causal GQA prefill unavailable".into()))?
         } else {
-            None
-        };
-        let a = match prefill {
-            Some(out) => out.reshape(vec![n, h * d])?,
-            None => apxinf_musa::ops::causal_prefix_attention(ctx, &q, &k, &v)?,
-        };
+            apxinf_musa::kernels::attention::decode_gqa_bf16(ctx, &q, &k, &v)?
+        }
+        .reshape(vec![n, h * d])?;
         x = elementwise::add(ctx, &x, &gemm::bf16(ctx, &a, &l.wo)?)?;
         let z = norm::rms_bf16(ctx, &x, &l.ffn_norm_weight, tc.rms_norm_eps)?;
         let gate = activation::bias_silu_bf16(ctx, &gemm::bf16(ctx, &z, &l.w_gate)?, None)?;

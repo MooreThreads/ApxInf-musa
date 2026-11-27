@@ -23,6 +23,7 @@ mod norm;
 mod pointwise;
 mod quantization;
 mod rope;
+pub mod sampling;
 pub mod w8a8;
 
 pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
@@ -163,40 +164,9 @@ fn require_scaled_output(out: &Tensor, scale: f32, operation: &str) -> Result<Sc
     }
 }
 
-/// BF16 axial RoPE with preuploaded row/column IDs, preserving the portable
-/// Qwen arithmetic (including the multiply-add rounding policy).
-pub fn vision_axial_rope(
-    ctx: &MusaContext,
-    x: &Tensor,
-    positions: &crate::MusaBuffer,
-    theta: f32,
-) -> Result<Tensor> {
-    let &[n, h, d] = x.shape().dims() else {
-        return Err(Error::Other(
-            "vision RoPE requires [tokens, heads, dim]".into(),
-        ));
-    };
-    if n == 0
-        || h == 0
-        || d == 0
-        || d % 4 != 0
-        || x.shape().numel() > i32::MAX as usize
-        || x.dtype() != DType::BF16
-        || x.device() != apxinf_core::Device::Musa(ctx.device_id())
-        || positions.device() != ctx.device_id()
-        || n.checked_mul(8) != Some(positions.len())
-        || !theta.is_finite()
-        || theta <= 0.
-    {
-        return Err(Error::Other("invalid vision RoPE operands".into()));
-    }
-    let out = ctx.allocate_output(x.shape().clone(), DType::BF16)?;
-    rope::portable_rope(ctx, x, &out, positions, h, d, theta, 2, 0, 0)?;
-    Ok(out)
-}
+pub use rope::vision_axial_rope;
 
-/// Vision self-attention. Only the measured shape uses the quadratic workspace;
-/// other supported head widths use the online-softmax kernel.
+/// Vision self-attention delegates kernel selection to the noncausal backend.
 pub fn vision_self_attention(
     ctx: &MusaContext,
     q: &Tensor,
@@ -220,47 +190,5 @@ pub fn vision_self_attention(
     {
         return Err(Error::Other("invalid vision attention operands".into()));
     }
-    if (n, h, d) == (400, 16, 64) {
-        return crate::kernels::attention::noncausal(ctx, q, k, v, h, d);
-    }
-    let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    attention::portable_attention(ctx, q, k, v, &out, n, n, h, h, d, false)?;
-    out.reshape(vec![n, h * d])
-}
-
-/// Causal attention over the initialized, token-major K/V prefix. Query rows
-/// correspond to its final `nq` positions (including the just-appended row).
-pub fn causal_prefix_attention(
-    ctx: &MusaContext,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-) -> Result<Tensor> {
-    let &[nq, h, d] = q.shape().dims() else {
-        return Err(Error::Other("invalid query rank".into()));
-    };
-    let &[nk, kh, kd] = k.shape().dims() else {
-        return Err(Error::Other("invalid key rank".into()));
-    };
-    if nq == 0
-        || nk < nq
-        || kh == 0
-        || h == 0
-        || h > 65535
-        || h % kh != 0
-        || d == 0
-        || d > 128
-        || kd != d
-        || k.shape() != v.shape()
-        || [q, k, v].iter().any(|t| {
-            t.dtype() != DType::BF16
-                || t.device() != apxinf_core::Device::Musa(ctx.device_id())
-                || t.shape().numel() > i32::MAX as usize
-        })
-    {
-        return Err(Error::Other("invalid causal attention operands".into()));
-    }
-    let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    attention::portable_attention(ctx, q, k, v, &out, nq, nk, h, kh, d, true)?;
-    out.reshape(vec![nq, h * d])
+    crate::kernels::attention::noncausal(ctx, q, k, v, h, d)
 }

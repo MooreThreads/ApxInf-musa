@@ -2102,6 +2102,28 @@ fn launch_causal_gqa_gemm(
     }
 }
 
+/// Single-token GQA over an initialized token-major KV prefix, including this token.
+pub fn decode_gqa_bf16(ctx: &MusaContext, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let (nq, heads, dim) = require_3d_bf16(ctx, q, "decode GQA", "q")?;
+    let (nk, kv_heads, kd) = require_3d_bf16(ctx, k, "decode GQA", "k")?;
+    let vs = require_3d_bf16(ctx, v, "decode GQA", "v")?;
+    if nq != 1 || nk == 0 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0
+        || kd != dim || dim == 0 || vs != (nk, kv_heads, dim)
+        || [q, k, v].iter().any(|t| t.shape().numel() > i32::MAX as usize)
+    {
+        return Err(Error::Other("MUSA decode GQA shape mismatch".into()));
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        let output = bf16_tensor(ctx, &[1, heads, dim])?;
+        // No future slots are in K/V: the final query attends the entire prefix.
+        launch_general_flash_bf16(ctx, q, k, v, 1, heads, kv_heads, 1, nk, dim, false, &output)?;
+        Ok(output)
+    }
+    #[cfg(not(apxinf_musa_available))]
+    Err(native_unavailable("attention::decode_gqa_bf16"))
+}
+
 /// Native prefill path. Returns `Some` for every validated BF16 GQA
 /// shape so the caller does not enter its CUDA-provider error path.
 pub fn causal_gqa_prefill_bf16(

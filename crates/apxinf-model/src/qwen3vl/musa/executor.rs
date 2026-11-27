@@ -4,11 +4,15 @@ use apxinf_core::{Error, Result, Tensor};
 use apxinf_musa::ExecutionSession;
 use std::path::Path;
 
+// Executor KV capacity per layer, in tokens; not the checkpoint's context limit.
+const MAX_KV_TOKENS: usize = 4096;
+
 pub struct Qwen3VlMusaExecutor {
     pub(crate) runtime: MusaQwenRuntime,
     pub(crate) weights: NativeQwenWeights,
     cache: Vec<Option<super::kv_cache::LayerCache>>,
     next_rope: u32,
+    vision_positions: super::vision::PositionCache,
     pub(crate) sequence: NativeSequenceState,
     session: Option<ExecutionSession>,
 }
@@ -20,6 +24,7 @@ impl Qwen3VlMusaExecutor {
         Ok(Self {
             cache: (0..weights.text.layers.len()).map(|_| None).collect(),
             next_rope: 0,
+            vision_positions: Default::default(),
             runtime,
             weights,
             sequence: NativeSequenceState::default(),
@@ -28,17 +33,20 @@ impl Qwen3VlMusaExecutor {
     }
     /// Start a new sequence on the same stream, retaining per-layer KV capacity.
     pub fn reset(&mut self) -> Result<()> {
+        self.rewind_sequence();
+        Ok(())
+    }
+    fn rewind_sequence(&mut self) {
         for layer in self.cache.iter_mut().flatten() {
             layer.rewind();
         }
         self.next_rope = 0;
         self.sequence.reset();
-        Ok(())
     }
     /// End the sequence and release KV allocations; model weights and workspace stay loaded.
     pub fn release_kv_cache(&mut self) -> Result<()> {
         self.runtime.synchronize()?;
-        self.reset()?;
+        self.rewind_sequence();
         self.cache.iter_mut().for_each(|layer| *layer = None);
         Ok(())
     }
@@ -55,10 +63,20 @@ impl Qwen3VlMusaExecutor {
         } else {
             pixels
         };
-        super::vision::forward(&self.runtime, &self.weights, pixels, grids)
+        super::vision::forward(
+            &self.runtime,
+            &self.weights,
+            &self.vision_positions,
+            pixels,
+            grids,
+        )
     }
     fn capacity(&self) -> usize {
-        self.weights.config.text.max_position_embeddings.min(4096)
+        self.weights
+            .config
+            .text
+            .max_position_embeddings
+            .min(MAX_KV_TOKENS)
     }
     fn validate_ids(&self, ids: &[u32]) -> Result<()> {
         if ids.is_empty()
@@ -114,7 +132,7 @@ impl Qwen3VlMusaExecutor {
                 Ok(t)
             }
             Err(e) => {
-                self.reset()?;
+                self.rewind_sequence();
                 Err(e)
             }
         }
@@ -127,6 +145,9 @@ impl Qwen3VlMusaExecutor {
         // than reserving quadratic temporary storage for every layer at once.
         let n = tokens as u128;
         let width = (t.hidden_size as u128).max(t.n_heads as u128 * t.head_dim as u128);
+        // Conservative byte allowances, not exact tensor liveness: the linear terms
+        // cover activations/projections and MLP intermediates, the quadratic term
+        // covers per-head attention scratch, and 16 KiB covers per-layer padding.
         let per_layer = n * (48 * width + 8 * t.intermediate_size as u128)
             + 8 * n * n * t.n_heads as u128
             + 16384;
@@ -226,12 +247,7 @@ impl Qwen3VlMusaExecutor {
         if logits.shape().dims() != [1, self.weights.config.text.vocab_size] {
             return Err(Error::Other("expected one row of vocabulary logits".into()));
         }
-        self.synchronize()?;
-        let v = self.runtime.to_cpu(logits)?.to_f32_vec()?;
-        if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
-            return Err(Error::Other("invalid logits".into()));
-        }
-        Ok((1..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b }) as u32)
+        apxinf_musa::ops::sampling::greedy_argmax(self.runtime.context(), logits)
     }
     pub fn synchronize(&self) -> Result<()> {
         self.runtime.synchronize()

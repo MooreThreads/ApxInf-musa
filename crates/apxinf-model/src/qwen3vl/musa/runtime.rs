@@ -30,6 +30,7 @@ impl MusaQwenRuntime {
     pub fn output(&self, shape: Shape, dtype: DType) -> Result<Tensor> {
         self.context.allocate_output(shape, dtype)
     }
+    /// The next prefill may overwrite arena storage while the caller still owns these logits.
     pub(super) fn stable_copy(&self, tensor: &Tensor) -> Result<Tensor> {
         self.require_device(tensor)?;
         let source = apxinf_musa::MusaBuffer::from_tensor(tensor).map_err(Error::Other)?;

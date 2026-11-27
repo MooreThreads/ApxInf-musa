@@ -2,14 +2,35 @@ use super::{runtime::MusaQwenRuntime, weights::NativeQwenWeights};
 use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::super::vision_weights::Qwen3VLMerger;
+#[derive(Default)]
+pub(super) struct PositionCache(std::sync::Mutex<Option<((usize, usize), Tensor)>>);
+
+impl PositionCache {
+    fn get(&self, grid: (usize, usize), build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| Error::Other("vision position cache poisoned".into()))?;
+        if let Some((key, tensor)) = slot.as_ref() {
+            if *key == grid {
+                return Ok(tensor.clone());
+            }
+        }
+        let tensor = build()?;
+        *slot = Some((grid, tensor.clone()));
+        Ok(tensor)
+    }
+}
+
 pub struct NativeVisionOutput {
     pub primary: Tensor,
     pub deepstack: Vec<Tensor>,
 }
 
-pub fn forward(
+pub(super) fn forward(
     runtime: &MusaQwenRuntime,
     weights: &NativeQwenWeights,
+    cache: &PositionCache,
     pixels: &Tensor,
     grids: &[[u32; 3]],
 ) -> Result<NativeVisionOutput> {
@@ -54,10 +75,12 @@ pub fn forward(
         &x,
         Some(&weights.vision.patch_embed_bias),
     )?;
-    let pos = position_embeddings(runtime, &weights.vision.pos_embed, 1, h, w, merge, hidden)?;
+    let pos = cache.get((h, w), || {
+        position_embeddings(runtime, &weights.vision.pos_embed, h, w, merge, hidden)
+    })?;
     x = apxinf_musa::kernels::elementwise::add(runtime.context(), &x, &pos)?;
     let pos_ids = vision_pos_ids(1, h, w, merge);
-    let pb = position_buffer(runtime, &pos_ids)?;
+    let angles = runtime.to_device(&axial_angles(&pos_ids, dim)?)?;
     let mut deep = Vec::new();
     for (i, b) in weights.vision.blocks.iter().enumerate() {
         let z = apxinf_musa::kernels::norm::layer_bf16(
@@ -80,8 +103,8 @@ pub fn forward(
         let q = q.reshape(vec![n, heads, dim])?;
         let k = k.reshape(vec![n, heads, dim])?;
         let v = v.reshape(vec![n, heads, dim])?;
-        let q = apxinf_musa::ops::vision_axial_rope(runtime.context(), &q, &pb, 10000.)?;
-        let k = apxinf_musa::ops::vision_axial_rope(runtime.context(), &k, &pb, 10000.)?;
+        let q = apxinf_musa::ops::vision_axial_rope(runtime.context(), &q, &angles)?;
+        let k = apxinf_musa::ops::vision_axial_rope(runtime.context(), &k, &angles)?;
         let attn = apxinf_musa::ops::vision_self_attention(runtime.context(), &q, &k, &v)?;
         let attn = apxinf_musa::kernels::gemm::bf16(runtime.context(), &attn, &b.proj_w)?;
         let attn = apxinf_musa::kernels::elementwise::bias_bf16(
@@ -128,7 +151,7 @@ fn merge_primary(
     eps: f32,
 ) -> Result<Tensor> {
     let z = apxinf_musa::kernels::norm::layer_bf16(r.context(), x, &m.norm_w, &m.norm_b, eps)?;
-    let z = reshape_merge(r, &z, n, h, merge)?;
+    let z = reshape_merge(&z, n, h, merge)?;
     let z = apxinf_musa::kernels::gemm::bf16(r.context(), &z, &m.fc1_w)?;
     let z = gelu_after_bias(r, &z, &m.fc1_b)?;
     let z = apxinf_musa::kernels::gemm::bf16(r.context(), &z, &m.fc2_w)?;
@@ -143,20 +166,14 @@ fn merge_deep(
     merge: usize,
     eps: f32,
 ) -> Result<Tensor> {
-    let z = reshape_merge(r, x, n, h, merge)?;
+    let z = reshape_merge(x, n, h, merge)?;
     let z = apxinf_musa::kernels::norm::layer_bf16(r.context(), &z, &m.norm_w, &m.norm_b, eps)?;
     let z = apxinf_musa::kernels::gemm::bf16(r.context(), &z, &m.fc1_w)?;
     let z = gelu_after_bias(r, &z, &m.fc1_b)?;
     let z = apxinf_musa::kernels::gemm::bf16(r.context(), &z, &m.fc2_w)?;
     apxinf_musa::kernels::elementwise::bias_bf16(r.context(), &z, Some(&m.fc2_b))
 }
-fn reshape_merge(
-    _r: &MusaQwenRuntime,
-    x: &Tensor,
-    n: usize,
-    h: usize,
-    merge: usize,
-) -> Result<Tensor> {
+fn reshape_merge(x: &Tensor, n: usize, h: usize, merge: usize) -> Result<Tensor> {
     x.reshape(vec![n / (merge * merge), h * merge * merge])
 }
 fn vision_pos_ids(t: usize, h: usize, w: usize, m: usize) -> Vec<u32> {
@@ -175,16 +192,28 @@ fn vision_pos_ids(t: usize, h: usize, w: usize, m: usize) -> Vec<u32> {
     }
     o
 }
-fn position_buffer(r: &MusaQwenRuntime, p: &[u32]) -> Result<apxinf_musa::MusaBuffer> {
-    let b = apxinf_musa::MusaBuffer::alloc_on(r.context(), p.len() * 4).map_err(Error::Other)?;
-    b.copy_from_host(&p.iter().flat_map(|id| id.to_ne_bytes()).collect::<Vec<_>>())
-        .map_err(Error::Other)?;
-    Ok(b)
+// The first quarter uses row angles, the next uses column angles. Both
+// halves of each rotary pair consume the same angle in muDNN's split layout.
+fn axial_angles(ids: &[u32], dim: usize) -> Result<Tensor> {
+    if dim == 0 || dim % 4 != 0 || ids.len() % 2 != 0 {
+        return Err(Error::Other("invalid axial RoPE dimensions".into()));
+    }
+    let inv: Vec<_> = (0..dim / 4)
+        .map(|i| 10000f32.powf(-4. * i as f32 / dim as f32))
+        .collect();
+    let mut angles = Vec::with_capacity(ids.len() / 2 * dim);
+    for xy in ids.chunks_exact(2) {
+        let start = angles.len();
+        for &pos in xy {
+            angles.extend(inv.iter().map(|f| pos as f32 * f));
+        }
+        angles.extend_from_within(start..);
+    }
+    Tensor::from_f32(vec![ids.len() / 2, dim], &angles)
 }
 fn position_embeddings(
     r: &MusaQwenRuntime,
     table: &Tensor,
-    _t: usize,
     h: usize,
     w: usize,
     m: usize,
@@ -221,4 +250,24 @@ fn position_embeddings(
 fn gelu_after_bias(r: &MusaQwenRuntime, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let biased = apxinf_musa::kernels::elementwise::bias_bf16(r.context(), x, Some(bias))?;
     apxinf_musa::kernels::activation::bias_gelu_bf16(r.context(), &biased, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_cache_keeps_only_the_last_grid() -> Result<()> {
+        let cache = PositionCache::default();
+        let mut builds = 0;
+        for (grid, expected) in [((2, 4), 1), ((2, 4), 1), ((4, 2), 2), ((2, 4), 3)] {
+            let result = cache.get(grid, || {
+                builds += 1;
+                Tensor::from_f32(vec![1], &[builds as f32])
+            })?;
+            assert_eq!(result.as_f32()?, &[expected as f32]);
+        }
+        assert_eq!(builds, 3);
+        Ok(())
+    }
 }

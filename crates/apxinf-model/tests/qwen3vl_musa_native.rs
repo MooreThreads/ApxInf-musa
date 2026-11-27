@@ -320,3 +320,28 @@ fn native_prefill_reports_stable_workspace() -> Result<(), Box<dyn std::error::E
     assert_eq!(original, read(&first)?);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires M1000"]
+fn device_argmax_checks_whole_row_and_uses_first_tie() -> apxinf_core::Result<()> {
+    use apxinf_core::Tensor;
+    use apxinf_musa::{ops::sampling::greedy_argmax, transfers::to_device, MusaContext};
+    let ctx = MusaContext::new(0)?;
+    let mut row = vec![-5.; 151936];
+    row[4097] = -1.;
+    row[151935] = -1.;
+    let sample = |row: &[f32]| {
+        let values: Vec<_> = row.iter().copied().map(half::bf16::from_f32).collect();
+        let host = Tensor::from_bf16(vec![1, row.len()], &values)?;
+        greedy_argmax(&ctx, &to_device(&host, 0)?)
+    };
+    assert_eq!(sample(&row)?, 4097);
+    for bad in [f32::NEG_INFINITY, f32::NAN, f32::INFINITY] {
+        row[2] = bad;
+        assert!(sample(&row).is_err());
+    }
+    row[2] = -5.;
+    row[151935] = 0.;
+    assert_eq!(sample(&row)?, 151935);
+    Ok(())
+}

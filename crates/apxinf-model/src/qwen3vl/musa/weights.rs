@@ -14,8 +14,11 @@ pub struct NativeQwenWeights {
 
 impl NativeQwenWeights {
     pub fn from_map(config: Qwen3VLConfig, tensors: HashMap<String, Tensor>) -> Result<Self> {
-        let text = Qwen3VLTextWeights::from_map(&config, tensors.clone())?;
-        let vision = Qwen3VLVisionWeights::from_map(&config, tensors)?;
+        let (vision_tensors, text_tensors): (HashMap<_, _>, HashMap<_, _>) = tensors
+            .into_iter()
+            .partition(|(key, _)| key.starts_with("model.visual."));
+        let text = Qwen3VLTextWeights::from_map(&config, text_tensors)?;
+        let vision = Qwen3VLVisionWeights::from_map(&config, vision_tensors)?;
         let lm_head = match &text.lm_head {
             Some(t) => t.clone(),
             None => transpose_2d(&text.token_embedding)?,
@@ -123,5 +126,83 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
         dtype => Err(Error::Other(format!(
             "Qwen3-VL weight transpose does not support {dtype}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_moves_embedding_and_preserves_tied_and_explicit_heads() -> Result<()> {
+        for tied in [true, false] {
+            let mut cfg = Qwen3VLConfig::from_json_str(
+                r#"{
+                "text_config":{"num_hidden_layers":0,"hidden_size":2,"vocab_size":3,
+                    "rope_scaling":{"mrope_section":[1,0,0]}},
+                "vision_config":{"depth":0,"hidden_size":1,"in_channels":1,
+                    "patch_size":1,"temporal_patch_size":1}
+            }"#,
+            )?;
+            cfg.text.tie_word_embeddings = tied;
+            let embedding = Tensor::from_f32(vec![3, 2], &[1., 2., 3., 4., 5., 6.])?;
+            let original = embedding.as_f32()?.as_ptr();
+            let mut map = HashMap::from([
+                ("model.language_model.embed_tokens.weight".into(), embedding),
+                (
+                    "model.language_model.norm.weight".into(),
+                    Tensor::from_f32(vec![2], &[1., 1.])?,
+                ),
+            ]);
+            for suffix in [
+                "patch_embed.proj.weight",
+                "patch_embed.proj.bias",
+                "pos_embed.weight",
+            ] {
+                map.insert(
+                    format!("model.visual.{suffix}"),
+                    Tensor::from_f32(vec![1, 1], &[7.])?,
+                );
+            }
+            for prefix in [
+                "merger",
+                "deepstack_merger_list.0",
+                "deepstack_merger_list.1",
+                "deepstack_merger_list.2",
+            ] {
+                for suffix in [
+                    "norm.weight",
+                    "norm.bias",
+                    "linear_fc1.weight",
+                    "linear_fc1.bias",
+                    "linear_fc2.weight",
+                    "linear_fc2.bias",
+                ] {
+                    map.insert(
+                        format!("model.visual.{prefix}.{suffix}"),
+                        Tensor::from_f32(vec![1, 1], &[1.])?,
+                    );
+                }
+            }
+            if !tied {
+                map.insert(
+                    "lm_head.weight".into(),
+                    Tensor::from_f32(vec![3, 2], &[6., 5., 4., 3., 2., 1.])?,
+                );
+            }
+            let w = NativeQwenWeights::from_map(cfg, map)?;
+            assert_eq!(w.text.token_embedding.as_f32()?.as_ptr(), original);
+            assert_eq!(w.vision.pos_embed.as_f32()?, &[7.]);
+            assert_eq!(w.lm_head.shape().dims(), &[2, 3]);
+            assert_eq!(
+                w.lm_head.as_f32()?,
+                if tied {
+                    &[1., 3., 5., 2., 4., 6.]
+                } else {
+                    &[6., 4., 2., 5., 3., 1.]
+                }
+            );
+        }
+        Ok(())
     }
 }
