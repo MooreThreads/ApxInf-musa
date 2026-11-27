@@ -60,7 +60,7 @@ pub use llm_trait::{
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;
-pub use qwen3vl::{Qwen3VLConfig, Qwen3VLTextWeights};
+pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use qwen_drive::QwenDriveConfig;
 #[cfg(feature = "cuda")]
 pub use qwen_drive::QwenDriveModelRunner;
