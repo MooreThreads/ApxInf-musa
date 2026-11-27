@@ -21,7 +21,6 @@ mod gather;
 mod gemm;
 mod norm;
 mod pointwise;
-mod portable;
 mod quantization;
 mod rope;
 pub mod w8a8;
@@ -192,7 +191,7 @@ pub fn vision_axial_rope(
         return Err(Error::Other("invalid vision RoPE operands".into()));
     }
     let out = ctx.allocate_output(x.shape().clone(), DType::BF16)?;
-    portable::rope(ctx, x, &out, positions, h, d, theta, 2, 0, 0)?;
+    rope::portable_rope(ctx, x, &out, positions, h, d, theta, 2, 0, 0)?;
     Ok(out)
 }
 
@@ -225,7 +224,7 @@ pub fn vision_self_attention(
         return crate::kernels::attention::noncausal(ctx, q, k, v, h, d);
     }
     let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    portable::attention(ctx, q, k, v, &out, n, n, h, h, d, false)?;
+    attention::portable_attention(ctx, q, k, v, &out, n, n, h, h, d, false)?;
     out.reshape(vec![n, h * d])
 }
 
@@ -262,6 +261,6 @@ pub fn causal_prefix_attention(
         return Err(Error::Other("invalid causal attention operands".into()));
     }
     let out = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
-    portable::attention(ctx, q, k, v, &out, nq, nk, h, kh, d, true)?;
+    attention::portable_attention(ctx, q, k, v, &out, nq, nk, h, kh, d, true)?;
     out.reshape(vec![nq, h * d])
 }

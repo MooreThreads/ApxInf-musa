@@ -5,7 +5,7 @@ use apxinf_core::{Error, Result, Tensor};
 use super::{require_deterministic, require_unit_output_scale, require_workspace};
 use crate::kernels::attention as kernels;
 use crate::kernels::{not_ported, TacticDispatch};
-use crate::MusaContext;
+use crate::{MusaBuffer, MusaContext};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionMask {
@@ -270,4 +270,52 @@ pub fn prepare_attention(
         ));
     }
     kernels::mp31::prepare(ctx, query_heads, kv_heads, head_dim)
+}
+
+// Portable MUSA fallback launch used by native vision/decode attention.
+fn buffer(tensor: &Tensor) -> Result<MusaBuffer> {
+    MusaBuffer::from_tensor(tensor).map_err(Error::Other)
+}
+
+pub(crate) fn portable_attention(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &Tensor,
+    query_len: usize,
+    key_len: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+) -> Result<()> {
+    let q = buffer(q)?;
+    let k = buffer(k)?;
+    let v = buffer(v)?;
+    let output = buffer(output)?;
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_attention(
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            output.ptr(),
+            query_len as i32,
+            key_len as i32,
+            heads as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            causal as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Other)?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    let _ = (
+        ctx, q, k, v, output, query_len, key_len, heads, kv_heads, head_dim, causal,
+    );
+    #[cfg(not(apxinf_musa_available))]
+    return Err(Error::Other("MUSA portable attention unavailable".into()));
+    Ok(())
 }

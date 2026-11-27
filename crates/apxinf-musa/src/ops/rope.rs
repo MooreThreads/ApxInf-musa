@@ -4,7 +4,7 @@ use apxinf_core::{Error, Result, Tensor};
 
 use crate::kernels::attention as attention_kernels;
 use crate::kernels::rope as rope_kernels;
-use crate::MusaContext;
+use crate::{MusaBuffer, MusaContext};
 
 /// Which packed-QKV split the arguments describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,4 +87,59 @@ pub fn rope(ctx: &MusaContext, args: RopeArgs<'_>) -> Result<()> {
             )
         }
     }
+}
+
+// Portable MUSA fallback launch used by native vision RoPE.
+fn buffer(tensor: &Tensor) -> Result<MusaBuffer> {
+    MusaBuffer::from_tensor(tensor).map_err(Error::Other)
+}
+
+pub(crate) fn portable_rope(
+    ctx: &MusaContext,
+    input: &Tensor,
+    output: &Tensor,
+    positions: &MusaBuffer,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    mode: i32,
+    height_sections: usize,
+    width_sections: usize,
+) -> Result<()> {
+    let elements = input.shape().numel() as i32;
+    let input = buffer(input)?;
+    let output = buffer(output)?;
+    #[cfg(apxinf_musa_available)]
+    unsafe {
+        crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_portable_rope(
+            input.ptr(),
+            output.ptr(),
+            positions.ptr(),
+            elements,
+            heads as i32,
+            head_dim as i32,
+            theta,
+            mode,
+            height_sections as i32,
+            width_sections as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Other)?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    let _ = (
+        ctx,
+        input,
+        output,
+        positions,
+        heads,
+        head_dim,
+        theta,
+        mode,
+        height_sections,
+        width_sections,
+    );
+    #[cfg(not(apxinf_musa_available))]
+    return Err(Error::Other("MUSA portable rope unavailable".into()));
+    Ok(())
 }
