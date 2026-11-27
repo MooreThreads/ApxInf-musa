@@ -1,11 +1,13 @@
 //! Dense attention contracts.
 
-use apxinf_core::{DType, Error, Result, Tensor};
+use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::{require_deterministic, require_unit_output_scale, require_workspace};
 use crate::kernels::attention as kernels;
 use crate::kernels::{not_ported, TacticDispatch};
 use crate::MusaContext;
+#[cfg(apxinf_musa_available)]
+use crate::{buffer::MusaBuffer, error::musa_error, ffi};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionMask {
@@ -215,6 +217,111 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
     }
 }
 
+/// Exact BF16 math attention with an explicit boolean mask.
+///
+/// Q/K/V are contiguous physical `[batch,heads,tokens,head_dim]`; `mask` is an
+/// I8 byte tensor `[query_tokens,key_tokens]` where zero forbids and one allows
+/// attention. muDNN interprets those bytes as BOOL and produces Q's shape.
+/// This route exists for Fast-WAM's first-frame block mask, but the contract is
+/// model neutral.
+pub fn masked_math_attention_bf16(
+    ctx: &MusaContext,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (batch, query_tokens, key_tokens, heads, head_dim) = masked_attention_geometry(
+        query.shape().dims(),
+        key.shape().dims(),
+        value.shape().dims(),
+        mask.shape().dims(),
+    )?;
+    let expected_device = Device::Musa(ctx.device_id());
+    for (name, tensor, dtype) in [
+        ("query", query, DType::BF16),
+        ("key", key, DType::BF16),
+        ("value", value, DType::BF16),
+        ("mask", mask, DType::I8),
+    ] {
+        if tensor.dtype() != dtype || tensor.device() != expected_device {
+            return Err(Error::Other(format!(
+                "MUSA masked math attention {name} must be {dtype} on {expected_device}, got {} on {}",
+                tensor.dtype(),
+                tensor.device()
+            )));
+        }
+    }
+    let output = ctx.allocate_output(Shape::new(query.shape().dims().to_vec()), DType::BF16)?;
+    #[cfg(apxinf_musa_available)]
+    {
+        fn ptr(tensor: &Tensor) -> Result<*mut std::ffi::c_void> {
+            Ok(MusaBuffer::from_tensor(tensor).map_err(musa_error)?.ptr() as *mut std::ffi::c_void)
+        }
+        let checked = |name: &str, value: usize| {
+            i32::try_from(value)
+                .map_err(|_| Error::Other(format!("MUSA masked math attention {name} exceeds i32")))
+        };
+        let status = unsafe {
+            ffi::custom::apxinf_musa_mudnn_masked_math_attention_bf16(
+                ptr(query)? as *const _,
+                ptr(key)? as *const _,
+                ptr(value)? as *const _,
+                ptr(mask)? as *const _,
+                ptr(&output)?,
+                checked("batch", batch)?,
+                checked("heads", heads)?,
+                checked("query tokens", query_tokens)?,
+                checked("key tokens", key_tokens)?,
+                checked("head dim", head_dim)?,
+                ctx.stream().handle(),
+            )
+        };
+        ffi::custom::check_mudnn(status, || {
+            format!(
+                "muDNN masked math attention B={batch} H={heads} Tq={query_tokens} Tk={key_tokens} D={head_dim}"
+            )
+        })
+        .map_err(musa_error)?;
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (ctx, batch, query_tokens, key_tokens, heads, head_dim);
+        return Err(crate::kernels::native_unavailable(
+            "muDNN masked math attention",
+        ));
+    }
+    Ok(output)
+}
+
+fn masked_attention_geometry(
+    query: &[usize],
+    key: &[usize],
+    value: &[usize],
+    mask: &[usize],
+) -> Result<(usize, usize, usize, usize, usize)> {
+    let [batch, heads, query_tokens, head_dim] = query else {
+        return Err(Error::Other(format!(
+            "MUSA masked math attention query must be [B,Tq,H,D], got {query:?}"
+        )));
+    };
+    let [key_batch, key_heads, key_tokens, key_dim] = key else {
+        return Err(Error::Other(format!(
+            "MUSA masked math attention key must be [B,Tk,H,D], got {key:?}"
+        )));
+    };
+    if value != key
+        || (*key_batch, *key_heads, *key_dim) != (*batch, *heads, *head_dim)
+        || mask != [*query_tokens, *key_tokens]
+        || [*batch, *query_tokens, *key_tokens, *heads, *head_dim].contains(&0)
+    {
+        return Err(Error::Other(format!(
+            "MUSA masked math attention incompatible q={query:?}, k={key:?}, v={value:?}, mask={mask:?}"
+        )));
+    }
+    Ok((*batch, *query_tokens, *key_tokens, *heads, *head_dim))
+}
+
 /// Rows in a KV cache: 2-D `[rows, head_dim]`, 3-D `[rows, 1, head_dim]`, or
 /// the 4-D `[1, rows, 1, head_dim]` the prefix layer builds.
 fn key_rows(tensor: &Tensor, head_dim: usize, name: &str) -> Result<usize> {
@@ -289,6 +396,31 @@ mod policy_tests {
         }
         .admit("attention")
         .is_ok());
+    }
+
+    #[test]
+    fn masked_math_geometry_accepts_rectangular_attention() {
+        assert_eq!(
+            masked_attention_geometry(
+                &[1, 32, 24, 128],
+                &[1, 326, 24, 128],
+                &[1, 326, 24, 128],
+                &[32, 326]
+            )
+            .unwrap(),
+            (1, 32, 326, 24, 128)
+        );
+    }
+
+    #[test]
+    fn masked_math_geometry_rejects_wrong_mask() {
+        assert!(masked_attention_geometry(
+            &[1, 32, 24, 128],
+            &[1, 326, 24, 128],
+            &[1, 326, 24, 128],
+            &[326, 32]
+        )
+        .is_err());
     }
 }
 

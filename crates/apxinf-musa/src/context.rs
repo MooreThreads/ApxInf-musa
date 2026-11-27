@@ -152,7 +152,7 @@ fn warn_unmeasured_generation(caps: &MusaDeviceCaps) {
 /// whichever device was left current: `musaStreamCreate` has no device
 /// argument, so a replacement stream made under someone else's binding would
 /// silently move the whole context to another card.
-fn set_device(device_id: usize) -> Result<()> {
+pub(crate) fn set_device(device_id: usize) -> Result<()> {
     let device = i32::try_from(device_id)
         .map_err(|_| Error::Other(format!("MUSA device id {device_id} does not fit in i32")))?;
     unsafe { ffi::check_runtime(ffi::musa::musaSetDevice(device)) }.map_err(Error::Other)
@@ -259,6 +259,7 @@ impl MusaContext {
     }
 
     pub fn synchronize(&self) -> Result<()> {
+        set_device(self.device_id)?;
         self.stream.synchronize()
     }
 

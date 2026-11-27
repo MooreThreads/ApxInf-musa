@@ -41,8 +41,8 @@ pub use device_caps::{MusaArchFamily, MusaDeviceCaps};
 pub use graph::{capture, capture_isolated, CapturedGraph};
 pub use stream::MusaStream;
 pub use workspace::{
-    is_workspace_exhaustion, workspace_pool_enabled, ExecutionSession, GraphWorkspace,
-    OperationShape,
+    is_workspace_exhaustion, session_checkpoint, session_rewind, workspace_pool_enabled,
+    ExecutionSession, GraphWorkspace, OperationShape, SessionCheckpoint,
 };
 
 /// Whether this build found a MUSA toolkit. Set by `build.rs`; a build

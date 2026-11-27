@@ -23,10 +23,13 @@ mod norm;
 mod pointwise;
 mod quantization;
 mod rope;
+mod spatial;
+mod tensor;
 pub mod w8a8;
 
+pub use attention::masked_math_attention_bf16;
 pub use attention::{attention, prepare_attention, AttentionArgs, AttentionMask, AttentionPolicy};
-pub use cache::{concat_rows, reserve_prefix};
+pub use cache::{concat_rows, contiguous_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gemm::{
     gemm, gemm_ada_gate_residual_rms_norm, gemm_bias_gelu, gemm_bias_residual, gemm_fp8_qkv_rope,
@@ -43,6 +46,11 @@ pub use norm::{
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
 pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{rope, RopeArgs, RopeSemantic};
+pub use spatial::{convolution_bf16, interpolate_nearest_exact_bf16, ConvolutionArgs};
+pub use tensor::{
+    binary_bf16, binary_bf16_into, layer_norm_bf16, pairwise_rope_bf16, permute_bf16, rms_norm_bf16,
+    unary_bf16, BinaryOp, UnaryOp,
+};
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 

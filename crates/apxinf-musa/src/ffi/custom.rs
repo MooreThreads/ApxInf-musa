@@ -200,6 +200,108 @@ extern "C" {
         alpha: f32,
         stream: *mut c_void,
     ) -> i32;
+    /// Contiguous NCHW/NCDHW BF16 convolution, optionally with a channel bias.
+    /// Shapes and convolution attributes are passed as signed 64/32-bit arrays
+    /// so the adapter can construct exact muDNN tensor descriptors.
+    pub fn apxinf_musa_mudnn_convolution_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        input_dims: *const i64,
+        weight_dims: *const i64,
+        output_dims: *const i64,
+        rank: i32,
+        padding: *const i32,
+        stride: *const i32,
+        dilation: *const i32,
+        groups: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Contiguous NCW/NCHW/NCDHW BF16 nearest-exact interpolation.
+    pub fn apxinf_musa_mudnn_interpolate_nearest_exact_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        input_dims: *const i64,
+        output_dims: *const i64,
+        rank: i32,
+        scales: *const f32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Contiguous BF16 unary activation. `mode` is the adapter-owned enum.
+    pub fn apxinf_musa_mudnn_unary_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        dims: *const i64,
+        rank: i32,
+        mode: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Contiguous BF16 binary arithmetic with NumPy broadcasting.
+    pub fn apxinf_musa_mudnn_binary_bf16(
+        left: *const c_void,
+        left_dims: *const i64,
+        left_rank: i32,
+        right: *const c_void,
+        right_dims: *const i64,
+        right_rank: i32,
+        output: *mut c_void,
+        output_dims: *const i64,
+        output_rank: i32,
+        mode: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Last-axis BF16 LayerNorm over a flattened `[rows, cols]` view.
+    pub fn apxinf_musa_mudnn_layer_norm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f64,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Last-axis unit-weight BF16 RMSNorm over `[rows, cols]`.
+    pub fn apxinf_musa_mudnn_rms_norm_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f64,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn apxinf_musa_mudnn_pairwise_rope_bf16(
+        input: *const c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        output: *mut c_void,
+        batch: i32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn apxinf_musa_mudnn_concat_rows_bf16(
+        first: *const c_void,
+        second: *const c_void,
+        output: *mut c_void,
+        first_rows: i32,
+        second_rows: i32,
+        cols: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn apxinf_musa_mudnn_permute_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        input_dims: *const i64,
+        permutation: *const i64,
+        rank: i32,
+        stream: *mut c_void,
+    ) -> i32;
     /// muDNN flash attention. Same status convention as the GEMM above.
     pub fn apxinf_musa_mudnn_flash_bf16(
         q: *const c_void,
@@ -225,6 +327,21 @@ extern "C" {
         key_tokens: i32,
         dim: i32,
         causal: bool,
+        stream: *mut c_void,
+    ) -> i32;
+    /// muDNN math SDPA with a contiguous boolean mask `[Tq,Tk]`. Q/K/V and
+    /// output are physically contiguous `[B,T,H,D]` BF16 tensors.
+    pub fn apxinf_musa_mudnn_masked_math_attention_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        mask: *const c_void,
+        y: *mut c_void,
+        batch: i32,
+        heads: i32,
+        query_tokens: i32,
+        key_tokens: i32,
+        dim: i32,
         stream: *mut c_void,
     ) -> i32;
     /// Noncausal BF16 flash attention over a physical `[B,T,3,H,D]` QKV

@@ -373,6 +373,17 @@ pub struct ExecutionSession {
     inner: Rc<ExecutionSessionInner>,
 }
 
+/// A temporary allocation watermark inside the active prepared session.
+///
+/// Model code may use this only at a proven lifetime boundary: every Tensor
+/// backed by allocations after the watermark must be dropped before rewind.
+/// This is deliberately separate from `ExecutionSession::reset`, which resets
+/// a whole request and is used before prepare/run.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionCheckpoint {
+    offset: usize,
+}
+
 impl ExecutionSession {
     pub fn new(workspace: GraphWorkspace) -> Self {
         Self {
@@ -385,6 +396,10 @@ impl ExecutionSession {
 
     pub fn with_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
         GraphWorkspace::new(capacity_bytes, device).map(Self::new)
+    }
+
+    pub fn with_bump_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
+        GraphWorkspace::build(capacity_bytes, device, false).map(Self::new)
     }
 
     pub fn workspace(&self) -> &GraphWorkspace {
@@ -518,6 +533,38 @@ pub(crate) fn with_session<T>(
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     with_session_phase(session, false, operation)
+}
+
+/// Mark the current end of the active prepared arena. Returns `None` for the
+/// ordinary eager path, where allocations are owned by the stream allocator.
+pub fn session_checkpoint() -> Option<SessionCheckpoint> {
+    ACTIVE_SESSION.with(|active| {
+        let ptr = active.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: ACTIVE_SESSION is installed only for the duration of a
+            // live ExecutionSession traversal.
+            match &unsafe { &*ptr }.workspace.allocator {
+                Allocator::Bump { offset } => Some(SessionCheckpoint { offset: offset.get() }),
+                Allocator::Pool { .. } => None,
+            }
+        }
+    })
+}
+
+/// Rewind temporary allocations to a previously marked watermark.
+pub fn session_rewind(checkpoint: SessionCheckpoint) {
+    ACTIVE_SESSION.with(|active| {
+        let ptr = active.get();
+        if !ptr.is_null() {
+            // SAFETY: the checkpoint is consumed on the same active session;
+            // callers must drop all post-checkpoint Tensor handles first.
+            if let Allocator::Bump { offset } = &unsafe { &*ptr }.workspace.allocator {
+                offset.set(checkpoint.offset);
+            }
+        }
+    });
 }
 
 pub(crate) fn begin_capture_retention() {

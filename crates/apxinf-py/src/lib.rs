@@ -27,13 +27,15 @@
 //! imports and reports shape contracts, but model loading errors.
 //!
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "musa")]
+use std::time::Instant;
 
-use numpy::ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2, ArrayD, IxDyn};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -234,6 +236,18 @@ pub struct ModelRunner {
     device: Device,
     sampling_seed: Cell<u64>,
     sampling_draw: Cell<u64>,
+    fastwam_prepared: RefCell<Option<FastWamPrepared>>,
+}
+
+/// Device-resident Fast-WAM inputs.  Keeping these tensors on the accelerator
+/// makes the benchmark boundary match the Torch eager reference: conversion
+/// and H2D are performed once before warmup, not on every timed request.
+struct FastWamPrepared {
+    input_image: Tensor,
+    context: Tensor,
+    proprio: Tensor,
+    action_noise: Tensor,
+    video_noise: Option<Tensor>,
 }
 
 /// Request-owned RGB snapshot. This object has no NumPy references and can be
@@ -451,6 +465,7 @@ fn grid_metadata(grids: Option<&[[u32; 3]]>) -> VlaMetadata<'_> {
         image_grid_thw: grids,
         embodiment_id: None,
         planning: None,
+        auxiliary_latent: None,
     }
 }
 
@@ -648,6 +663,16 @@ impl ModelRunner {
         }
         let array = Array2::from_shape_vec((horizon, dim), flat).map_err(runtime_err)?;
         Ok(array.into_pyarray_bound(py))
+    }
+
+    fn fastwam_array<'py>(
+        py: Python<'py>,
+        shape: &[usize],
+        values: Vec<f32>,
+    ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+        ArrayD::from_shape_vec(IxDyn(shape), values)
+            .map_err(runtime_err)
+            .map(|array| array.into_pyarray_bound(py))
     }
 
     fn next_sampling_rng(&self) -> PyResult<RngKey> {
@@ -1010,6 +1035,7 @@ impl ModelRunner {
                 || options.reasoning.is_some()
                 || options.raw_rgb_resize.is_some())
             .then_some(&options),
+            auxiliary_latent: None,
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -1141,11 +1167,12 @@ impl ModelRunner {
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
-        let needs_pi05_config = config_json.is_some()
+        let needs_pi05_config = matches!(model, "pi05" | "pi05-musa" | "pi05-cuda" | "pi05-hip")
+            && (config_json.is_some()
             || action_horizon.is_some()
             || num_views.is_some()
             || num_flow_steps.is_some()
-            || flow_start_time.is_some();
+            || flow_start_time.is_some());
         let config = if needs_pi05_config {
             let mut config = match config_json {
                 Some(raw) => Pi05Config::from_json_str(raw).map_err(runtime_err)?,
@@ -1203,7 +1230,262 @@ impl ModelRunner {
             device,
             sampling_seed: Cell::new(sampling_seed),
             sampling_draw: Cell::new(0),
+            fastwam_prepared: RefCell::new(None),
         })
+    }
+
+    #[pyo3(name = "_infer_fastwam_preprocessed", signature = (input_image, context, context_mask, proprio, action_noise, video_noise=None))]
+    fn infer_fastwam_preprocessed<'py>(
+        &self,
+        py: Python<'py>,
+        input_image: PyReadonlyArrayDyn<'py, f32>,
+        context: PyReadonlyArrayDyn<'py, f32>,
+        context_mask: PyReadonlyArrayDyn<'py, u8>,
+        proprio: PyReadonlyArrayDyn<'py, f32>,
+        action_noise: PyReadonlyArrayDyn<'py, f32>,
+        video_noise: Option<PyReadonlyArrayDyn<'py, f32>>,
+    ) -> PyResult<PyObject> {
+        let mode = self
+            .model
+            .vla()
+            .map_err(runtime_err)?
+            .model_variant()
+            .ok_or_else(|| PyValueError::new_err("loaded model is not Fast-WAM"))?;
+        let expect = |shape: &[usize], want: &[usize], name: &str| -> PyResult<()> {
+            if shape != want {
+                return Err(PyValueError::new_err(format!(
+                    "Fast-WAM {name} expected shape {want:?}, got {shape:?}"
+                )));
+            }
+            Ok(())
+        };
+        expect(input_image.shape(), &[1, 3, 224, 448], "input_image")?;
+        expect(context.shape(), &[1, 128, 4096], "context")?;
+        expect(context_mask.shape(), &[1, 128], "context_mask")?;
+        if context_mask
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("Fast-WAM context_mask must be contiguous u8"))?
+            .iter()
+            .any(|&value| value == 0)
+        {
+            return Err(PyValueError::new_err(
+                "Fast-WAM first release requires an all-valid context_mask",
+            ));
+        }
+        expect(proprio.shape(), &[1, 8], "proprio")?;
+        expect(action_noise.shape(), &[1, 32, 7], "action_noise")?;
+        if mode != "fast" && video_noise.is_none() {
+            return Err(PyValueError::new_err("Fast-WAM IDM/Joint requires video_noise"));
+        }
+        let mask = context_mask.as_slice().map_err(|_| {
+            PyValueError::new_err("Fast-WAM context_mask must be C-contiguous uint8")
+        })?;
+        let to_tensor = |array: &PyReadonlyArrayDyn<'py, f32>, name: &str| -> PyResult<Tensor> {
+            Tensor::from_f32(
+                Shape::new(array.shape().to_vec()),
+                array.as_slice().map_err(|_| {
+                    PyValueError::new_err(format!("Fast-WAM {name} must be contiguous f32"))
+                })?,
+            )
+            .map_err(runtime_err)
+        };
+        let image = to_tensor(&input_image, "input_image")?;
+        let context = to_tensor(&context, "context")?;
+        let proprio = to_tensor(&proprio, "proprio")?;
+        let action_noise = to_tensor(&action_noise, "action_noise")?;
+        let video_noise = video_noise
+            .map(|noise| to_tensor(&noise, "video_noise"))
+            .transpose()?;
+        if let Some(noise) = &video_noise {
+            expect(noise.shape().dims(), &[1, 48, 3, 14, 28], "video_noise")?;
+        }
+        let observation = Observation {
+            vision: VisionObservation::Patches(image),
+            token_ids: vec![0],
+            state: Some(context),
+            action_mask: Some(proprio),
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(mask),
+            auxiliary_latent: video_noise.as_ref(),
+            ..Default::default()
+        };
+        let request = VlaRequest::provided_with_metadata(&observation, &action_noise, metadata);
+        let outputs = self.model.infer_with_outputs(&request).map_err(runtime_err)?;
+        let result = PyDict::new_bound(py);
+        result.set_item(
+            "normalized_actions",
+            Self::fastwam_array(
+                py,
+                &[1, 32, 7],
+                outputs.action.tensor().to_f32_vec().map_err(runtime_err)?,
+            )?,
+        )?;
+        if let Some(latents) = outputs.video_latents {
+            result.set_item(
+                "video_latents",
+                Self::fastwam_array(
+                    py,
+                    latents.shape().dims(),
+                    latents.to_f32_vec().map_err(runtime_err)?,
+                )?,
+            )?;
+        }
+        if let Some(video) = outputs.decoded_video {
+            let values = video
+                .to_f32_vec()
+                .map_err(runtime_err)?
+                .into_iter()
+                .map(|value| ((value.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8)
+                .collect::<Vec<_>>();
+            let mut nhwc = Vec::with_capacity(values.len());
+            for frame in 0..9 {
+                for y in 0..224 {
+                    for x in 0..448 {
+                        for channel in 0..3 {
+                            let index = ((channel * 9 + frame) * 224 + y) * 448 + x;
+                            nhwc.push(values[index]);
+                        }
+                    }
+                }
+            }
+            let array = numpy::ndarray::ArrayD::from_shape_vec(IxDyn(&[9, 224, 448, 3]), nhwc)
+                .map_err(runtime_err)?
+                .into_pyarray_bound(py);
+            result.set_item("decoded_video", array)?;
+        }
+        Ok(result.into())
+    }
+
+    /// Prepare fixed Fast-WAM inputs once on the MUSA device. The paired
+    /// `_infer_fastwam_prepared` call is the benchmark path: it excludes
+    /// NumPy/PyO3 validation, F32->BF16 conversion, and H2D copies from every
+    /// timed iteration, while retaining the synchronized action D2H result.
+    #[cfg(feature = "musa")]
+    #[pyo3(name = "prepare_fastwam_preprocessed", signature = (input_image, context, context_mask, proprio, action_noise, video_noise=None))]
+    fn prepare_fastwam_preprocessed<'py>(
+        &self,
+        input_image: PyReadonlyArrayDyn<'py, f32>,
+        context: PyReadonlyArrayDyn<'py, f32>,
+        context_mask: PyReadonlyArrayDyn<'py, u8>,
+        proprio: PyReadonlyArrayDyn<'py, f32>,
+        action_noise: PyReadonlyArrayDyn<'py, f32>,
+        video_noise: Option<PyReadonlyArrayDyn<'py, f32>>,
+    ) -> PyResult<()> {
+        let mode = self
+            .model
+            .vla()
+            .map_err(runtime_err)?
+            .model_variant()
+            .ok_or_else(|| PyValueError::new_err("loaded model is not Fast-WAM"))?;
+        let expect = |shape: &[usize], want: &[usize], name: &str| -> PyResult<()> {
+            if shape != want {
+                return Err(PyValueError::new_err(format!(
+                    "Fast-WAM {name} expected shape {want:?}, got {shape:?}"
+                )));
+            }
+            Ok(())
+        };
+        expect(input_image.shape(), &[1, 3, 224, 448], "input_image")?;
+        expect(context.shape(), &[1, 128, 4096], "context")?;
+        expect(context_mask.shape(), &[1, 128], "context_mask")?;
+        if context_mask
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("Fast-WAM context_mask must be contiguous u8"))?
+            .iter()
+            .any(|&value| value == 0)
+        {
+            return Err(PyValueError::new_err(
+                "Fast-WAM prepared path requires an all-valid context_mask",
+            ));
+        }
+        expect(proprio.shape(), &[1, 8], "proprio")?;
+        expect(action_noise.shape(), &[1, 32, 7], "action_noise")?;
+        if mode != "fast" && video_noise.is_none() {
+            return Err(PyValueError::new_err("Fast-WAM IDM/Joint requires video_noise"));
+        }
+        let to_bf16 = |array: &PyReadonlyArrayDyn<'py, f32>, name: &str| -> PyResult<Tensor> {
+            let values = array.as_slice().map_err(|_| {
+                PyValueError::new_err(format!("Fast-WAM {name} must be contiguous f32"))
+            })?;
+            Tensor::from_bf16(
+                array.shape().to_vec(),
+                &values.iter().copied().map(half::bf16::from_f32).collect::<Vec<_>>(),
+            )
+            .map_err(runtime_err)
+        };
+        let device_id = match self.device {
+            Device::Musa(id) => id,
+            device => {
+                return Err(PyValueError::new_err(format!(
+                    "Fast-WAM prepared inputs require MUSA, got {device}"
+                )))
+            }
+        };
+        let upload = |array: &PyReadonlyArrayDyn<'py, f32>, name: &str| -> PyResult<Tensor> {
+            let host = to_bf16(array, name)?;
+            apxinf_musa::transfers::to_device(&host, device_id).map_err(runtime_err)
+        };
+        let video_noise = video_noise
+            .map(|noise| {
+                expect(noise.shape(), &[1, 48, 3, 14, 28], "video_noise")?;
+                upload(&noise, "video_noise")
+            })
+            .transpose()?;
+        *self.fastwam_prepared.borrow_mut() = Some(FastWamPrepared {
+            input_image: upload(&input_image, "input_image")?,
+            context: upload(&context, "context")?,
+            proprio: upload(&proprio, "proprio")?,
+            action_noise: upload(&action_noise, "action_noise")?,
+            video_noise,
+        });
+        Ok(())
+    }
+
+    /// Run the device-resident Fast-WAM request and return only final action.
+    #[cfg(feature = "musa")]
+    #[pyo3(name = "_infer_fastwam_prepared")]
+    fn infer_fastwam_prepared<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        let prepared = self.fastwam_prepared.borrow();
+        let prepared = prepared
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("call prepare_fastwam_preprocessed first"))?;
+        let observation = Observation {
+            vision: VisionObservation::Patches(prepared.input_image.clone()),
+            token_ids: vec![0],
+            state: Some(prepared.context.clone()),
+            action_mask: Some(prepared.proprio.clone()),
+        };
+        let metadata = VlaMetadata {
+            auxiliary_latent: prepared.video_noise.as_ref(),
+            ..Default::default()
+        };
+        let request = VlaRequest::provided_with_metadata(
+            &observation,
+            &prepared.action_noise,
+            metadata,
+        );
+        self.model.synchronize().map_err(runtime_err)?;
+        let started = Instant::now();
+        let action = self
+            .model
+            .infer_action_only(&request)
+            .map_err(runtime_err)?;
+        self.model.synchronize().map_err(runtime_err)?;
+        let action = apxinf_musa::transfers::to_cpu(action.tensor()).map_err(runtime_err)?;
+        self.model.synchronize().map_err(runtime_err)?;
+        let core_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let result = PyDict::new_bound(py);
+        result.set_item("_core_latency_ms", core_latency_ms)?;
+        result.set_item(
+            "normalized_actions",
+            Self::fastwam_array(
+                py,
+                &[1, 32, 7],
+                action.to_f32_vec().map_err(runtime_err)?,
+            )?,
+        )?;
+        Ok(result.into())
     }
 
     /// Build a **checkpoint-free** pi05 model with deterministic random weights.
@@ -1298,6 +1580,7 @@ impl ModelRunner {
             device,
             sampling_seed: Cell::new(sampling_seed),
             sampling_draw: Cell::new(0),
+            fastwam_prepared: RefCell::new(None),
         })
     }
 
@@ -1432,6 +1715,7 @@ impl ModelRunner {
             embodiment_id: input.embodiment_id,
             planning: (options.num_steps.is_some() || options.reasoning.is_some())
                 .then_some(&options),
+            auxiliary_latent: None,
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -1597,6 +1881,7 @@ impl ModelRunner {
             image_grid_thw: Some(&input.image_grid_thw),
             embodiment_id: input.embodiment_id,
             planning: None,
+            auxiliary_latent: None,
         };
         self.model
             .calibration_amax(&VlaRequest::provided_with_metadata(
@@ -1886,6 +2171,11 @@ impl ModelRunner {
     /// Actual loaded implementation; `auto` is resolved during loading.
     #[getter]
     fn model_variant(&self) -> PyResult<Option<&'static str>> {
+        Ok(self.model.vla().map_err(runtime_err)?.model_variant())
+    }
+
+    #[getter]
+    fn fastwam_mode(&self) -> PyResult<Option<&'static str>> {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 

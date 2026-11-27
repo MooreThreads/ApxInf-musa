@@ -19,6 +19,8 @@ pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
 #[cfg(feature = "musa")]
+pub mod musa_fastwam;
+#[cfg(feature = "musa")]
 pub mod musa_gr00t;
 #[cfg(feature = "musa")]
 pub mod musa_pi05;
@@ -65,6 +67,6 @@ pub use qwen_drive::QwenDriveModelRunner;
 pub use registry::{get, list, register};
 pub use vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
-    PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
-    VlaRuntime,
+    InferenceOutputs, PreparationStatus, PreparedInference, VisionObservation, VlaContract,
+    VlaMetadata, VlaRequest, VlaRuntime,
 };

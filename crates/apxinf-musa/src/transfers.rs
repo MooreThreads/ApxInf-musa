@@ -184,6 +184,33 @@ pub fn copy_cpu_to_device_pinned(
         .map_err(musa_error)
 }
 
+/// Copy a fixed-shape device tensor into another fixed-shape device tensor on
+/// the backend stream. This is used by prepared denoise loops to move the
+/// result into a persistent ping-pong state buffer before rewinding scratch.
+pub fn copy_device_to_device(
+    source: &Tensor,
+    destination: &Tensor,
+    stream: &crate::MusaStream,
+) -> Result<()> {
+    if source.device() != destination.device()
+        || source.shape() != destination.shape()
+        || source.dtype() != destination.dtype()
+    {
+        return Err(Error::Other(format!(
+            "fixed MUSA device copy mismatch: source {:?} {}, destination {:?} {}",
+            source.shape().dims(),
+            source.dtype(),
+            destination.shape().dims(),
+            destination.dtype()
+        )));
+    }
+    let source = MusaBuffer::from_tensor(source).map_err(musa_error)?;
+    let destination = MusaBuffer::from_tensor(destination).map_err(musa_error)?;
+    destination
+        .copy_from_device_async(&source, source.len(), stream)
+        .map_err(musa_error)
+}
+
 /// Transfer a MUSA tensor back to CPU.
 pub fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     let handle = match tensor.storage() {

@@ -15,10 +15,12 @@ crate-type = ["cdylib", "rlib"]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-model = { path = "../apxinf-model" }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", features = ["sentencepiece"] }
+apxinf-musa = { path = "../apxinf-musa", optional = true, default-features = false }
 # Keep pyo3 default features (incl. `macros`); `extension-module` is opt-in
 # below so `cargo test` can still link a Python interpreter for the harness.
 pyo3 = "0.22"
 numpy = "0.22"
+half = "2"
 
 [features]
 default = []
@@ -32,7 +34,7 @@ extension-module = ["pyo3/extension-module"]
 cuda = ["apxinf-model/cuda"]
 # Forward MUSA support to the model crate. `musa-mttx` additionally enables
 # the MTTX profiling markers.
-musa = ["apxinf-model/musa"]
+musa = ["apxinf-model/musa", "dep:apxinf-musa"]
 musa-mttx = ["musa", "apxinf-model/musa-mttx"]
 # Forward the TileLang-generated operators (see apxinf-model's
 # `musa-tilelang`).

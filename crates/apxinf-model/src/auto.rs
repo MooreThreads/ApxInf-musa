@@ -21,7 +21,8 @@ use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
 use crate::vla::{
-    Action, ExecutionPolicy, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime,
+    Action, ExecutionPolicy, InferenceOutputs, InferenceSpec, PreparedInference, VlaRequest,
+    VlaRuntime,
 };
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
@@ -260,6 +261,18 @@ impl LoadedModel {
         self.vla()?.infer(request)
     }
 
+    pub fn infer_action_only(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        self.vla()?.infer_action_only(request)
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        self.vla()?.synchronize()
+    }
+
+    pub fn infer_with_outputs(&self, request: &VlaRequest<'_>) -> Result<InferenceOutputs> {
+        self.vla()?.infer_with_outputs(request)
+    }
+
     /// Run VLA inference and copy the action to host as `f32`. Convenience for
     /// callers that need host values without holding a backend handle.
     pub fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
@@ -443,6 +456,16 @@ impl AutoModel {
             if matches!(device, Device::Musa(_)) {
                 return crate::musa_gr00t::load(path, device, options);
             }
+        }
+
+        if model_name == "fastwam" {
+            #[cfg(feature = "musa")]
+            if matches!(device, Device::Musa(_)) {
+                return crate::musa_fastwam::load_runtime(path, device, options);
+            }
+            return Err(Error::Other(
+                "Fast-WAM first release requires the MUSA backend".into(),
+            ));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -681,7 +704,7 @@ fn family_name(model_name: &str) -> &str {
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         family_name(model_name),
-        "pi05" | "qwen_drive" | "d3" | "smolvla" | "smolvla_libero"
+        "pi05" | "qwen_drive" | "d3" | "smolvla" | "smolvla_libero" | "fastwam"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]

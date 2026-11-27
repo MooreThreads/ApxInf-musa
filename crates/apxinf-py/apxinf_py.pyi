@@ -175,6 +175,28 @@ class ModelRunner:
         """Private L0 path used by model-specific policies and parity tests."""
         ...
 
+    def _infer_fastwam_preprocessed(
+        self,
+        input_image: npt.NDArray[np.float32],
+        context: npt.NDArray[np.float32],
+        context_mask: npt.NDArray[np.uint8],
+        proprio: npt.NDArray[np.float32],
+        action_noise: npt.NDArray[np.float32],
+        video_noise: npt.NDArray[np.float32] | None = ...,
+    ) -> dict[str, object]: ...
+
+    def prepare_fastwam_preprocessed(
+        self,
+        input_image: npt.NDArray[np.float32],
+        context: npt.NDArray[np.float32],
+        context_mask: npt.NDArray[np.uint8],
+        proprio: npt.NDArray[np.float32],
+        action_noise: npt.NDArray[np.float32],
+        video_noise: npt.NDArray[np.float32] | None = ...,
+    ) -> None: ...
+
+    def _infer_fastwam_prepared(self) -> dict[str, object]: ...
+
     def infer_rgb(
         self,
         rgb_u8: npt.NDArray[np.uint8],
@@ -226,6 +248,10 @@ class ModelRunner:
     def max_token_len(self) -> int: ...
     @property
     def accepts_rgb_u8(self) -> bool: ...
+    @property
+    def fastwam_mode(self) -> str | None: ...
+    @property
+    def execution_mode(self) -> str: ...
 
 class DecisionRunner:
     """A loaded decision model handle for encoded-prompt or schema requests."""

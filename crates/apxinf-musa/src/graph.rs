@@ -43,6 +43,7 @@ pub struct CapturedGraph {
 
 impl Graph for CapturedGraph {
     fn replay(&self) -> Result<()> {
+        crate::context::set_device(self.context.device_id())?;
         unsafe {
             ffi::check_runtime(ffi::musa::musaGraphLaunch(
                 self.executable,

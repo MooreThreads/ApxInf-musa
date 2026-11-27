@@ -86,6 +86,7 @@ impl RequestInput {
             image_grid_thw: Some(&self.grid),
             embodiment_id: Some(self.embodiment_id),
             planning: None,
+            auxiliary_latent: None,
         };
         VlaRequest::provided_with_metadata(&self.observation, &self.noise, metadata)
     }

@@ -469,6 +469,10 @@ fn main() {
         "APXINF_KERNEL_BUILD_ID",
         "MUSA_PATH",
         "MUSA_HOME",
+        "CPLUS_INCLUDE_PATH",
+        "C_INCLUDE_PATH",
+        "LIBRARY_PATH",
+        "LD_LIBRARY_PATH",
         "APXINF_MTTX_SRC",
         "MTTX_SRC",
     ] {

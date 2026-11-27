@@ -356,12 +356,19 @@ impl MusaBuffer {
         num_bytes: usize,
         stream: &crate::MusaStream,
     ) -> Result<(), String> {
+        if self.device != source.device {
+            return Err(format!(
+                "device copy crosses MUSA devices: source {}, destination {}",
+                source.device, self.device
+            ));
+        }
         if num_bytes > self.len || num_bytes > source.len {
             return Err(format!(
                 "device copy of {num_bytes} bytes exceeds {} or {}",
                 self.len, source.len
             ));
         }
+        crate::context::set_device(self.device).map_err(|error| error.to_string())?;
         unsafe {
             ffi::check_runtime(ffi::musa::musaMemcpyAsync(
                 self.ptr,

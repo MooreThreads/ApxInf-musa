@@ -16,9 +16,11 @@
 // `mublas_adapter.mu` and the two FA adapters return their own status types;
 // this one returns `int` because muDNN's own Run() does, and translating would
 // mean inventing a mapping for codes this file does not own.
-#include <mudnn.h>
+#include <mudnncxx/mudnn.h>
 #include <musa_runtime.h>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -29,6 +31,7 @@
 
 namespace {
 namespace md = musa::dnn;
+
 
 // This adapter's own failure codes. 1000 and up, so they cannot collide with a
 // `md::Status` value, and named, so a caller reading `status 1004` can find out
@@ -209,6 +212,220 @@ struct GeneralFlash {
   }
   ~GeneralFlash() { if(lse_buffer) musaFree(lse_buffer); }
 };
+
+// Exact fallback for Fast-WAM's block mask. Unlike Flash, muDNN Math SDPA
+// consumes an explicit BOOL [Tq,Tk] mask and materializes attention
+// probabilities. Q/K/V remain physically [B,T,H,D], described logically as
+// [B,H,T,D], matching Torch-MUSA's MuDNNMathSDPAFwd wrapper.
+struct MaskedMathAttention {
+  md::Tensor q,k,v,y,mask,attn_probs,dropout;
+  md::ScaledDotProductAttention operation;
+  Scratch scratch;
+  void* attn_probs_buffer = nullptr;
+  MaskedMathAttention(int batch,int heads,int query_tokens,int key_tokens,
+                      int dim,musaStream_t stream) : scratch(stream) {
+    for(auto p:{&q,&k,&v,&y,&attn_probs}) check(p->SetType(md::Tensor::Type::BFLOAT16));
+    check(q.SetNdInfo({batch,heads,query_tokens,dim},
+      {heads*query_tokens*dim,query_tokens*dim,dim,1}));
+    check(y.SetNdInfo({batch,heads,query_tokens,dim},
+      {heads*query_tokens*dim,query_tokens*dim,dim,1}));
+    for(auto p:{&k,&v}) check(p->SetNdInfo({batch,heads,key_tokens,dim},
+      {heads*key_tokens*dim,key_tokens*dim,dim,1}));
+    check(mask.SetType(md::Tensor::Type::BOOL));
+    check(mask.SetNdInfo({query_tokens,key_tokens}));
+    check(attn_probs.SetNdInfo({batch,heads,query_tokens,key_tokens}));
+    check(dropout.SetType(md::Tensor::Type::BOOL));
+    check(dropout.SetNdInfo({0}));
+    check(operation.SetComputeMode(md::ScaledDotProductAttention::ComputeMode::TENSOR));
+    check(operation.SetBatchSize(batch));
+    check(operation.SetHeadsNum(heads));
+    check(operation.SetEmbedDim(heads*dim));
+    check(operation.SetScale(1./std::sqrt(double(dim))));
+    check(operation.SetMaskMode(false));
+    check(operation.SetCausal(false));
+    check(operation.SetTraining(false));
+    check(operation.SetDropoutP(0));
+    check(operation.SetIsDeterministic(true));
+    const size_t bytes=size_t(batch)*heads*query_tokens*key_tokens*sizeof(uint16_t);
+    if(musaMalloc(&attn_probs_buffer,bytes)!=musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    check(attn_probs.SetAddr(attn_probs_buffer));
+  }
+  ~MaskedMathAttention() { if(attn_probs_buffer) musaFree(attn_probs_buffer); }
+};
+
+md::Tensor::Format channel_first_format(int rank) {
+  switch (rank) {
+    case 3: return md::Tensor::Format::NCW;
+    case 4: return md::Tensor::Format::NCHW;
+    case 5: return md::Tensor::Format::NCDHW;
+    default: throw StatusError{kStatusInvalidArgument};
+  }
+}
+
+void configure_bf16_tensor(md::Tensor& tensor, const int64_t* dims, int rank) {
+  if (!dims || rank < 1 || rank > 5) throw StatusError{kStatusInvalidArgument};
+  for (int i = 0; i < rank; ++i) {
+    if (dims[i] <= 0) throw StatusError{kStatusInvalidArgument};
+  }
+  check(tensor.SetType(md::Tensor::Type::BFLOAT16));
+  check(tensor.SetNdInfo(rank, dims));
+  if (rank >= 3) check(tensor.SetFormat(channel_first_format(rank)));
+}
+
+void configure_empty_bf16_tensor(md::Tensor& tensor) {
+  check(tensor.SetType(md::Tensor::Type::BFLOAT16));
+  check(tensor.SetNdInfo({0}));
+}
+
+void configure_contiguous_bf16_tensor(md::Tensor& tensor,const int64_t* dims,int rank) {
+  if(!dims||rank<1||rank>8) throw StatusError{kStatusInvalidArgument};
+  for(int i=0;i<rank;++i) if(dims[i]<=0) throw StatusError{kStatusInvalidArgument};
+  check(tensor.SetType(md::Tensor::Type::BFLOAT16));
+  check(tensor.SetNdInfo(rank,dims));
+}
+
+struct LayerNormOp {
+  md::Tensor input,weight,bias,output,mean,inv_var;
+  md::LayerNorm operation;
+  Scratch scratch;
+  void* statistics=nullptr;
+  bool affine;
+  LayerNormOp(int rows,int cols,double eps,bool use_affine,musaStream_t stream)
+      : scratch(stream),affine(use_affine) {
+    const int64_t matrix_dims[2]={rows,cols};
+    for(auto p:{&input,&output}) configure_contiguous_bf16_tensor(*p,matrix_dims,2);
+    if(affine) {
+      const int64_t affine_dims[1]={cols};
+      configure_contiguous_bf16_tensor(weight,affine_dims,1);
+      configure_contiguous_bf16_tensor(bias,affine_dims,1);
+    } else {
+      configure_empty_bf16_tensor(weight);
+      configure_empty_bf16_tensor(bias);
+    }
+    for(auto p:{&mean,&inv_var}) {
+      check(p->SetType(md::Tensor::Type::FLOAT));
+      check(p->SetNdInfo({rows}));
+    }
+    check(operation.SetAxis({1}));
+    check(operation.SetEpsilon(eps));
+    check(operation.SetVarMode(md::LayerNorm::VarMode::DIRECT));
+    const size_t bytes=size_t(rows)*2*sizeof(float);
+    if(musaMalloc(&statistics,bytes)!=musaSuccess) throw StatusError{kStatusAllocationFailed};
+    check(mean.SetAddr(statistics));
+    check(inv_var.SetAddr(static_cast<unsigned char*>(statistics)+size_t(rows)*sizeof(float)));
+  }
+  ~LayerNormOp(){if(statistics)musaFree(statistics);}
+};
+
+struct RmsNormOp {
+  md::Tensor input,weight,output,inv_var;
+  md::RMSNorm operation;
+  void* statistics=nullptr;
+  RmsNormOp(int rows,int cols,double eps,musaStream_t) {
+    const int64_t matrix_dims[2]={rows,cols};
+    for(auto p:{&input,&output}) configure_contiguous_bf16_tensor(*p,matrix_dims,2);
+    configure_empty_bf16_tensor(weight);
+    check(inv_var.SetType(md::Tensor::Type::FLOAT));
+    check(inv_var.SetNdInfo({rows}));
+    check(operation.SetAxis({1}));
+    check(operation.SetEpsilon(eps));
+    check(operation.SetVarMode(md::RMSNorm::VarMode::DIRECT));
+    if(musaMalloc(&statistics,size_t(rows)*sizeof(float))!=musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    check(inv_var.SetAddr(statistics));
+  }
+  ~RmsNormOp(){if(statistics)musaFree(statistics);}
+};
+
+// Adjacent-pair RoPE implemented entirely with muDNN tensor operators. The
+// strided BF16 descriptors expose even and odd lanes without a gather kernel;
+// the five cached F32 planes preserve the reference's single final BF16 cast.
+struct PairwiseRopeOp {
+  md::Tensor input_even,input_odd,output_even,output_odd,cos,sin;
+  md::Tensor even_f32,odd_f32,product_a,product_b,result;
+  md::Unary cast;
+  md::Binary multiply,add,subtract;
+  void* workspace=nullptr;
+  size_t plane_bytes=0;
+
+  PairwiseRopeOp(int batch,int tokens,int heads,int head_dim,musaStream_t) {
+    const int pairs=head_dim/2;
+    const int64_t pair_dims[4]={batch,tokens,heads,pairs};
+    // The model tensor is contiguous [B,H,T,D]; descriptors expose the
+    // strided even/odd planes as logical [B,T,H,D/2].
+    const int64_t pair_strides[4]={
+      int64_t(heads)*tokens*head_dim,
+      head_dim,
+      int64_t(tokens)*head_dim,
+      2,
+    };
+    for(auto p:{&input_even,&input_odd,&output_even,&output_odd}) {
+      check(p->SetType(md::Tensor::Type::BFLOAT16));
+      check(p->SetNdInfo(4,pair_dims,pair_strides));
+    }
+    for(auto p:{&even_f32,&odd_f32,&product_a,&product_b,&result}) {
+      check(p->SetType(md::Tensor::Type::FLOAT));
+      check(p->SetNdInfo(4,pair_dims));
+    }
+    const int64_t table_dims[4]={1,tokens,1,pairs};
+    for(auto p:{&cos,&sin}) {
+      check(p->SetType(md::Tensor::Type::FLOAT));
+      check(p->SetNdInfo(4,table_dims));
+    }
+    check(cast.SetMode(md::Unary::Mode::CAST));
+    check(multiply.SetMode(md::Binary::Mode::MUL));
+    check(add.SetMode(md::Binary::Mode::ADD));
+    check(subtract.SetMode(md::Binary::Mode::SUB));
+
+    plane_bytes=size_t(batch)*tokens*heads*pairs*sizeof(float);
+    if(musaMalloc(&workspace,5*plane_bytes)!=musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    auto* base=static_cast<unsigned char*>(workspace);
+    check(even_f32.SetAddr(base));
+    check(odd_f32.SetAddr(base+plane_bytes));
+    check(product_a.SetAddr(base+2*plane_bytes));
+    check(product_b.SetAddr(base+3*plane_bytes));
+    check(result.SetAddr(base+4*plane_bytes));
+  }
+  ~PairwiseRopeOp(){if(workspace)musaFree(workspace);}
+};
+
+// Convolution is used by Fast-WAM's VAE and video patch embedding.  muDNN's
+// recommended algorithm and scratch allocation are shape/stream resources;
+// constructing them inside stream capture triggers runtime error 900.  Cache
+// both on the warmup traversal, just like Matmul and attention above.
+struct ConvolutionOp {
+  md::Tensor input,weight,bias,output,add;
+  md::Convolution operation;
+  md::Convolution::Algorithm algorithm;
+  md::Convolution::FusedActivationDesc activation;
+  Scratch scratch;
+  bool has_bias;
+  ConvolutionOp(const int64_t* input_dims,const int64_t* weight_dims,
+                const int64_t* output_dims,int rank,const int* padding,
+                const int* stride,const int* dilation,int groups,bool use_bias,
+                md::Handle& handle,musaStream_t stream)
+      : scratch(stream),has_bias(use_bias) {
+    const int spatial=rank-2;
+    configure_bf16_tensor(input,input_dims,rank);
+    configure_bf16_tensor(weight,weight_dims,rank);
+    configure_bf16_tensor(output,output_dims,rank);
+    if(has_bias) {
+      const int64_t bias_dims[1]={weight_dims[0]};
+      configure_bf16_tensor(bias,bias_dims,1);
+    } else {
+      configure_empty_bf16_tensor(bias);
+    }
+    configure_empty_bf16_tensor(add);
+    check(operation.SetGroups(groups));
+    check(operation.SetNdInfo(spatial,padding,stride,dilation));
+    check(operation.SetComputeMode(md::Convolution::ComputeMode::TENSOR));
+    check(operation.GetRecommendForwardAlgorithm(handle,algorithm,output,input,weight));
+    check(activation.SetMode(md::Convolution::FusedActivationDesc::Mode::IDENTITY));
+  }
+};
+
 struct Stream {
   md::Handle handle;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
@@ -216,6 +433,11 @@ struct Stream {
   std::map<std::tuple<int,int,int>,std::unique_ptr<MatmulFp8Bias>> fp8_bias_matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
   std::map<std::tuple<int,int,int,int,int,int,bool,bool>,std::unique_ptr<GeneralFlash>> general_flashes;
+  std::map<std::tuple<int,int,int,int,int>,std::unique_ptr<MaskedMathAttention>> masked_math_attention;
+  std::map<std::tuple<int,int,double,bool>,std::unique_ptr<LayerNormOp>> layer_norms;
+  std::map<std::tuple<int,int,double>,std::unique_ptr<RmsNormOp>> rms_norms;
+  std::map<std::tuple<int,int,int,int>,std::unique_ptr<PairwiseRopeOp>> pairwise_ropes;
+  std::map<std::vector<int64_t>,std::unique_ptr<ConvolutionOp>> convolutions;
   Stream(int device,musaStream_t stream) : handle(device) {
     check(handle.SetStream(stream)); check(handle.SetAllowTF32(false));
   }
@@ -417,6 +639,339 @@ extern "C" int apxinf_musa_mudnn_fp8_gemm_bias(const void* a,const void* w,void*
  }
 }
 
+extern "C" int apxinf_musa_mudnn_convolution_bf16(
+ const void* input,const void* weight,const void* bias,void* output,
+ const int64_t* input_dims,const int64_t* weight_dims,const int64_t* output_dims,
+ int rank,const int* padding,const int* stride,const int* dilation,int groups,
+ musaStream_t stream) {
+ const int spatial=rank-2;
+ if(!input||!weight||!output||!input_dims||!weight_dims||!output_dims||
+    !padding||!stride||!dilation||(rank!=4&&rank!=5)||groups<=0) {
+   record_failure(kStatusInvalidArgument, "muDNN BF16 convolution");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   std::vector<int64_t> key;
+   key.reserve(size_t(rank)*3+size_t(spatial)*3+3);
+   key.push_back(rank); key.push_back(groups); key.push_back(bias?1:0);
+   key.insert(key.end(),input_dims,input_dims+rank);
+   key.insert(key.end(),weight_dims,weight_dims+rank);
+   key.insert(key.end(),output_dims,output_dims+rank);
+   for(int i=0;i<spatial;++i) key.push_back(padding[i]);
+   for(int i=0;i<spatial;++i) key.push_back(stride[i]);
+   for(int i=0;i<spatial;++i) key.push_back(dilation[i]);
+   auto it=s.convolutions.find(key);
+   if(it==s.convolutions.end()) {
+     if(capturing(stream)) {
+       record_failure(kStatusCaptureInProgress,"muDNN BF16 convolution");
+       return kStatusCaptureInProgress;
+     }
+     it=s.convolutions.emplace(key,std::make_unique<ConvolutionOp>(
+       input_dims,weight_dims,output_dims,rank,padding,stride,dilation,groups,
+       bias!=nullptr,s.handle,stream)).first;
+   }
+   auto& p=*it->second;
+   check(p.input.SetAddr(input)); check(p.weight.SetAddr(weight));
+   check(p.output.SetAddr(output));
+   if(p.has_bias) check(p.bias.SetAddr(bias));
+   p.scratch.cursor=0;
+   const int status=int(p.operation.RunFusion(
+     s.handle,p.output,p.input,p.weight,p.bias,p.add,p.activation,p.algorithm,
+     [&](size_t n){return p.scratch.get(n);}));
+   if(status!=0) record_failure(status,"muDNN BF16 convolution");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 convolution");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 convolution");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_interpolate_nearest_exact_bf16(
+ const void* input,void* output,const int64_t* input_dims,const int64_t* output_dims,
+ int rank,const float* scales,musaStream_t stream) {
+ if(!input||!output||!input_dims||!output_dims||!scales||rank<3||rank>5) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 nearest-exact interpolate");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   md::Tensor x,y;
+   configure_bf16_tensor(x,input_dims,rank);
+   configure_bf16_tensor(y,output_dims,rank);
+   check(x.SetAddr(input)); check(y.SetAddr(output));
+   md::Interpolate op;
+   check(op.SetMode(md::Interpolate::Mode::NEAREST_EXACT));
+   check(op.SetScaleInfo(rank-2,const_cast<float*>(scales)));
+   const int status=int(op.Run(s.handle,y,x));
+   if(status!=0) record_failure(status,"muDNN BF16 nearest-exact interpolate");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 nearest-exact interpolate");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 nearest-exact interpolate");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_unary_bf16(
+ const void* input,void* output,const int64_t* dims,int rank,int mode,
+ musaStream_t stream) {
+ if(!input||!output||!dims||rank<1||rank>5||mode<0||mode>1) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 unary");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   md::Tensor x,y;
+   configure_contiguous_bf16_tensor(x,dims,rank);
+   configure_contiguous_bf16_tensor(y,dims,rank);
+   check(x.SetAddr(input)); check(y.SetAddr(output));
+   md::Unary op;
+   check(op.SetMode(mode==0?md::Unary::Mode::GELU_TANH:md::Unary::Mode::SILU));
+   const int status=int(op.Run(s.handle,y,x));
+   if(status!=0) record_failure(status,"muDNN BF16 unary");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 unary");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 unary");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_binary_bf16(
+ const void* left,const int64_t* left_dims,int left_rank,
+ const void* right,const int64_t* right_dims,int right_rank,
+ void* output,const int64_t* output_dims,int output_rank,int mode,
+ musaStream_t stream) {
+ if(!left||!right||!output||!left_dims||!right_dims||!output_dims||
+    left_rank<1||left_rank>5||right_rank<1||right_rank>5||
+    output_rank<1||output_rank>5||mode<0||mode>3) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 binary");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   md::Tensor l,r,y;
+   configure_contiguous_bf16_tensor(l,left_dims,left_rank);
+   configure_contiguous_bf16_tensor(r,right_dims,right_rank);
+   configure_contiguous_bf16_tensor(y,output_dims,output_rank);
+   check(l.SetAddr(left)); check(r.SetAddr(right)); check(y.SetAddr(output));
+   md::Binary op;
+   const auto op_mode = mode == 0 ? md::Binary::Mode::ADD
+                      : mode == 1 ? md::Binary::Mode::MUL
+                      : mode == 2 ? md::Binary::Mode::MAX
+                                  : md::Binary::Mode::MIN;
+   check(op.SetMode(op_mode));
+   const int status=int(op.Run(s.handle,y,l,r));
+   if(status!=0) record_failure(status,"muDNN BF16 binary");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 binary");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 binary");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_layer_norm_bf16(
+ const void* input,const void* weight,const void* bias,void* output,
+ int rows,int cols,double eps,musaStream_t stream) {
+ if(!input||!output||rows<=0||cols<=0||!std::isfinite(eps)||eps<=0||
+    ((weight==nullptr)!=(bias==nullptr))) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 layer norm");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   const bool affine=weight!=nullptr;
+   auto key=std::make_tuple(rows,cols,eps,affine);
+   auto it=s.layer_norms.find(key);
+   if(it==s.layer_norms.end()) {
+     if(capturing(stream)) {
+       record_failure(kStatusCaptureInProgress,"muDNN BF16 layer norm");
+       return kStatusCaptureInProgress;
+     }
+     it=s.layer_norms.emplace(
+       key,std::make_unique<LayerNormOp>(rows,cols,eps,affine,stream)).first;
+   }
+   auto& p=*it->second;
+   check(p.input.SetAddr(input)); check(p.output.SetAddr(output));
+   if(affine) { check(p.weight.SetAddr(weight)); check(p.bias.SetAddr(bias)); }
+   p.scratch.cursor=0;
+   const int status=int(p.operation.Run(s.handle,p.output,p.mean,p.inv_var,p.input,
+     p.weight,p.bias,[&](size_t n){return p.scratch.get(n);}));
+   if(status!=0) record_failure(status,"muDNN BF16 layer norm");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 layer norm");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 layer norm");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_rms_norm_bf16(
+ const void* input,void* output,int rows,int cols,double eps,musaStream_t stream) {
+ if(!input||!output||rows<=0||cols<=0||!std::isfinite(eps)||eps<=0) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 RMS norm");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   auto key=std::make_tuple(rows,cols,eps);
+   auto it=s.rms_norms.find(key);
+   if(it==s.rms_norms.end()) {
+     if(capturing(stream)) {
+       record_failure(kStatusCaptureInProgress,"muDNN BF16 RMS norm");
+       return kStatusCaptureInProgress;
+     }
+     it=s.rms_norms.emplace(
+       key,std::make_unique<RmsNormOp>(rows,cols,eps,stream)).first;
+   }
+   auto& p=*it->second;
+   check(p.input.SetAddr(input)); check(p.output.SetAddr(output));
+   const int status=int(p.operation.Run(s.handle,p.output,p.inv_var,p.input,p.weight));
+   if(status!=0) record_failure(status,"muDNN BF16 RMS norm");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 RMS norm");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 RMS norm");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_pairwise_rope_bf16(
+ const void* input,const void* cos,const void* sin,void* output,
+ int batch,int tokens,int heads,int head_dim,musaStream_t stream) {
+ if(!input||!cos||!sin||!output||batch<=0||tokens<=0||heads<=0||
+    head_dim<=0||head_dim%2!=0) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 pairwise RoPE");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   auto key=std::make_tuple(batch,tokens,heads,head_dim);
+   auto it=s.pairwise_ropes.find(key);
+   if(it==s.pairwise_ropes.end()) {
+     if(capturing(stream)) {
+       record_failure(kStatusCaptureInProgress,"muDNN BF16 pairwise RoPE");
+       return kStatusCaptureInProgress;
+     }
+     it=s.pairwise_ropes.emplace(
+       key,std::make_unique<PairwiseRopeOp>(batch,tokens,heads,head_dim,stream)).first;
+   }
+   auto& p=*it->second;
+   auto* input_bytes=static_cast<const unsigned char*>(input);
+   auto* output_bytes=static_cast<unsigned char*>(output);
+   check(p.input_even.SetAddr(input_bytes));
+   check(p.input_odd.SetAddr(input_bytes+sizeof(uint16_t)));
+   check(p.output_even.SetAddr(output_bytes));
+   check(p.output_odd.SetAddr(output_bytes+sizeof(uint16_t)));
+   check(p.cos.SetAddr(cos));
+   check(p.sin.SetAddr(sin));
+
+   check(p.cast.Run(s.handle,p.even_f32,p.input_even));
+   check(p.cast.Run(s.handle,p.odd_f32,p.input_odd));
+   check(p.multiply.Run(s.handle,p.product_a,p.even_f32,p.cos));
+   check(p.multiply.Run(s.handle,p.product_b,p.odd_f32,p.sin));
+   check(p.subtract.Run(s.handle,p.result,p.product_a,p.product_b));
+   check(p.cast.Run(s.handle,p.output_even,p.result));
+   check(p.multiply.Run(s.handle,p.product_a,p.even_f32,p.sin));
+   check(p.multiply.Run(s.handle,p.product_b,p.odd_f32,p.cos));
+   check(p.add.Run(s.handle,p.result,p.product_a,p.product_b));
+   const int status=int(p.cast.Run(s.handle,p.output_odd,p.result));
+   if(status!=0) record_failure(status,"muDNN BF16 pairwise RoPE");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 pairwise RoPE");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 pairwise RoPE");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_concat_rows_bf16(
+ const void* first,const void* second,void* output,
+ int first_rows,int second_rows,int cols,musaStream_t stream) {
+ if(!first||!second||!output||first_rows<=0||second_rows<=0||cols<=0) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 row concatenation");
+   return kStatusInvalidArgument;
+ }
+ try {
+   auto& s=state(stream);
+   md::Tensor inputs[2];
+   md::Tensor y;
+   const int64_t first_dims[2]={first_rows,cols};
+   const int64_t second_dims[2]={second_rows,cols};
+   const int64_t output_dims[2]={first_rows+second_rows,cols};
+   configure_contiguous_bf16_tensor(inputs[0],first_dims,2);
+   configure_contiguous_bf16_tensor(inputs[1],second_dims,2);
+   configure_contiguous_bf16_tensor(y,output_dims,2);
+   check(inputs[0].SetAddr(first));
+   check(inputs[1].SetAddr(second));
+   check(y.SetAddr(output));
+   md::Concat op;
+   check(op.SetAxis(0));
+   const int status=int(op.Run(s.handle,y,2,inputs));
+   if(status!=0) record_failure(status,"muDNN BF16 row concatenation");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 row concatenation");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 row concatenation");
+   return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_mudnn_permute_bf16(
+ const void* input,void* output,const int64_t* input_dims,
+ const int64_t* permutation,int rank,musaStream_t stream) {
+ if(!input||!output||!input_dims||!permutation||rank<1||rank>8) {
+   record_failure(kStatusInvalidArgument,"muDNN BF16 permute");
+   return kStatusInvalidArgument;
+ }
+ try {
+   std::vector<int64_t> output_dims(rank);
+   std::vector<bool> seen(rank,false);
+   for(int i=0;i<rank;++i) {
+     if(input_dims[i]<=0||permutation[i]<0||permutation[i]>=rank||seen[permutation[i]])
+       throw StatusError{kStatusInvalidArgument};
+     seen[permutation[i]]=true;
+     output_dims[i]=input_dims[permutation[i]];
+   }
+   auto& s=state(stream);
+   md::Tensor x,y;
+   configure_contiguous_bf16_tensor(x,input_dims,rank);
+   configure_contiguous_bf16_tensor(y,output_dims.data(),rank);
+   check(x.SetAddr(input));
+   check(y.SetAddr(output));
+   check(md::Permute::ConfigDimStride(y,x,rank,permutation));
+   md::Permute op;
+   const int status=int(op.Run(s.handle,y,x));
+   if(status!=0) record_failure(status,"muDNN BF16 permute");
+   return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN BF16 permute");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN BF16 permute");
+   return kStatusUnknown;
+ }
+}
+
 extern "C" int apxinf_musa_mudnn_flash_bf16(const void* q,const void* k,const void* v,
  void* y,int batch,int heads,int tokens,int dim,musaStream_t stream) {
  if(!q||!k||!v||!y||batch<=0||heads<=0||tokens<=0||dim<=0) {
@@ -485,6 +1040,44 @@ extern "C" int apxinf_musa_mudnn_general_flash_bf16(
  }
 }
 
+extern "C" int apxinf_musa_mudnn_masked_math_attention_bf16(
+ const void* q,const void* k,const void* v,const void* mask,void* y,
+ int batch,int heads,int query_tokens,int key_tokens,int dim,musaStream_t stream) {
+ if(!q||!k||!v||!mask||!y||batch<=0||heads<=0||query_tokens<=0||
+    key_tokens<=0||dim<=0) {
+   record_failure(kStatusInvalidArgument,"muDNN masked math attention");
+   return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream);
+  auto key=std::make_tuple(batch,heads,query_tokens,key_tokens,dim);
+  auto it=s.masked_math_attention.find(key);
+  if(it==s.masked_math_attention.end()) {
+    if(capturing(stream)) {
+      record_failure(kStatusCaptureInProgress,"muDNN masked math attention");
+      return kStatusCaptureInProgress;
+    }
+    it=s.masked_math_attention.emplace(
+      key,std::make_unique<MaskedMathAttention>(batch,heads,query_tokens,
+                                                key_tokens,dim,stream)).first;
+  }
+  auto& p=*it->second;
+  check(p.q.SetAddr(const_cast<void*>(q))); check(p.k.SetAddr(const_cast<void*>(k)));
+  check(p.v.SetAddr(const_cast<void*>(v))); check(p.mask.SetAddr(const_cast<void*>(mask)));
+  check(p.y.SetAddr(y)); p.scratch.cursor=0;
+  const int status=int(p.operation.RunMath(s.handle,p.y,p.attn_probs,p.q,p.k,p.v,
+    p.mask,p.dropout,[&](size_t n){return p.scratch.get(n);}));
+  if(status!=0) record_failure(status,"muDNN masked math attention");
+  return status;
+ } catch(const StatusError& e) {
+   record_failure(e.status,"muDNN masked math attention");
+   return e.status;
+ } catch(...) {
+   record_failure(kStatusUnknown,"muDNN masked math attention");
+   return kStatusUnknown;
+ }
+}
+
 extern "C" int apxinf_musa_mudnn_packed_qkv_flash_bf16(
  const void* qkv,void* y,int batch,int heads,int tokens,int dim,musaStream_t stream) {
  if(!qkv||!y||batch<=0||heads<=0||tokens<=0||dim<=0) {
@@ -528,6 +1121,7 @@ extern "C" int apxinf_musa_mudnn_packed_qkv_flash_bf16(
 extern "C" const char* apxinf_musa_mudnn_last_error(void) {
   return apxinf_adapters::error_buffer();
 }
+
 
 extern "C" void apxinf_musa_mudnn_release_stream(musaStream_t stream) {
  for(auto it=streams.begin();it!=streams.end();) {

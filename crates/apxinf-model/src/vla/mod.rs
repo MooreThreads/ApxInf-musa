@@ -107,6 +107,8 @@ pub struct VlaMetadata<'a> {
     pub image_grid_thw: Option<&'a [[u32; 3]]>,
     pub embodiment_id: Option<usize>,
     pub planning: Option<&'a PlanningOptions>,
+    /// Optional model-family auxiliary latent (Fast-WAM video noise).
+    pub auxiliary_latent: Option<&'a Tensor>,
 }
 
 /// Complete VLA request: an environment observation plus the model-generation
@@ -128,6 +130,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                auxiliary_latent: None,
             },
         }
     }
@@ -141,6 +144,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                auxiliary_latent: None,
             },
         }
     }
@@ -202,6 +206,16 @@ impl InferenceSpec {
 #[derive(Clone, Debug)]
 pub struct Action {
     tensor: Tensor,
+}
+
+/// Optional auxiliary tensors emitted by model-specific continuous VLA
+/// runtimes.  The default is intentionally empty so existing families keep
+/// the stable action-only contract.
+#[derive(Clone, Debug)]
+pub struct InferenceOutputs {
+    pub action: Action,
+    pub video_latents: Option<Tensor>,
+    pub decoded_video: Option<Tensor>,
 }
 
 impl Action {
@@ -292,6 +306,30 @@ pub trait VlaRuntime {
     }
 
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
+
+    /// Action-only path for latency benchmarks and clients that do not need
+    /// model-family diagnostics. Implementations may skip auxiliary decoding
+    /// and transfers while preserving the final action result.
+    fn infer_action_only(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        self.infer(request)
+    }
+
+    /// Make asynchronous device work from the last inference visible to the
+    /// caller without forcing action-only inference to perform a host copy.
+    fn synchronize(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Run inference and optionally return model-family auxiliary outputs.
+    /// Fast-WAM uses this for its generated video latent/video diagnostics;
+    /// ordinary VLA families retain the action-only default.
+    fn infer_with_outputs(&self, request: &VlaRequest<'_>) -> Result<InferenceOutputs> {
+        Ok(InferenceOutputs {
+            action: self.infer(request)?,
+            video_latents: None,
+            decoded_video: None,
+        })
+    }
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 
     /// Prepare without tuning on placeholder data. Compatible runs do not
